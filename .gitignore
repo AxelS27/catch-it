@@ -1,0 +1,14 @@
+# Rust build output
+/target/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+
+# Local agent artifacts
+/.pi/
+
+# Windows metadata
+Thumbs.db
+Desktop.ini
