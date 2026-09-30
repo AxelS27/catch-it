@@ -1,0 +1,251 @@
+mod capture;
+mod geometry;
+mod overlay;
+mod storage;
+mod worker;
+
+use std::{
+    sync::mpsc::{self, Receiver},
+    time::Instant,
+};
+
+use anyhow::{Context, Result};
+use windows::{
+    Win32::{
+        Foundation::*,
+        Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint},
+        System::LibraryLoader::GetModuleHandleW,
+        UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    },
+    core::{PCWSTR, w},
+};
+
+const CAPTURE_HOTKEY: i32 = 1;
+const QUIT_HOTKEY: i32 = 2;
+const WORK_READY: u32 = WM_APP + 1;
+
+enum WorkResult {
+    Captured(Result<capture::Snapshot>),
+    Saved(Result<std::path::PathBuf>),
+}
+
+struct App {
+    controller: HWND,
+    receiver: Receiver<WorkResult>,
+    worker: worker::Worker,
+    pending: bool,
+    overlay: Option<overlay::ActiveOverlay>,
+    started: Instant,
+}
+
+impl App {
+    fn start_capture(&mut self) -> Result<()> {
+        if self.pending || self.overlay.is_some() {
+            return Ok(());
+        }
+        let mut pointer = POINT::default();
+        unsafe {
+            GetCursorPos(&mut pointer)?;
+        }
+        let monitor = unsafe { MonitorFromPoint(pointer, MONITOR_DEFAULTTONEAREST) }.0 as isize;
+        self.started = Instant::now();
+        self.worker.capture(monitor)?;
+        self.pending = true;
+        Ok(())
+    }
+
+    fn receive_work(&mut self) -> Result<()> {
+        let result = self
+            .receiver
+            .try_recv()
+            .context("Capture worker returned no result")?;
+        self.pending = false;
+        match result {
+            WorkResult::Captured(result) => {
+                let snapshot = result?;
+                self.overlay = Some(overlay::ActiveOverlay::create(self.controller, snapshot)?);
+                println!(
+                    "Selection ready in {} ms",
+                    self.started.elapsed().as_millis()
+                );
+            }
+            WorkResult::Saved(result) => {
+                let path = result?;
+                println!(
+                    "Saved in {} ms: {}",
+                    self.started.elapsed().as_millis(),
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_selection(&mut self) -> Result<()> {
+        let Some(mut overlay) = self.overlay.take() else {
+            return Ok(());
+        };
+        let (region, error) = overlay.result();
+        if let Some(error) = error {
+            drop(overlay);
+            anyhow::bail!("{error}");
+        }
+        let Some(region) = region else {
+            drop(overlay);
+            println!("Selection canceled");
+            return Ok(());
+        };
+        let snapshot = overlay.into_snapshot();
+        println!(
+            "Selected {} x {} physical pixels",
+            region.width, region.height
+        );
+        self.started = Instant::now();
+        self.worker.save(snapshot, region)?;
+        self.pending = true;
+        Ok(())
+    }
+}
+impl Drop for App {
+    fn drop(&mut self) {
+        self.overlay.take();
+        self.worker.shutdown();
+        unsafe {
+            let _ = UnregisterHotKey(Some(self.controller), CAPTURE_HOTKEY);
+            let _ = UnregisterHotKey(Some(self.controller), QUIT_HOTKEY);
+            let _ = DestroyWindow(self.controller);
+        }
+    }
+}
+
+fn show_error(error: &anyhow::Error) {
+    eprintln!("{error:#}");
+    let message: Vec<u16> = format!("{error:#}").encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(message.as_ptr()),
+            w!("Simple Screenshot"),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+unsafe extern "system" fn controller_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+fn run() -> Result<()> {
+    // Must be set before creating any window or reading virtualized coordinates.
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
+    }
+    let _com = storage::ComApartment::new()?;
+    overlay::register_class()?;
+    let controller = unsafe {
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(controller_proc),
+            hInstance: GetModuleHandleW(None)?.into(),
+            lpszClassName: w!("SimpleScreenshot.Controller"),
+            ..Default::default()
+        };
+        anyhow::ensure!(
+            RegisterClassW(&class) != 0,
+            "Cannot register controller window"
+        );
+        CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            class.lpszClassName,
+            w!("Simple Screenshot"),
+            WINDOW_STYLE::default(),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            Some(class.hInstance),
+            None,
+        )?
+    };
+    let (sender, receiver) = mpsc::channel();
+    let mut pointer = POINT::default();
+    unsafe {
+        GetCursorPos(&mut pointer)?;
+    }
+    let initial_monitor = unsafe { MonitorFromPoint(pointer, MONITOR_DEFAULTTONEAREST) }.0 as isize;
+    let worker = worker::Worker::new(controller, initial_monitor, sender);
+    let mut app = App {
+        controller,
+        receiver,
+        worker,
+        pending: false,
+        overlay: None,
+        started: Instant::now(),
+    };
+    unsafe {
+        RegisterHotKey(
+            Some(controller),
+            CAPTURE_HOTKEY,
+            MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
+            u32::from(b'S'),
+        )
+        .context("Alt + Shift + S is already registered by another application")?;
+        RegisterHotKey(
+            Some(controller),
+            QUIT_HOTKEY,
+            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+            u32::from(b'Q'),
+        )
+        .context("Prototype exit shortcut Ctrl + Alt + Q is unavailable")?;
+    }
+    println!("Simple Screenshot capture prototype");
+    println!("Alt + Shift + S: select a region on the monitor under the pointer");
+    println!("Esc / right-click: cancel. Ctrl + Alt + Q: quit.");
+    println!("Output: %LOCALAPPDATA%\\SimpleScreenshot\\Temp\\");
+    let mut message = MSG::default();
+    loop {
+        let status = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
+        if status == -1 {
+            return Err(windows::core::Error::from_thread().into());
+        }
+        if status == 0 {
+            break;
+        }
+        if message.hwnd == controller {
+            let result = match message.message {
+                WM_HOTKEY if message.wParam.0 == CAPTURE_HOTKEY as usize => app.start_capture(),
+                WM_HOTKEY if message.wParam.0 == QUIT_HOTKEY as usize => break,
+                WORK_READY => app.receive_work(),
+                overlay::FINISH_SELECTION => app.finish_selection(),
+                _ => {
+                    unsafe {
+                        DispatchMessageW(&message);
+                    }
+                    Ok(())
+                }
+            };
+            if let Err(error) = result {
+                show_error(&error);
+            }
+        } else {
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        show_error(&error);
+        std::process::exit(1);
+    }
+}
