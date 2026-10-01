@@ -1,6 +1,7 @@
 param(
     [switch]$Scene,
-    [ValidateSet('debug', 'release')][string]$Configuration = 'debug'
+    [ValidateSet('debug', 'release')][string]$Configuration = 'debug',
+    [switch]$DragDrop
 )
 
 $ErrorActionPreference = 'Stop'
@@ -20,6 +21,29 @@ public static class CaptureInput {
     [DllImport("user32.dll")] public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
     [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extra);
     [DllImport("user32.dll")] private static extern int GetSystemMetrics(int index);
+    [StructLayout(LayoutKind.Sequential)] struct MouseInput {
+        public int X, Y; public uint Data, Flags, Time; public UIntPtr Extra;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct Input { public uint Type; public MouseInput Mouse; }
+    [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count, Input[] inputs, int size);
+    public static void ClickAt(int x, int y, uint down = 2, uint up = 4) {
+        int dx = (int)(((long)(x - GetSystemMetrics(76)) * 65536 + 32768) / GetSystemMetrics(78));
+        int dy = (int)(((long)(y - GetSystemMetrics(77)) * 65536 + 32768) / GetSystemMetrics(79));
+        var inputs = new Input[] {
+            new Input { Mouse = new MouseInput { X=dx, Y=dy, Flags=0xC001 | down } },
+            new Input { Mouse = new MouseInput { X=dx, Y=dy, Flags=0xC001 | up } }
+        };
+        if (SendInput(2, inputs, Marshal.SizeOf(typeof(Input))) != 2) { throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
+    }
+    public static void DropAt(int x, int y) {
+        int dx = (int)(((long)(x - GetSystemMetrics(76)) * 65536 + 32768) / GetSystemMetrics(78));
+        int dy = (int)(((long)(y - GetSystemMetrics(77)) * 65536 + 32768) / GetSystemMetrics(79));
+        var inputs = new Input[] {
+            new Input { Mouse = new MouseInput { X=dx, Y=dy, Flags=0xC001 } },
+            new Input { Mouse = new MouseInput { Flags=4 } }
+        };
+        if (SendInput(2, inputs, Marshal.SizeOf(typeof(Input))) != 2) { throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
+    }
     public static void MouseAt(int x, int y, uint buttons) {
         uint dx = (uint)(((long)(x - GetSystemMetrics(76)) * 65536 + 32768) / GetSystemMetrics(78));
         uint dy = (uint)(((long)(y - GetSystemMetrics(77)) * 65536 + 32768) / GetSystemMetrics(79));
@@ -28,6 +52,20 @@ public static class CaptureInput {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr FindWindow(string cls, string title);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
+    [DllImport("user32.dll")] public static extern uint GetGuiResources(IntPtr process, uint flags);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr window);
+    delegate bool WindowCallback(IntPtr window, IntPtr data);
+    [DllImport("user32.dll")] static extern bool EnumWindows(WindowCallback callback, IntPtr data);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr window, System.Text.StringBuilder text, int max);
+    public static IntPtr TaggedWindow(string tag) {
+        IntPtr result = IntPtr.Zero;
+        EnumWindows((window, data) => {
+            var title = new System.Text.StringBuilder(512); GetWindowText(window, title, 512);
+            if (IsWindowVisible(window) && title.ToString().Contains(tag)) { result = window; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return result;
+    }
     public static IntPtr ThumbnailWindow() { return FindWindow("SimpleScreenshot.Thumbnail", null); }
     public static int ThumbnailCount() {
         int count = 0; IntPtr window = IntPtr.Zero;
@@ -71,9 +109,15 @@ if ($Scene) {
 $root = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root "target/$Configuration/simple-screenshot.exe"
 if (-not (Test-Path $exe)) { throw 'Run cargo build first.' }
+$session = (Get-Process -Id $PID).SessionId
+if (Get-Process simple-screenshot -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session }) { throw 'Close the running prototype before starting the interactive test.' }
 $artifacts = Join-Path $root '.pi/capture-smoke'
 [void](New-Item -ItemType Directory -Force $artifacts)
-$output = Join-Path $env:LOCALAPPDATA 'SimpleScreenshot/Temp'
+$dataRoot = if ($DragDrop) { Join-Path $artifacts 'User data 日本' } else { $env:LOCALAPPDATA }
+$output = Join-Path $dataRoot 'SimpleScreenshot/Temp'
+$explorerWindow = $null
+$closeExplorer = $false
+$terminalWindow = [IntPtr]::Zero
 $created = @()
 $app = $null
 $sceneProcess = $null
@@ -203,9 +247,162 @@ function Assert-Png([string]$Path) {
     } finally { $bitmap.Dispose() }
 }
 
+function New-TestPreview {
+    $before = @(Get-Shots)
+    [void](Start-Selection)
+    Drag-Selection $false
+    $shot = Wait-NewShot $before
+    $script:created += $shot
+    Assert-Png $shot
+    $preview = Wait-Thumbnail $true
+    [void](Assert-Preview $preview)
+    return @{ Shot = $shot; Window = $preview; Foreground = [CaptureInput]::GetForegroundWindow() }
+}
+function Wait-DragLog([string]$Text) {
+    for ($i = 0; $i -lt 150; $i++) {
+        $lines = @(Get-Content (Join-Path $artifacts 'stdout.log') -ErrorAction SilentlyContinue | Select-Object -Skip $script:dragBaseline)
+        if (($lines -join "`n").Contains($Text)) { return }
+        $app.Refresh()
+        if ($app.HasExited) { throw 'Application exited during drag.' }
+        Start-Sleep -Milliseconds 20
+    }
+    throw "No '$Text' received from native drag loop."
+}
+function Begin-PreviewDrag([IntPtr]$Window, [int]$TargetX, [int]$TargetY) {
+    $script:dragBaseline = @(Get-Content (Join-Path $artifacts 'stdout.log')).Count
+    $rect = New-Object CaptureInput+Rect
+    [void][CaptureInput]::GetWindowRect($Window, [ref]$rect)
+    $x = [int](($rect.Left + $rect.Right) / 2)
+    $y = [int](($rect.Top + $rect.Bottom) / 2)
+    [CaptureInput]::MouseAt($x, $y, 2)
+    Start-Sleep -Milliseconds 50
+    for ($i = 1; $i -le 25; $i++) {
+        [CaptureInput]::MouseAt([int]($x + ($TargetX-$x)*$i/25), [int]($y + ($TargetY-$y)*$i/25), 0)
+        Start-Sleep -Milliseconds 15
+    }
+}
+function Save-DragVisual([string]$Name, [int]$X, [int]$Y) {
+    $bitmap = New-Object System.Drawing.Bitmap 320, 240
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.CopyFromScreen($X-160, $Y-120, 0, 0, $bitmap.Size)
+        $bitmap.Save((Join-Path $artifacts $Name), [System.Drawing.Imaging.ImageFormat]::Png)
+        foreach ($sample in @(@(80,80,[Drawing.Color]::Red), @(200,80,[Drawing.Color]::Lime), @(80,160,[Drawing.Color]::Blue))) {
+            if ($bitmap.GetPixel($sample[0], $sample[1]).ToArgb() -ne $sample[2].ToArgb()) { throw 'Drag image is missing, moved away from the pointer, or has incorrect colors.' }
+        }
+    } finally { $graphics.Dispose(); $bitmap.Dispose() }
+}
+function Test-DragDrop {
+    $targetX = $sceneRect.Left + 400
+    $targetY = $sceneRect.Top + 250
+    $record = New-TestPreview
+    Begin-PreviewDrag $record.Window $targetX $targetY
+    Wait-DragLog 'Drag started:'
+    [CaptureInput]::MouseAt($targetX, $targetY, 0)
+    Start-Sleep -Milliseconds 150
+    Save-DragVisual 'drag-unsupported.png' $targetX $targetY
+    if ([CaptureInput]::GetForegroundWindow() -ne $record.Foreground) { throw 'Dragging stole keyboard focus.' }
+    $hold = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($hold.ElapsedMilliseconds -lt 5600) {
+        [CaptureInput]::MouseAt($targetX, $targetY, 0)
+        Start-Sleep -Milliseconds 20
+        if ([CaptureInput]::ThumbnailWindow() -eq [IntPtr]::Zero -or -not (Test-Path -LiteralPath $record.Shot)) { throw 'Active drag expired or lost its source PNG.' }
+    }
+    Press-Key 0x1B
+    [CaptureInput]::DropAt($targetX, $targetY)
+    Wait-DragLog 'Drag result: canceled'
+    [void](Wait-Thumbnail $true)
+    if (-not [CaptureInput]::IsWindowVisible($record.Window)) { throw 'Canceled drag did not restore its preview.' }
+    $gdiBaseline = [CaptureInput]::GetGuiResources($app.Handle, 0)
+    Write-Host 'PASS: long native drag pauses lifetime beyond five seconds; Escape restores preview and source file'
+
+    Begin-PreviewDrag $record.Window $targetX $targetY
+    Wait-DragLog 'Drag started:'
+    [CaptureInput]::DropAt($targetX, $targetY)
+    Wait-DragLog 'Drag result: canceled'
+    if (-not [CaptureInput]::IsWindowVisible($record.Window)) { throw 'Rejected drop did not restore its preview.' }
+    Write-Host 'PASS: unsupported target rejects file without losing the preview'
+
+    $destination = Join-Path $artifacts ('Explorer drop ' + $PID)
+    [void](New-Item -ItemType Directory -Force $destination)
+    $shellApp = New-Object -ComObject Shell.Application
+    $existingWindows = @($shellApp.Windows() | ForEach-Object { $_.HWND })
+    $shellApp.Explore($destination)
+    for ($i = 0; $i -lt 200; $i++) {
+        foreach ($window in $shellApp.Windows()) {
+            try {
+                if ($window.Document.Folder.Self.Path -eq $destination) { $script:explorerWindow = $window; break }
+            } catch {}
+        }
+        if ($script:explorerWindow) { break }
+        Start-Sleep -Milliseconds 50
+    }
+    if (-not $script:explorerWindow) { throw 'Explorer did not open the isolated test folder.' }
+    $script:closeExplorer = $script:explorerWindow.HWND -notin $existingWindows
+    $explorerHandle = [IntPtr]$script:explorerWindow.HWND
+    $bounds = New-Object CaptureInput+Rect
+    [void][CaptureInput]::GetWindowRect($explorerHandle, [ref]$bounds)
+    $x = [int]($bounds.Left + ($bounds.Right-$bounds.Left)*0.75)
+    $y = [int]($bounds.Top + ($bounds.Bottom-$bounds.Top)*0.60)
+    $record = New-TestPreview
+    $hash = (Get-FileHash -LiteralPath $record.Shot).Hash
+    Begin-PreviewDrag $record.Window $x $y
+    Wait-DragLog 'Drag started:'
+    Start-Sleep -Milliseconds 150
+    Save-DragVisual 'drag-explorer.png' $x $y
+    [CaptureInput]::DropAt($x, $y)
+    Wait-DragLog 'Drag result: copied'
+    [void](Wait-Thumbnail $false)
+    $copy = Join-Path $destination (Split-Path -Leaf $record.Shot)
+    for ($i = 0; $i -lt 200 -and -not (Test-Path -LiteralPath $copy); $i++) { Start-Sleep -Milliseconds 25 }
+    if (-not (Test-Path -LiteralPath $copy) -or -not (Test-Path -LiteralPath $record.Shot)) { throw 'Explorer did not copy the PNG or moved the source.' }
+    if ((Get-FileHash -LiteralPath $copy).Hash -ne $hash) { throw 'Explorer copy has incorrect bytes.' }
+    Write-Host 'PASS: real Explorer drop copies identical PNG bytes and keeps the source'
+    Remove-Item -LiteralPath $copy
+
+    $tag = 'SimpleScreenshot Terminal E2E ' + $PID
+    $receiver = Join-Path $artifacts 'terminal-receiver.ps1'
+    $resultFile = Join-Path $artifacts 'terminal-path.txt'
+    Remove-Item -LiteralPath $resultFile -ErrorAction SilentlyContinue
+    @'
+param([string]$ResultFile)
+$value = Read-Host 'Drop screenshot here, then press Enter'
+[IO.File]::WriteAllText($ResultFile, $value, [Text.Encoding]::UTF8)
+'@ | Set-Content -LiteralPath $receiver -Encoding utf8
+    $terminalArgs = '-w new nt --title "' + $tag + '" --suppressApplicationTitle --startingDirectory "' + $artifacts + '" powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $receiver + '" -ResultFile "' + $resultFile + '"'
+    [void](Start-Process wt.exe -ArgumentList $terminalArgs -PassThru)
+    for ($i = 0; $i -lt 200; $i++) {
+        $script:terminalWindow = [CaptureInput]::TaggedWindow($tag)
+        if ($script:terminalWindow -ne [IntPtr]::Zero) { break }
+        Start-Sleep -Milliseconds 50
+    }
+    if ($script:terminalWindow -eq [IntPtr]::Zero) { throw 'Isolated Windows Terminal window did not open.' }
+    [void][CaptureInput]::GetWindowRect($script:terminalWindow, [ref]$bounds)
+    $x = [int]($bounds.Left + ($bounds.Right-$bounds.Left)*0.75)
+    $y = [int]($bounds.Top + ($bounds.Bottom-$bounds.Top)*0.50)
+    [void][CaptureInput]::SetForegroundWindow($script:terminalWindow)
+    $record = New-TestPreview
+    Begin-PreviewDrag $record.Window $x $y
+    Wait-DragLog 'Drag started:'
+    [CaptureInput]::DropAt($x, $y)
+    Wait-DragLog 'Drag result: copied'
+    [void](Wait-Thumbnail $false)
+    [CaptureInput]::ClickAt($x, $y)
+    Press-Key 0x0D
+    for ($i = 0; $i -lt 200 -and -not (Test-Path -LiteralPath $resultFile); $i++) { Start-Sleep -Milliseconds 25 }
+    if (-not (Test-Path -LiteralPath $resultFile)) { throw 'Terminal did not receive the dropped path.' }
+    $received = [IO.File]::ReadAllText($resultFile).Trim().Trim('"')
+    if ($received -ne $record.Shot -or -not (Test-Path -LiteralPath $record.Shot)) { throw "Terminal received incorrect path: $received" }
+    Write-Host 'PASS: actual Windows Terminal + PowerShell receives the file path, including spaces and Unicode'
+    Start-Sleep -Milliseconds 300
+    $gdiAfter = [CaptureInput]::GetGuiResources($app.Handle, 0)
+    if ($gdiAfter -gt $gdiBaseline) { throw "Drag leaked GDI resources: $gdiBaseline -> $gdiAfter" }
+    Write-Host "PASS: GDI handles do not grow across repeated native drags ($gdiBaseline -> $gdiAfter)"
+}
+
 try {
     $shell = (Get-Process -Id $PID).Path
-    $sceneProcess = Start-Process $shell -ArgumentList @('-NoProfile', '-File', ('"' + $PSCommandPath + '"'), '-Scene') -PassThru -RedirectStandardOutput (Join-Path $artifacts 'scene-stdout.log') -RedirectStandardError (Join-Path $artifacts 'scene-stderr.log')
+    $sceneProcess = Start-Process $shell -ArgumentList @('-NoProfile', '-Sta', '-File', ('"' + $PSCommandPath + '"'), '-Scene') -PassThru -RedirectStandardOutput (Join-Path $artifacts 'scene-stdout.log') -RedirectStandardError (Join-Path $artifacts 'scene-stderr.log')
     for ($i = 0; $i -lt 600; $i++) {
         $sceneProcess.Refresh()
         if ($sceneProcess.HasExited) { throw 'Test scene exited. Check scene-stderr.log.' }
@@ -217,9 +414,25 @@ try {
     $sceneRect = New-Object CaptureInput+Rect
     [void][CaptureInput]::GetWindowRect($sceneWindow, [ref]$sceneRect)
     Write-Host "Display DPI: $([CaptureInput]::GetDpiForWindow($sceneWindow)); scene at $($sceneRect.Left),$($sceneRect.Top)"
-    $app = Start-Process $exe -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $artifacts 'stdout.log') -RedirectStandardError (Join-Path $artifacts 'stderr.log')
-    Start-Sleep -Milliseconds 800
-    if ($app.HasExited) { throw 'Capture application exited during startup.' }
+    $launch = @{
+        FilePath = $exe; WindowStyle = 'Hidden'; PassThru = $true
+        RedirectStandardOutput = (Join-Path $artifacts 'stdout.log')
+        RedirectStandardError = (Join-Path $artifacts 'stderr.log')
+    }
+    if ($DragDrop) { $launch.Environment = @{ LOCALAPPDATA = $dataRoot } }
+    $app = Start-Process @launch
+    $ready = $false
+    for ($i = 0; $i -lt 200; $i++) {
+        $app.Refresh()
+        $startupError = Get-Content (Join-Path $artifacts 'stderr.log') -Raw -ErrorAction SilentlyContinue
+        if ($startupError) { throw "Capture application failed during startup: $startupError" }
+        if ($app.HasExited) { throw 'Capture application exited during startup.' }
+        $startup = Get-Content (Join-Path $artifacts 'stdout.log') -Raw -ErrorAction SilentlyContinue
+        if ($startup -and $startup.Contains('Timing is provisional.')) { $ready = $true; break }
+        Start-Sleep -Milliseconds 50
+    }
+    if (-not $ready) { throw 'Capture application never reported startup readiness.' }
+    Start-Sleep -Milliseconds 350
 
     foreach ($reverse in @($false, $true)) {
         $before = @(Get-Shots)
@@ -236,8 +449,7 @@ try {
         $centerY = [int](($previewRect.Top + $previewRect.Bottom) / 2)
         if (-not $reverse) {
             Start-Sleep -Milliseconds 1800
-            [CaptureInput]::MouseAt($centerX, $centerY, 2)
-            [CaptureInput]::MouseAt($centerX, $centerY, 4)
+            [CaptureInput]::ClickAt($centerX, $centerY)
             Start-Sleep -Milliseconds 100
             if ([CaptureInput]::GetForegroundWindow() -ne $script:expectedFocus) { throw 'Clicking the preview stole keyboard focus.' }
             # Keep injecting the hover position during the hold, just as the
@@ -262,14 +474,15 @@ try {
             if (-not (Test-Path -LiteralPath $shot)) { throw 'Dismissal deleted the PNG.' }
             Write-Host "PASS: mouse exit resumes remaining time ($($remaining.ElapsedMilliseconds) ms), file survives automatic dismissal"
         } else {
-            [CaptureInput]::MouseAt($centerX, $centerY, 8)
-            [CaptureInput]::MouseAt($centerX, $centerY, 16)
+            [CaptureInput]::ClickAt($centerX, $centerY, 8, 16)
             [void](Wait-Thumbnail $false 1500)
             if (-not (Test-Path -LiteralPath $shot)) { throw 'Manual dismissal deleted the PNG.' }
             if ([CaptureInput]::GetForegroundWindow() -ne $script:expectedFocus) { throw 'Dismissal stole keyboard focus.' }
             Write-Host 'PASS: right-click dismisses without stealing focus or deleting the file'
         }
     }
+
+    if ($DragDrop) { Test-DragDrop }
 
     # Place a solid-color part of the test scene beneath the thumbnail. A new
     # capture must show blue there, not the red pixels of the previous preview.
@@ -339,16 +552,28 @@ try {
     Drag-Selection $false
     $finalShot = Wait-NewShot $before
     $created += $finalShot
-    [void](Wait-Thumbnail $true)
+    $finalPreview = Wait-Thumbnail $true
+    if ($DragDrop) {
+        Begin-PreviewDrag $finalPreview ($sceneRect.Left + 400) ($sceneRect.Top + 250)
+        Wait-DragLog 'Drag started:'
+    }
     [CaptureInput]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero)
     [CaptureInput]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
     Press-Key 0x51
     [CaptureInput]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
     [CaptureInput]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
+    if ($DragDrop) {
+        for ($i = 0; $i -lt 100 -and -not $app.HasExited; $i++) {
+            [CaptureInput]::MouseAt($sceneRect.Left + 400, $sceneRect.Top + 250, 0)
+            Start-Sleep -Milliseconds 20
+            $app.Refresh()
+        }
+        [CaptureInput]::mouse_event(4, 0, 0, 0, [UIntPtr]::Zero)
+    }
     if (-not $app.WaitForExit(5000)) { throw 'Exit shortcut did not stop the application.' }
     if ($app.ExitCode -ne 0) { throw "Application exited with $($app.ExitCode)." }
     if ([CaptureInput]::ThumbnailWindow() -ne [IntPtr]::Zero -or -not (Test-Path -LiteralPath $finalShot)) { throw 'Shutdown left a window or removed the PNG.' }
-    Write-Host 'PASS: clean shutdown with an active preview; file survives'
+    Write-Host "PASS: clean shutdown with active preview/drag (drag=$DragDrop); file survives"
     Write-Host "Visual artifacts: $artifacts/overlay.png and thumbnail.png"
 } finally {
     # Release synthetic input even when a test fails.
@@ -356,6 +581,8 @@ try {
     foreach ($key in @(0x10, 0x11, 0x12)) { [CaptureInput]::keybd_event($key, 0, 2, [UIntPtr]::Zero) }
     if ($app -and -not $app.HasExited) { Stop-Process -Id $app.Id -Force }
     if ($sceneProcess -and -not $sceneProcess.HasExited) { Stop-Process -Id $sceneProcess.Id -Force }
+    if ($closeExplorer -and $explorerWindow) { try { $explorerWindow.Quit() } catch {} }
+    if ($terminalWindow -ne [IntPtr]::Zero) { [void][CaptureInput]::PostMessage($terminalWindow, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) }
     foreach ($path in $created) { Remove-Item -LiteralPath $path -ErrorAction SilentlyContinue }
     [void][CaptureInput]::SetForegroundWindow($originalFocus)
 }

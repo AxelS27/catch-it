@@ -1,4 +1,5 @@
 mod capture;
+mod drag_drop;
 mod geometry;
 mod overlay;
 mod storage;
@@ -6,6 +7,7 @@ mod thumbnail;
 mod worker;
 
 use std::{
+    cell::Cell,
     rc::Rc,
     sync::mpsc::{self, Receiver},
     time::Instant,
@@ -29,6 +31,12 @@ const CAPTURE_HOTKEY: i32 = 1;
 const QUIT_HOTKEY: i32 = 2;
 const WORK_READY: u32 = WM_APP + 1;
 const THUMBNAIL_TIMER: usize = 1;
+
+thread_local! { static EXIT_REQUESTED: Cell<bool> = const { Cell::new(false) }; }
+
+fn exit_requested() -> bool {
+    EXIT_REQUESTED.get()
+}
 
 enum WorkResult {
     Captured(Result<capture::Snapshot>),
@@ -130,6 +138,47 @@ impl App {
     }
 }
 impl App {
+    fn begin_drag(&mut self, source: WPARAM) -> Result<()> {
+        if !self
+            .thumbnail
+            .as_ref()
+            .is_some_and(|thumbnail| thumbnail.matches(source))
+        {
+            return Ok(());
+        }
+        // Move the owner out of App before entering OLE's reentrant message loop.
+        // The stable window state stays alive; no callback borrows the App.
+        let mut thumbnail = self.thumbnail.take().expect("thumbnail checked");
+        unsafe {
+            let _ = KillTimer(Some(self.controller), THUMBNAIL_TIMER);
+        }
+        let result = thumbnail.run_drag();
+        if EXIT_REQUESTED.replace(false) {
+            drop(thumbnail);
+            unsafe {
+                PostQuitMessage(0);
+            }
+            return Ok(());
+        }
+        match result {
+            Ok(drag_drop::Outcome::Copied) => {
+                println!("Drag result: copied");
+                drop(thumbnail);
+            }
+            Ok(drag_drop::Outcome::Canceled) => {
+                println!("Drag result: canceled or rejected");
+                self.thumbnail = Some(thumbnail);
+                self.schedule_thumbnail_timer()?;
+            }
+            Err(error) => {
+                self.thumbnail = Some(thumbnail);
+                self.schedule_thumbnail_timer()?;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     fn clear_thumbnail(&mut self) -> bool {
         unsafe {
             let _ = KillTimer(Some(self.controller), THUMBNAIL_TIMER);
@@ -218,6 +267,12 @@ unsafe extern "system" fn controller_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if message == WM_HOTKEY && wparam.0 == QUIT_HOTKEY as usize {
+        // DoDragDrop dispatches directly to this callback rather than our outer
+        // loop. IDropSource observes this flag and cancels safely before exit.
+        EXIT_REQUESTED.set(true);
+        return LRESULT(0);
+    }
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
@@ -226,9 +281,10 @@ fn run() -> Result<()> {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
     }
-    let _com = storage::ComApartment::new()?;
+    let _ole = drag_drop::OleApartment::new()?;
     overlay::register_class()?;
     thumbnail::register_class()?;
+    drag_drop::register_class()?;
     let compositor = thumbnail::Compositor::new()?;
     let controller = unsafe {
         let class = WNDCLASSW {
@@ -293,7 +349,9 @@ fn run() -> Result<()> {
     println!("Alt + Shift + S: select a region on the monitor under the pointer");
     println!("Esc / right-click: cancel. Ctrl + Alt + Q: quit.");
     println!("Output: %LOCALAPPDATA%\\SimpleScreenshot\\Temp\\");
-    println!("Preview: hover to pause; right-click to dismiss. Timing is provisional.");
+    println!(
+        "Preview: drag to copy a file, hover to pause, right-click to dismiss. Timing is provisional."
+    );
     let mut message = MSG::default();
     loop {
         let status = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
@@ -314,6 +372,7 @@ fn run() -> Result<()> {
                 }
                 thumbnail::HOVER_CHANGED => app.update_thumbnail(Some(message.wParam), false),
                 thumbnail::DISMISS => app.update_thumbnail(Some(message.wParam), true),
+                thumbnail::BEGIN_DRAG => app.begin_drag(message.wParam),
                 _ => {
                     unsafe {
                         DispatchMessageW(&message);

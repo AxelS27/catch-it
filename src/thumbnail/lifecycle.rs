@@ -53,6 +53,7 @@ pub struct Lifecycle {
     checkpoint: Instant,
     remaining: Duration,
     hovered: bool,
+    dragging: bool,
 }
 
 impl Lifecycle {
@@ -63,6 +64,7 @@ impl Lifecycle {
             checkpoint: now,
             remaining: timing.lifetime,
             hovered,
+            dragging: false,
         }
     }
 
@@ -78,7 +80,7 @@ impl Lifecycle {
                 }
             }
             Phase::Visible => {
-                if !self.hovered {
+                if !self.hovered && !self.dragging {
                     self.remaining = self
                         .remaining
                         .saturating_sub(now.saturating_duration_since(self.checkpoint));
@@ -100,6 +102,25 @@ impl Lifecycle {
         Action::None
     }
 
+    pub fn can_drag(&self) -> bool {
+        matches!(self.phase, Phase::Appearing | Phase::Visible)
+    }
+
+    pub fn begin_drag(&mut self, now: Instant, hovered: bool) -> Action {
+        let action = self.update(now, hovered);
+        if self.can_drag() {
+            self.dragging = true;
+        }
+        action
+    }
+
+    pub fn end_drag(&mut self, now: Instant, hovered: bool) -> Action {
+        // Account for the whole modal loop while the drag pause is still active.
+        let action = self.update(now, hovered);
+        self.dragging = false;
+        action
+    }
+
     pub fn dismiss(&mut self, now: Instant) -> Action {
         match self.phase {
             Phase::Appearing | Phase::Visible => {
@@ -116,7 +137,9 @@ impl Lifecycle {
         let elapsed = now.saturating_duration_since(self.checkpoint);
         match self.phase {
             Phase::Appearing => Some(self.timing.appear.saturating_sub(elapsed)),
-            Phase::Visible if !self.hovered => Some(self.remaining.saturating_sub(elapsed)),
+            Phase::Visible if !self.hovered && !self.dragging => {
+                Some(self.remaining.saturating_sub(elapsed))
+            }
             Phase::Dismissing => Some(self.timing.dismiss.saturating_sub(elapsed)),
             _ => None,
         }
@@ -178,6 +201,43 @@ mod tests {
         assert_eq!(life.dismiss(now), Action::BeginDismiss);
         assert_eq!(life.dismiss(now + Duration::from_millis(20)), Action::None);
         assert_eq!(life.update(now + timing.dismiss, true), Action::Close);
+    }
+
+    #[test]
+    fn active_drag_pauses_even_after_mouse_leaves_and_cancel_resumes_remaining_time() {
+        let now = Instant::now();
+        let timing = Timing::default();
+        let mut life = Lifecycle::new(now, timing, false);
+        life.update(now + timing.appear, false);
+        let start = now + timing.appear + Duration::from_secs(2);
+        assert_eq!(life.begin_drag(start, true), Action::None);
+        assert_eq!(
+            life.update(start + Duration::from_secs(30), false),
+            Action::None
+        );
+        assert_eq!(life.next_wake(start + Duration::from_secs(30)), None);
+        let end = start + Duration::from_secs(60);
+        assert_eq!(life.end_drag(end, false), Action::None);
+        assert_eq!(life.next_wake(end), Some(Duration::from_secs(3)));
+        assert_eq!(
+            life.update(end + Duration::from_secs(3), false),
+            Action::BeginDismiss
+        );
+        assert!(!life.can_drag());
+    }
+
+    #[test]
+    fn drag_during_entrance_does_not_consume_the_lifetime() {
+        let now = Instant::now();
+        let timing = Timing::default();
+        let mut life = Lifecycle::new(now, timing, false);
+        assert_eq!(
+            life.begin_drag(now + Duration::from_millis(50), true),
+            Action::None
+        );
+        let end = now + Duration::from_secs(60);
+        assert_eq!(life.end_drag(end, false), Action::None);
+        assert_eq!(life.next_wake(end), Some(timing.lifetime));
     }
 
     #[test]

@@ -3,6 +3,7 @@ mod lifecycle;
 mod render;
 
 use std::{
+    cell::Cell,
     path::PathBuf,
     rc::Rc,
     time::{Duration, Instant},
@@ -15,14 +16,19 @@ use windows::{
         Graphics::Gdi::*,
         System::LibraryLoader::GetModuleHandleW,
         UI::{
-            Controls::WM_MOUSELEAVE, HiDpi::GetDpiForWindow, Input::KeyboardAndMouse::*,
+            Controls::WM_MOUSELEAVE,
+            HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi},
+            Input::KeyboardAndMouse::*,
             WindowsAndMessaging::*,
         },
     },
     core::{BOOL, w},
 };
 
-use crate::geometry::Point;
+use crate::{
+    drag_drop::{Outcome, PreparedDrag},
+    geometry::Point,
+};
 use layout::{Layout, WorkArea};
 use lifecycle::{Action, Lifecycle, Timing};
 pub use render::Compositor;
@@ -30,6 +36,7 @@ use render::Surface;
 
 pub const HOVER_CHANGED: u32 = WM_APP + 3;
 pub const DISMISS: u32 = WM_APP + 4;
+pub const BEGIN_DRAG: u32 = WM_APP + 5;
 const CLASS_NAME: windows::core::PCWSTR = w!("SimpleScreenshot.Thumbnail");
 
 /// Published only after the complete PNG has been saved by the worker.
@@ -45,6 +52,13 @@ struct WindowState {
     controller: HWND,
     layout: Layout,
     hovered: bool,
+    press: Option<Point>,
+    drag_anchor: Point,
+    drag_pending: bool,
+    dragging: bool,
+    cancel_drag: Rc<Cell<bool>>,
+    drag_width: i32,
+    drag_height: i32,
 }
 
 pub struct Thumbnail {
@@ -52,8 +66,8 @@ pub struct Thumbnail {
     state: Box<WindowState>,
     surface: Option<Surface>,
     lifecycle: Lifecycle,
-    // Keep the file independently of the UI. Future drag support uses this path.
-    _path: PathBuf,
+    // Source PNG remains available independently of the UI and copy operation.
+    path: PathBuf,
 }
 
 impl Thumbnail {
@@ -99,6 +113,13 @@ impl Thumbnail {
             controller,
             layout: Layout::new(area, 96, image.width, image.height)?,
             hovered: false,
+            press: None,
+            drag_anchor: Point::default(),
+            drag_pending: false,
+            dragging: false,
+            cancel_drag: Rc::new(Cell::new(false)),
+            drag_width: 4,
+            drag_height: 4,
         });
         unsafe {
             // Create hidden on the capture monitor, then ask Windows for its actual
@@ -122,9 +143,11 @@ impl Thumbnail {
                 state,
                 surface: None,
                 lifecycle: Lifecycle::new(Instant::now(), timing, false),
-                _path: image.path.clone(),
+                path: image.path.clone(),
             };
             let dpi = GetDpiForWindow(hwnd);
+            thumbnail.state.drag_width = GetSystemMetricsForDpi(SM_CXDRAG, dpi).max(1);
+            thumbnail.state.drag_height = GetSystemMetricsForDpi(SM_CYDRAG, dpi).max(1);
             thumbnail.state.layout = Layout::new(area, dpi, image.width, image.height)?;
             let layout = thumbnail.state.layout;
             SetWindowPos(
@@ -192,6 +215,85 @@ impl Thumbnail {
         Ok(false)
     }
 
+    pub fn run_drag(&mut self) -> Result<Outcome> {
+        if !self.state.drag_pending {
+            return Ok(Outcome::Canceled);
+        }
+        self.state.drag_pending = false;
+        self.state.press = None;
+        unsafe {
+            if GetCapture() == self.hwnd {
+                let _ = ReleaseCapture();
+            }
+        }
+        if !self.lifecycle.can_drag() || unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
+            return Ok(Outcome::Canceled);
+        }
+        let action = self
+            .lifecycle
+            .begin_drag(Instant::now(), self.state.hovered);
+        self.apply(action)?;
+        if !self.lifecycle.can_drag() {
+            return Ok(Outcome::Canceled);
+        }
+        self.state.dragging = true;
+        self.state.cancel_drag.set(false);
+        let layout = self.state.layout;
+        let width = (layout.image_width * layout.scale).round() as u32;
+        let height = (layout.image_height * layout.scale).round() as u32;
+        let anchor = self.state.drag_anchor;
+        let offset = POINT {
+            x: (anchor.x - (layout.image_left * layout.scale).round() as i32)
+                .clamp(0, width as i32 - 1),
+            y: (anchor.y - (layout.image_top * layout.scale).round() as i32)
+                .clamp(0, height as i32 - 1),
+        };
+        let result = (|| {
+            let drag = PreparedDrag::new(
+                &self.path,
+                width,
+                height,
+                layout.radius * layout.scale,
+                layout.scale,
+                offset,
+                Rc::clone(&self.state.cancel_drag),
+            )?;
+            // Release during setup is a canceled gesture, not a drop somewhere else.
+            if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
+                return Ok(Outcome::Canceled);
+            }
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+            println!("Drag started: {}", self.path.display());
+            drag.run()
+        })();
+        self.state.dragging = false;
+        if matches!(result, Ok(Outcome::Copied)) || crate::exit_requested() {
+            return result;
+        }
+        let mut hovered = false;
+        if !self.state.cancel_drag.get() {
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+                let mut cursor = POINT::default();
+                hovered = GetCursorPos(&mut cursor).is_ok()
+                    && WindowFromPoint(cursor) == self.hwnd
+                    && layout.contains((cursor.x - layout.x) as f32, (cursor.y - layout.y) as f32);
+                if hovered {
+                    track_leave(self.hwnd);
+                }
+            }
+        }
+        self.state.hovered = hovered;
+        let action = self.lifecycle.end_drag(Instant::now(), hovered);
+        self.apply(action)?;
+        if self.state.cancel_drag.get() {
+            self.dismiss()?;
+        }
+        result
+    }
+
     pub fn next_wake(&self) -> Option<Duration> {
         self.lifecycle.next_wake(Instant::now())
     }
@@ -225,6 +327,22 @@ pub fn register_class() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn mouse_point(position: LPARAM) -> Point {
+    Point {
+        x: (position.0 as u16 as i16) as i32,
+        y: ((position.0 >> 16) as u16 as i16) as i32,
+    }
+}
+
+fn crossed_drag_threshold(start: Point, point: Point, width: i32, height: i32) -> bool {
+    let left = i64::from(start.x) - i64::from(width) / 2;
+    let top = i64::from(start.y) - i64::from(height) / 2;
+    i64::from(point.x) < left
+        || i64::from(point.x) >= left + i64::from(width)
+        || i64::from(point.y) < top
+        || i64::from(point.y) >= top + i64::from(height)
 }
 
 unsafe fn track_leave(hwnd: HWND) {
@@ -269,8 +387,65 @@ unsafe extern "system" fn window_proc(
                     HTTRANSPARENT as isize
                 })
             }
+            WM_LBUTTONDOWN => {
+                {
+                    let state = &mut *ptr;
+                    let point = mouse_point(lparam);
+                    if state.dragging || !state.layout.contains(point.x as f32, point.y as f32) {
+                        return LRESULT(0);
+                    }
+                    state.press = Some(point);
+                    state.drag_anchor = point;
+                    if !state.hovered {
+                        state.hovered = true;
+                        let _ = PostMessageW(
+                            Some(state.controller),
+                            HOVER_CHANGED,
+                            WPARAM(hwnd.0 as usize),
+                            LPARAM(0),
+                        );
+                    }
+                }
+                SetCapture(hwnd);
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                (&mut *ptr).press = None;
+                if GetCapture() == hwnd {
+                    let _ = ReleaseCapture();
+                }
+                LRESULT(0)
+            }
+            WM_CAPTURECHANGED => {
+                (&mut *ptr).press = None;
+                LRESULT(0)
+            }
             WM_MOUSEMOVE | WM_MOUSELEAVE => {
                 let state = &mut *ptr;
+                if message == WM_MOUSEMOVE
+                    && wparam.0 & 1 != 0
+                    && state.press.is_some_and(|start| {
+                        crossed_drag_threshold(
+                            start,
+                            mouse_point(lparam),
+                            state.drag_width,
+                            state.drag_height,
+                        )
+                    })
+                    && !state.drag_pending
+                    && !state.dragging
+                {
+                    state.press = None;
+                    state.drag_pending = true;
+                    // Begin OLE outside this callback: its modal loop dispatches
+                    // messages and must never reenter a borrowed WindowState.
+                    let _ = PostMessageW(
+                        Some(state.controller),
+                        BEGIN_DRAG,
+                        WPARAM(hwnd.0 as usize),
+                        LPARAM(0),
+                    );
+                }
                 let hovered = message != WM_MOUSELEAVE
                     && state.layout.contains(
                         (lparam.0 as u16 as i16) as f32,
@@ -292,6 +467,9 @@ unsafe extern "system" fn window_proc(
             }
             WM_RBUTTONUP | WM_CLOSE | WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
                 let state = &*ptr;
+                if state.dragging {
+                    state.cancel_drag.set(true);
+                }
                 let _ = PostMessageW(
                     Some(state.controller),
                     DISMISS,
@@ -310,5 +488,28 @@ unsafe extern "system" fn window_proc(
             WM_ERASEBKGND => LRESULT(1),
             _ => DefWindowProcW(hwnd, message, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn drag_uses_the_system_sized_centered_rectangle() {
+        let start = Point { x: 100, y: 100 };
+        assert!(!crossed_drag_threshold(
+            start,
+            Point { x: 101, y: 99 },
+            4,
+            4
+        ));
+        assert!(!crossed_drag_threshold(start, Point { x: 98, y: 98 }, 4, 4));
+        assert!(crossed_drag_threshold(
+            start,
+            Point { x: 102, y: 100 },
+            4,
+            4
+        ));
+        assert!(crossed_drag_threshold(start, Point { x: 97, y: 100 }, 4, 4));
     }
 }
