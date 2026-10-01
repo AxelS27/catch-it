@@ -1,0 +1,360 @@
+use std::{
+    rc::Rc,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use windows::{
+    Win32::{
+        Foundation::{HMODULE, HWND},
+        Graphics::{
+            Direct2D::{Common::*, *},
+            Direct3D::D3D_DRIVER_TYPE_HARDWARE,
+            Direct3D11::*,
+            DirectComposition::*,
+            Dxgi::{Common::*, *},
+        },
+    },
+    core::Interface,
+};
+use windows_numerics::{Matrix3x2, Vector2};
+
+use super::{SavedScreenshot, layout::Layout, lifecycle::Timing};
+
+/// UI-thread-owned, shared native rendering resources. No software animation loop.
+pub struct Compositor {
+    device: ID3D11Device,
+    factory: ID2D1Factory1,
+    context: ID2D1DeviceContext,
+    dxgi_factory: IDXGIFactory2,
+    composition: IDCompositionDevice,
+}
+
+impl Compositor {
+    pub fn new() -> Result<Rc<Self>> {
+        unsafe {
+            let mut device = None;
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )?;
+            let device = device.context("D3D11 returned no compositor device")?;
+            let dxgi: IDXGIDevice = device.cast()?;
+            let dxgi_factory = dxgi.GetAdapter()?.GetParent::<IDXGIFactory2>()?;
+            let factory: ID2D1Factory1 =
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+            let context = factory
+                .CreateDevice(&dxgi)?
+                .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
+            let composition = DCompositionCreateDevice(&dxgi)?;
+            Ok(Rc::new(Self {
+                device,
+                factory,
+                context,
+                dxgi_factory,
+                composition,
+            }))
+        }
+    }
+}
+
+pub struct Surface {
+    compositor: Rc<Compositor>,
+    target: IDCompositionTarget,
+    visual: IDCompositionVisual,
+    opacity: IDCompositionEffectGroup,
+    // Keep the content alive until the composition target is detached.
+    _swap_chain: IDXGISwapChain1,
+    layout: Layout,
+    timing: Timing,
+    started: Option<Instant>,
+}
+
+impl Surface {
+    pub fn new(
+        compositor: Rc<Compositor>,
+        hwnd: HWND,
+        layout: Layout,
+        image: &SavedScreenshot,
+        timing: Timing,
+    ) -> Result<Self> {
+        unsafe {
+            let swap_chain = compositor.dxgi_factory.CreateSwapChainForComposition(
+                &compositor.device,
+                &DXGI_SWAP_CHAIN_DESC1 {
+                    Width: layout.width,
+                    Height: layout.height,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                    BufferCount: 2,
+                    Scaling: DXGI_SCALING_STRETCH,
+                    SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                    AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                    ..Default::default()
+                },
+                None,
+            )?;
+            render(&compositor, &swap_chain, layout, image)?;
+            let target = compositor.composition.CreateTargetForHwnd(hwnd, true)?;
+            let visual = compositor.composition.CreateVisual()?;
+            let opacity = compositor.composition.CreateEffectGroup()?;
+            visual.SetContent(&swap_chain)?;
+            visual.SetEffect(&opacity)?;
+            // Commit a transparent initial state before showing the popup.
+            opacity.SetOpacity2(0.0)?;
+            visual.SetOffsetX2(24.0 * layout.scale)?;
+            target.SetRoot(&visual)?;
+            compositor.composition.Commit()?;
+            Ok(Self {
+                compositor,
+                target,
+                visual,
+                opacity,
+                _swap_chain: swap_chain,
+                layout,
+                timing,
+                started: None,
+            })
+        }
+    }
+
+    pub fn appear(&mut self) -> Result<()> {
+        self.started = Some(Instant::now());
+        self.animate(24.0 * self.layout.scale, 0.0, 0.0, 1.0, self.timing.appear)
+    }
+
+    pub fn dismiss(&self) -> Result<()> {
+        // A manual dismissal can interrupt entrance. Start from the current
+        // easing sample instead of flashing back to a fully opaque image.
+        let progress = self.started.map_or(0.0, |started| {
+            let t = (started.elapsed().as_secs_f32() / self.timing.appear.as_secs_f32())
+                .clamp(0.0, 1.0);
+            1.0 - (1.0 - t).powi(3)
+        });
+        self.animate(
+            24.0 * self.layout.scale * (1.0 - progress),
+            self.layout.width as f32,
+            progress,
+            0.0,
+            self.timing.dismiss,
+        )
+    }
+
+    fn animate(
+        &self,
+        from_x: f32,
+        to_x: f32,
+        from_opacity: f32,
+        to_opacity: f32,
+        duration: Duration,
+    ) -> Result<()> {
+        unsafe {
+            let slide = cubic_out(&self.compositor.composition, from_x, to_x, duration)?;
+            let fade = cubic_out(
+                &self.compositor.composition,
+                from_opacity,
+                to_opacity,
+                duration,
+            )?;
+            self.visual.SetOffsetX(&slide)?;
+            self.opacity.SetOpacity(&fade)?;
+            self.compositor.composition.Commit()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Surface {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.target.SetRoot(None);
+            let _ = self.compositor.composition.Commit();
+        }
+    }
+}
+
+fn cubic_out(
+    device: &IDCompositionDevice,
+    from: f32,
+    to: f32,
+    duration: Duration,
+) -> Result<IDCompositionAnimation> {
+    let seconds = duration.as_secs_f64();
+    anyhow::ensure!(seconds > 0.0, "Animation duration must be positive");
+    let d = seconds as f32;
+    let delta = to - from;
+    unsafe {
+        let animation = device.CreateAnimation()?;
+        animation.AddCubic(
+            0.0,
+            from,
+            3.0 * delta / d,
+            -3.0 * delta / (d * d),
+            delta / (d * d * d),
+        )?;
+        animation.End(seconds, to)?;
+        Ok(animation)
+    }
+}
+
+fn render(
+    compositor: &Compositor,
+    swap_chain: &IDXGISwapChain1,
+    layout: Layout,
+    image: &SavedScreenshot,
+) -> Result<()> {
+    unsafe {
+        let context = &compositor.context;
+        let dpi = 96.0 * layout.scale;
+        context.SetDpi(dpi, dpi);
+        let source = context.CreateBitmap(
+            D2D_SIZE_U {
+                width: image.width,
+                height: image.height,
+            },
+            Some(image.pixels.as_ptr().cast()),
+            image.width * 4,
+            &D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                },
+                dpiX: 96.0,
+                dpiY: 96.0,
+                ..Default::default()
+            },
+        )?;
+        let rect = D2D_RECT_F {
+            left: layout.image_left,
+            top: layout.image_top,
+            right: layout.image_left + layout.image_width,
+            bottom: layout.image_top + layout.image_height,
+        };
+        let rounded = D2D1_ROUNDED_RECT {
+            rect,
+            radiusX: layout.radius,
+            radiusY: layout.radius,
+        };
+        let geometry = compositor
+            .factory
+            .CreateRoundedRectangleGeometry(&rounded)?;
+        let commands = context.CreateCommandList()?;
+        let border = context.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 0.85,
+            },
+            None,
+        )?;
+        let mut layer = D2D1_LAYER_PARAMETERS1 {
+            contentBounds: rect,
+            geometricMask: std::mem::ManuallyDrop::new(Some(geometry.cast()?)),
+            maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            maskTransform: Matrix3x2::identity(),
+            opacity: 1.0,
+            ..Default::default()
+        };
+        context.SetTarget(&commands);
+        context.BeginDraw();
+        context.PushLayer(&layer, None);
+        context.DrawBitmap(
+            &source,
+            Some(&rect),
+            1.0,
+            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+            None,
+            None,
+        );
+        context.PopLayer();
+        let stroke = 1.0_f32.min(layout.image_width).min(layout.image_height);
+        let inset = stroke / 2.0;
+        context.DrawRoundedRectangle(
+            &D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: rect.left + inset,
+                    top: rect.top + inset,
+                    right: rect.right - inset,
+                    bottom: rect.bottom - inset,
+                },
+                radiusX: (layout.radius - inset).max(0.0),
+                radiusY: (layout.radius - inset).max(0.0),
+            },
+            &border,
+            stroke,
+            None,
+        );
+        let draw_result = context.EndDraw(None, None);
+        context.SetTarget(None);
+        // windows-rs uses ManuallyDrop for COM fields in native parameter structs.
+        std::mem::ManuallyDrop::drop(&mut layer.geometricMask);
+        draw_result?;
+        commands.Close()?;
+
+        let surface: IDXGISurface = swap_chain.GetBuffer(0)?;
+        let target = context.CreateBitmapFromDxgiSurface(
+            &surface,
+            Some(&D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: dpi,
+                dpiY: dpi,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                ..Default::default()
+            }),
+        )?;
+        let shadow = context.CreateEffect(&CLSID_D2D1Shadow)?;
+        shadow.SetInput(0, &commands, true);
+        shadow.SetValue(
+            D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION.0 as u32,
+            D2D1_PROPERTY_TYPE_FLOAT,
+            &3.0_f32.to_ne_bytes(),
+        )?;
+        let color: Vec<u8> = [0.0_f32, 0.0, 0.0, 0.32]
+            .into_iter()
+            .flat_map(f32::to_ne_bytes)
+            .collect();
+        shadow.SetValue(
+            D2D1_SHADOW_PROP_COLOR.0 as u32,
+            D2D1_PROPERTY_TYPE_VECTOR4,
+            &color,
+        )?;
+        let shadow_output = shadow.GetOutput()?;
+        context.SetTarget(&target);
+        context.BeginDraw();
+        context.Clear(Some(&D2D1_COLOR_F::default()));
+        context.DrawImage(
+            &shadow_output,
+            Some(&Vector2 { X: 0.0, Y: 4.0 }),
+            None,
+            D2D1_INTERPOLATION_MODE_LINEAR,
+            D2D1_COMPOSITE_MODE_SOURCE_OVER,
+        );
+        context.DrawImage(
+            &commands,
+            None,
+            None,
+            D2D1_INTERPOLATION_MODE_LINEAR,
+            D2D1_COMPOSITE_MODE_SOURCE_OVER,
+        );
+        let draw_result = context.EndDraw(None, None);
+        context.SetTarget(None);
+        draw_result?;
+        swap_chain.Present(1, DXGI_PRESENT(0)).ok()?;
+    }
+    Ok(())
+}

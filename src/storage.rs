@@ -11,8 +11,6 @@ use windows::{
     core::PCWSTR,
 };
 
-use crate::{capture::Snapshot, geometry::Region};
-
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct ComApartment;
@@ -33,8 +31,14 @@ impl Drop for ComApartment {
     }
 }
 
-pub fn save_png(snapshot: &Snapshot, region: Region) -> Result<PathBuf> {
-    let pixels = snapshot.crop(region)?;
+pub fn save_png(pixels: &[u8], width: u32, height: u32) -> Result<PathBuf> {
+    let expected = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|size| size.checked_mul(4));
+    anyhow::ensure!(
+        width > 0 && height > 0 && expected == Some(pixels.len() as u64),
+        "Invalid PNG pixel buffer"
+    );
     let folder =
         PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?)
             .join("SimpleScreenshot")
@@ -45,7 +49,7 @@ pub fn save_png(snapshot: &Snapshot, region: Region) -> Result<PathBuf> {
     let path = folder.join(format!("shot_{timestamp}_{}_{seq}.png", std::process::id()));
     // Write privately first; never expose an incomplete .png to future drag consumers.
     let pending = path.with_extension("png.part");
-    let result = encode(&pending, region.width, region.height, &pixels)
+    let result = encode(&pending, width, height, pixels)
         .and_then(|()| std::fs::rename(&pending, &path).context("Cannot finalize PNG"));
     if let Err(error) = result {
         let _ = std::fs::remove_file(&pending);
@@ -94,6 +98,13 @@ mod tests {
     impl Drop for TestFile {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn invalid_pixel_buffers_fail_before_creating_files() {
+        for (width, height) in [(0, 1), (1, 0), (2, 2), (u32::MAX, u32::MAX)] {
+            assert!(save_png(&[0; 4], width, height).is_err());
         }
     }
 

@@ -10,6 +10,11 @@ using System.Runtime.InteropServices;
 public static class CaptureInput {
     [StructLayout(LayoutKind.Sequential)]
     public struct Rect { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
+    [DllImport("user32.dll")] private static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(Point point);
+    public static IntPtr CursorWindow() { Point point; GetCursorPos(out point); return WindowFromPoint(point); }
+    public static string CursorInfo() { Point point; GetCursorPos(out point); return point.X + "," + point.Y + " window=" + WindowFromPoint(point); }
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
     [DllImport("user32.dll")] public static extern void keybd_event(byte key, byte scan, uint flags, UIntPtr extra);
@@ -21,6 +26,14 @@ public static class CaptureInput {
         mouse_event(0xC001 | buttons, dx, dy, 0, UIntPtr.Zero);
     }
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr FindWindow(string cls, string title);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int width, int height, uint flags);
+    public static IntPtr ThumbnailWindow() { return FindWindow("SimpleScreenshot.Thumbnail", null); }
+    public static int ThumbnailCount() {
+        int count = 0; IntPtr window = IntPtr.Zero;
+        while ((window = FindWindowEx(IntPtr.Zero, window, "SimpleScreenshot.Thumbnail", null)) != IntPtr.Zero) { count++; }
+        return count;
+    }
     public static IntPtr SceneWindow() { return FindWindow(null, "SimpleScreenshot E2E Scene"); }
     public static IntPtr OverlayWindow() { return FindWindow("SimpleScreenshot.Selection", null); }
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
@@ -121,6 +134,50 @@ function Drag-Selection([bool]$Reverse) {
     [CaptureInput]::MouseAt($x2, $y2, 4)
     [void](Wait-Overlay $false)
 }
+function Wait-Thumbnail([bool]$Visible, [int]$TimeoutMs = 6000) {
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($clock.ElapsedMilliseconds -lt $TimeoutMs) {
+        $hwnd = [CaptureInput]::ThumbnailWindow()
+        if (($hwnd -ne [IntPtr]::Zero) -eq $Visible) { return $hwnd }
+        Start-Sleep -Milliseconds 25
+    }
+    throw "Thumbnail visibility did not become $Visible. Check $artifacts logs."
+}
+function Assert-Preview([IntPtr]$Window) {
+    $rect = New-Object CaptureInput+Rect
+    [void][CaptureInput]::GetWindowRect($Window, [ref]$rect)
+    $scale = [CaptureInput]::GetDpiForWindow($Window) / 96.0
+    $work = [System.Windows.Forms.Screen]::FromHandle($Window).WorkingArea
+    if ($rect.Right -gt $work.Right -or $rect.Bottom -gt $work.Bottom -or $rect.Left -lt $work.Left -or $rect.Top -lt $work.Top) { throw 'Preview is outside the monitor work area.' }
+    $padding = [int][Math]::Round(14 * $scale, [MidpointRounding]::AwayFromZero)
+    $margin = [int][Math]::Round(18 * $scale, [MidpointRounding]::AwayFromZero)
+    $cardWidth = $rect.Right - $rect.Left - $padding - $margin
+    $cardHeight = $rect.Bottom - $rect.Top - $padding - $margin
+    if ([Math]::Abs($cardWidth / $cardHeight - 1.75) -gt 0.015) { throw 'Thumbnail image aspect ratio changed.' }
+    $bitmap = New-Object System.Drawing.Bitmap(($rect.Right - $rect.Left), ($rect.Bottom - $rect.Top))
+    $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+    try {
+        # Composition is asynchronous. Wait for actual rendered pixels instead
+        # of assuming a fixed sleep means the entrance animation has finished.
+        $ready = $false
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($clock.ElapsedMilliseconds -lt 1500) {
+            $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
+            $ready = $true
+            foreach ($sample in @(@(20,170,'Blue'), @(30,30,'Red'), @(200,30,'Lime'))) {
+                $x = $padding + [int][Math]::Floor($sample[0] * $cardWidth / 350)
+                $y = $padding + [int][Math]::Floor($sample[1] * $cardHeight / 200)
+                if ($bitmap.GetPixel($x,$y).ToArgb() -ne [System.Drawing.Color]::FromName($sample[2]).ToArgb()) { $ready = $false; break }
+            }
+            if ($ready) { break }
+            Start-Sleep -Milliseconds 25
+        }
+        $bitmap.Save((Join-Path $artifacts 'thumbnail.png'))
+        if (-not $ready) { throw "Thumbnail preview never reached the expected rendered colors at $x,${y}: $($bitmap.GetPixel($x,$y)). See thumbnail.png." }
+    } finally { $graphics.Dispose(); $bitmap.Dispose() }
+    if ([CaptureInput]::ThumbnailCount() -ne 1) { throw 'Expected exactly one floating preview.' }
+    return $rect
+}
 function Get-Shots {
     if (Test-Path $output) { return @(Get-ChildItem $output -Filter '*.png' | Select-Object -ExpandProperty FullName) }
     return @()
@@ -171,9 +228,85 @@ try {
         $shot = Wait-NewShot $before
         $created += $shot
         Assert-Png $shot
+        $preview = Wait-Thumbnail $true
+        $previewRect = Assert-Preview $preview
         if ([CaptureInput]::GetForegroundWindow() -ne $script:expectedFocus) { throw "Focus was not restored after capture (expected=$script:expectedFocus actual=$([CaptureInput]::GetForegroundWindow()))." }
-        Write-Host "PASS: capture direction reverse=$reverse; exact 350x200 PNG, original colors, restored focus"
+        Write-Host "PASS: capture direction reverse=$reverse; exact PNG, correct preview colors/aspect/work area, preserved focus"
+        $centerX = [int](($previewRect.Left + $previewRect.Right) / 2)
+        $centerY = [int](($previewRect.Top + $previewRect.Bottom) / 2)
+        if (-not $reverse) {
+            Start-Sleep -Milliseconds 1800
+            [CaptureInput]::MouseAt($centerX, $centerY, 2)
+            [CaptureInput]::MouseAt($centerX, $centerY, 4)
+            Start-Sleep -Milliseconds 100
+            if ([CaptureInput]::GetForegroundWindow() -ne $script:expectedFocus) { throw 'Clicking the preview stole keyboard focus.' }
+            # Keep injecting the hover position during the hold, just as the
+            # drag test controls its position. Remote pointer updates can reset
+            # a one-off synthetic move even when no physical mouse is moving.
+            $hold = [System.Diagnostics.Stopwatch]::StartNew()
+            $hoverSamples = 0
+            $outsideSamples = 0
+            while ($hold.ElapsedMilliseconds -lt 5500) {
+                [CaptureInput]::MouseAt($centerX, $centerY, 0)
+                Start-Sleep -Milliseconds 20
+                if ([CaptureInput]::ThumbnailWindow() -eq [IntPtr]::Zero) { throw 'Preview expired while hovered.' }
+                if ([CaptureInput]::CursorWindow() -eq $preview) { $hoverSamples++ } else { $outsideSamples++ }
+            }
+            if ($hoverSamples -lt 20 -or $outsideSamples -gt $hoverSamples) {
+                throw "External pointer input prevented reliable hover testing ($hoverSamples on-preview, $outsideSamples outside)."
+            }
+            Write-Host 'PASS: hover survives longer than the entire idle lifetime; clicking does not activate'
+            $remaining = [System.Diagnostics.Stopwatch]::StartNew()
+            [CaptureInput]::MouseAt($sceneRect.Left + 25, $sceneRect.Top + 25, 0)
+            [void](Wait-Thumbnail $false 4000)
+            if (-not (Test-Path -LiteralPath $shot)) { throw 'Dismissal deleted the PNG.' }
+            Write-Host "PASS: mouse exit resumes remaining time ($($remaining.ElapsedMilliseconds) ms), file survives automatic dismissal"
+        } else {
+            [CaptureInput]::MouseAt($centerX, $centerY, 8)
+            [CaptureInput]::MouseAt($centerX, $centerY, 16)
+            [void](Wait-Thumbnail $false 1500)
+            if (-not (Test-Path -LiteralPath $shot)) { throw 'Manual dismissal deleted the PNG.' }
+            if ([CaptureInput]::GetForegroundWindow() -ne $script:expectedFocus) { throw 'Dismissal stole keyboard focus.' }
+            Write-Host 'PASS: right-click dismisses without stealing focus or deleting the file'
+        }
     }
+
+    # Place a solid-color part of the test scene beneath the thumbnail. A new
+    # capture must show blue there, not the red pixels of the previous preview.
+    $work = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    [void][CaptureInput]::SetWindowPos($sceneWindow, [IntPtr]::Zero, $work.Right - 600, $work.Bottom - 400, 0, 0, 0x15)
+    [void][CaptureInput]::GetWindowRect($sceneWindow, [ref]$sceneRect)
+    Start-Sleep -Milliseconds 150
+    $before = @(Get-Shots)
+    [void](Start-Selection)
+    Drag-Selection $false
+    $shot = Wait-NewShot $before
+    $created += $shot
+    $preview = Wait-Thumbnail $true
+    $previewRect = Assert-Preview $preview
+    $oldShot = $shot
+    $before = @(Get-Shots)
+    [void](Start-Selection)
+    if ([CaptureInput]::ThumbnailWindow() -ne [IntPtr]::Zero) { throw 'Old preview remained visible during capture.' }
+    # The old HWND is now destroyed; use the known DPI of this desktop instead.
+    $scale = [CaptureInput]::GetDpiForWindow($sceneWindow) / 96.0
+    $padding = [int][Math]::Round(14 * $scale, [MidpointRounding]::AwayFromZero)
+    $offset = [int][Math]::Round(20 * $scale, [MidpointRounding]::AwayFromZero)
+    $x = $previewRect.Left + $padding + $offset
+    $y = $previewRect.Top + $padding + $offset
+    [CaptureInput]::MouseAt($x, $y, 2)
+    [CaptureInput]::MouseAt($x + 60, $y + 40, 4)
+    [void](Wait-Overlay $false)
+    $replacement = Wait-NewShot $before
+    $created += $replacement
+    $bitmap = New-Object System.Drawing.Bitmap($replacement)
+    try {
+        if ($bitmap.Width -ne 60 -or $bitmap.Height -ne 40) { throw 'Replacement capture has incorrect bounds.' }
+        if ($bitmap.GetPixel(10,10).ToArgb() -ne [System.Drawing.Color]::Blue.ToArgb()) { throw 'The old floating thumbnail leaked into the new screenshot.' }
+    } finally { $bitmap.Dispose() }
+    [void](Wait-Thumbnail $true)
+    if ([CaptureInput]::ThumbnailCount() -ne 1 -or -not (Test-Path -LiteralPath $oldShot)) { throw 'Preview replacement lost the old file or created multiple thumbnails.' }
+    Write-Host 'PASS: consecutive capture removes old preview before capture, creates one new preview, preserves old PNG'
 
     foreach ($cancel in @('Escape', 'RightClick', 'ZeroArea', 'Deactivate')) {
         $before = @(Get-Shots)
@@ -197,9 +330,16 @@ try {
         [void](Wait-Overlay $false)
         Start-Sleep -Milliseconds 200
         if (@(Get-Shots | Where-Object { $_ -notin $before }).Count -ne 0) { throw "$cancel unexpectedly saved a PNG." }
-        Write-Host "PASS: $cancel cancels without creating a file"
+        if ([CaptureInput]::ThumbnailWindow() -ne [IntPtr]::Zero) { throw "$cancel left a stale thumbnail visible." }
+        Write-Host "PASS: $cancel cancels without creating a file or stale thumbnail"
     }
 
+    $before = @(Get-Shots)
+    [void](Start-Selection)
+    Drag-Selection $false
+    $finalShot = Wait-NewShot $before
+    $created += $finalShot
+    [void](Wait-Thumbnail $true)
     [CaptureInput]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero)
     [CaptureInput]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
     Press-Key 0x51
@@ -207,8 +347,9 @@ try {
     [CaptureInput]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
     if (-not $app.WaitForExit(5000)) { throw 'Exit shortcut did not stop the application.' }
     if ($app.ExitCode -ne 0) { throw "Application exited with $($app.ExitCode)." }
-    Write-Host 'PASS: clean shutdown'
-    Write-Host "Visual artifact: $artifacts/overlay.png"
+    if ([CaptureInput]::ThumbnailWindow() -ne [IntPtr]::Zero -or -not (Test-Path -LiteralPath $finalShot)) { throw 'Shutdown left a window or removed the PNG.' }
+    Write-Host 'PASS: clean shutdown with an active preview; file survives'
+    Write-Host "Visual artifacts: $artifacts/overlay.png and thumbnail.png"
 } finally {
     # Release synthetic input even when a test fails.
     [CaptureInput]::mouse_event(4 -bor 16, 0, 0, 0, [UIntPtr]::Zero)

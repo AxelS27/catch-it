@@ -13,8 +13,9 @@ use windows::Win32::{
 use crate::{
     WORK_READY, WorkResult,
     capture::{CaptureSession, Snapshot},
-    geometry::Region,
+    geometry::{Point, Region},
     storage,
+    thumbnail::SavedScreenshot,
 };
 
 enum Command {
@@ -55,9 +56,20 @@ impl Worker {
                         }
                         WorkResult::Captured(result)
                     }
-                    Command::Save(snapshot, region) => {
-                        WorkResult::Saved(storage::save_png(&snapshot, region))
-                    }
+                    Command::Save(snapshot, region) => WorkResult::Saved((|| {
+                        let pixels = snapshot.crop(region)?;
+                        let path = storage::save_png(&pixels, region.width, region.height)?;
+                        Ok(SavedScreenshot {
+                            path,
+                            origin: Point {
+                                x: snapshot.left + region.x as i32,
+                                y: snapshot.top + region.y as i32,
+                            },
+                            width: region.width,
+                            height: region.height,
+                            pixels,
+                        })
+                    })()),
                     Command::Stop => break,
                 };
                 if results.send(result).is_err() {
