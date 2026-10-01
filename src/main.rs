@@ -1,4 +1,5 @@
 mod capture;
+mod cleanup;
 mod drag_drop;
 mod geometry;
 mod overlay;
@@ -282,6 +283,7 @@ fn run() -> Result<()> {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
     }
     let _ole = drag_drop::OleApartment::new()?;
+    let _cleanup = cleanup::CleanupWorker::start(storage::temp_directory()?)?;
     overlay::register_class()?;
     thumbnail::register_class()?;
     drag_drop::register_class()?;

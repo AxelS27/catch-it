@@ -31,6 +31,24 @@ impl Drop for ComApartment {
     }
 }
 
+pub fn temp_directory() -> Result<PathBuf> {
+    Ok(
+        PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?)
+            .join("SimpleScreenshot")
+            .join("Temp"),
+    )
+}
+
+/// Allow readers/copies, but deny deletion while a thumbnail or OLE drag owns it.
+pub fn protect_png(path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(3) // FILE_SHARE_READ | FILE_SHARE_WRITE, not FILE_SHARE_DELETE
+        .open(path)
+        .context("Cannot protect active screenshot")
+}
+
 pub fn save_png(pixels: &[u8], width: u32, height: u32) -> Result<PathBuf> {
     let expected = u64::from(width)
         .checked_mul(u64::from(height))
@@ -39,10 +57,7 @@ pub fn save_png(pixels: &[u8], width: u32, height: u32) -> Result<PathBuf> {
         width > 0 && height > 0 && expected == Some(pixels.len() as u64),
         "Invalid PNG pixel buffer"
     );
-    let folder =
-        PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?)
-            .join("SimpleScreenshot")
-            .join("Temp");
+    let folder = temp_directory()?;
     std::fs::create_dir_all(&folder)?;
     let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);

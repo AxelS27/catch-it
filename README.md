@@ -2,7 +2,7 @@
 
 A lightweight Windows screenshot utility. The full product targets the native macOS floating-thumbnail experience described in [PRD.md](PRD.md).
 
-## Current milestone: capture, floating thumbnail, and file drag-and-drop
+## Current milestone: capture, floating thumbnail, file drag-and-drop, and temp cleanup
 
 Implemented:
 
@@ -33,6 +33,9 @@ Implemented:
 - Cached, rounded native drag image follows the pointer even over unsupported targets; no focus activation or target hit-test interference.
 - Lifetime pauses for the entire OLE modal loop. Escape or rejected drops restore the preview and its remaining lifetime.
 - Successful drops dismiss the preview, not the PNG. Quit safely cancels an active drag.
+- Automatic cleanup at startup and once per hour on a separate sleeping thread, never on the capture/render thread.
+- Only generated PNGs and abandoned `.png.part` writes with a last-modified age of at least 24 hours are removed. Recent/future-dated files, unrelated names, directories, and reparse points are left alone.
+- Active previews and drags hold a native file handle that prevents deletion while still allowing reading/copying. Locked or inaccessible expired files are deferred until a later sweep; cleanup errors are logged without interrupting capture.
 
 Output directory:
 
@@ -40,7 +43,7 @@ Output directory:
 %LOCALAPPDATA%\SimpleScreenshot\Temp\
 ```
 
-No screenshot editor, tray, or automatic file cleanup yet. Files currently remain until manually deleted.
+No screenshot editor or tray yet. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
 
 ### Provisional UX profile
 
@@ -114,6 +117,8 @@ This opens an isolated Explorer folder and a new Windows Terminal window with a 
 
 Input clicks and final drag releases use atomic `SendInput` batches to prevent remote pointer packets from splitting gestures. Startup readiness and conflicting prototype instances are checked before sending the capture hotkey.
 
+Both smoke modes use a unique test-only `LOCALAPPDATA` directory, never the user's real screenshots. Startup cleanup is tested with expired, recent, unrelated, abandoned-write, and locked-file fixtures. Unit tests additionally cover the exact 24-hour boundary, future timestamps, release of active-file protection, and cleanup-worker shutdown.
+
 Logs and visual artifacts (`overlay.png`, `thumbnail.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
 
 Initial successful release validation:
@@ -150,7 +155,8 @@ These are observations on the available desktop, not cross-hardware performance 
 | `src/geometry.rs` | Physical-pixel selection bounds |
 | `src/drag_drop.rs` | OLE STA, Shell file object, copy-only source, cached layered drag visual |
 | `src/overlay.rs` | Win32 selection window, input, Direct2D rendering |
-| `src/storage.rs` | WIC PNG encoding and atomic file publication |
+| `src/storage.rs` | WIC PNG encoding, atomic file publication, and active-file protection |
+| `src/cleanup.rs` | Conservative 24-hour temp retention and sleeping cleanup worker |
 | `src/worker.rs` | Reusable GPU session and background work queue |
 | `src/thumbnail/mod.rs` | Non-activating Win32 floating window and interactions |
 | `src/thumbnail/layout.rs` | DPI-aware preview bounds and rounded hit testing |

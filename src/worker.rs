@@ -59,7 +59,9 @@ impl Worker {
                     Command::Save(snapshot, region) => WorkResult::Saved((|| {
                         let pixels = snapshot.crop(region)?;
                         let path = storage::save_png(&pixels, region.width, region.height)?;
+                        let protection = storage::protect_png(&path)?;
                         Ok(SavedScreenshot {
+                            protection,
                             path,
                             origin: Point {
                                 x: snapshot.left + region.x as i32,

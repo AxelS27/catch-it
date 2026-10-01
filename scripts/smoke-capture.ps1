@@ -113,13 +113,14 @@ $session = (Get-Process -Id $PID).SessionId
 if (Get-Process simple-screenshot -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session }) { throw 'Close the running prototype before starting the interactive test.' }
 $artifacts = Join-Path $root '.pi/capture-smoke'
 [void](New-Item -ItemType Directory -Force $artifacts)
-$dataRoot = if ($DragDrop) { Join-Path $artifacts 'User data 日本' } else { $env:LOCALAPPDATA }
+$dataRoot = Join-Path $artifacts ('User data 日本 ' + [Guid]::NewGuid().ToString('N'))
 $output = Join-Path $dataRoot 'SimpleScreenshot/Temp'
 $explorerWindow = $null
 $closeExplorer = $false
 $terminalWindow = [IntPtr]::Zero
 $created = @()
 $app = $null
+$cleanupLock = $null
 $sceneProcess = $null
 $originalFocus = [CaptureInput]::GetForegroundWindow()
 
@@ -419,7 +420,19 @@ try {
         RedirectStandardOutput = (Join-Path $artifacts 'stdout.log')
         RedirectStandardError = (Join-Path $artifacts 'stderr.log')
     }
-    if ($DragDrop) { $launch.Environment = @{ LOCALAPPDATA = $dataRoot } }
+    $launch.Environment = @{ LOCALAPPDATA = $dataRoot }
+    [void](New-Item -ItemType Directory -Force $output)
+    $expired = Join-Path $output 'shot_1_1_1.png'
+    $abandoned = Join-Path $output 'shot_1_1_2.png.part'
+    $fresh = Join-Path $output 'shot_1_1_3.png'
+    $unrelated = Join-Path $output 'personal.png'
+    $locked = Join-Path $output 'shot_1_1_4.png'
+    foreach ($file in @($expired, $abandoned, $fresh, $unrelated, $locked)) {
+        [IO.File]::WriteAllText($file, 'cleanup fixture')
+        $created += $file
+        if ($file -ne $fresh) { [IO.File]::SetLastWriteTimeUtc($file, [DateTime]::UtcNow.AddHours(-25)) }
+    }
+    $cleanupLock = [IO.File]::Open($locked, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
     $app = Start-Process @launch
     $ready = $false
     for ($i = 0; $i -lt 200; $i++) {
@@ -432,6 +445,17 @@ try {
         Start-Sleep -Milliseconds 50
     }
     if (-not $ready) { throw 'Capture application never reported startup readiness.' }
+    for ($i = 0; $i -lt 100; $i++) {
+        if (-not (Test-Path -LiteralPath $expired) -and -not (Test-Path -LiteralPath $abandoned)) { break }
+        Start-Sleep -Milliseconds 50
+    }
+    if ((Test-Path -LiteralPath $expired) -or (Test-Path -LiteralPath $abandoned)) { throw 'Startup cleanup did not remove expired screenshots/private writes.' }
+    foreach ($file in @($fresh, $unrelated, $locked)) {
+        if (-not (Test-Path -LiteralPath $file)) { throw "Cleanup incorrectly removed protected file: $file" }
+    }
+    $cleanupLock.Dispose()
+    $cleanupLock = $null
+    Write-Host 'PASS: real app startup cleans expired files, preserves recent/unrelated/locked files'
     Start-Sleep -Milliseconds 350
 
     foreach ($reverse in @($false, $true)) {
@@ -576,6 +600,7 @@ try {
     Write-Host "PASS: clean shutdown with active preview/drag (drag=$DragDrop); file survives"
     Write-Host "Visual artifacts: $artifacts/overlay.png and thumbnail.png"
 } finally {
+    if ($cleanupLock) { $cleanupLock.Dispose() }
     # Release synthetic input even when a test fails.
     [CaptureInput]::mouse_event(4 -bor 16, 0, 0, 0, [UIntPtr]::Zero)
     foreach ($key in @(0x10, 0x11, 0x12)) { [CaptureInput]::keybd_event($key, 0, 2, [UIntPtr]::Zero) }

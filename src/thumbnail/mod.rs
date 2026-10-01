@@ -41,6 +41,7 @@ const CLASS_NAME: windows::core::PCWSTR = w!("SimpleScreenshot.Thumbnail");
 
 /// Published only after the complete PNG has been saved by the worker.
 pub struct SavedScreenshot {
+    pub protection: std::fs::File,
     pub path: PathBuf,
     pub origin: Point,
     pub width: u32,
@@ -68,6 +69,7 @@ pub struct Thumbnail {
     lifecycle: Lifecycle,
     // Source PNG remains available independently of the UI and copy operation.
     path: PathBuf,
+    _protection: std::fs::File,
 }
 
 impl Thumbnail {
@@ -144,6 +146,7 @@ impl Thumbnail {
                 surface: None,
                 lifecycle: Lifecycle::new(Instant::now(), timing, false),
                 path: image.path.clone(),
+                _protection: image.protection.try_clone()?,
             };
             let dpi = GetDpiForWindow(hwnd);
             thumbnail.state.drag_width = GetSystemMetricsForDpi(SM_CXDRAG, dpi).max(1);
