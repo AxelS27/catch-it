@@ -2,11 +2,15 @@
 
 A lightweight Windows screenshot utility. The full product targets the native macOS floating-thumbnail experience described in [PRD.md](PRD.md).
 
-## Current milestone: capture, floating thumbnail, file drag-and-drop, and temp cleanup
+## Current milestone: capture-to-drag flow, temp cleanup, and system tray
 
 Implemented:
 
 - Global `Alt + Shift + S` hotkey.
+- Native notification-area icon with **Take screenshot** and **Quit**, accessible by mouse or keyboard.
+- Release builds run as a Windows GUI/background application, without a console window. Debug builds keep console diagnostics.
+- Tray registration is restored when Explorer sends `TaskbarCreated`; shutdown explicitly removes the icon.
+- Capture/quit hotkeys work inside the native tray menu. Worker completions and thumbnail lifecycle messages are deferred safely across nested menu/OLE loops.
 - Region selection on the monitor under the pointer.
 - Frozen desktop preview, dimmed outside the selected region.
 - Native Direct2D rendering and physical-pixel selection coordinates.
@@ -43,7 +47,7 @@ Output directory:
 %LOCALAPPDATA%\SimpleScreenshot\Temp\
 ```
 
-No screenshot editor or tray yet. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
+No screenshot editor or settings UI. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
 
 ### Provisional UX profile
 
@@ -79,9 +83,9 @@ cargo run --release
 4. The preview appears in the bottom-right corner without taking keyboard focus.
 5. Drag the preview into Explorer or a compatible terminal. Hover to keep it visible, or right-click to dismiss. The file path is also printed in the console.
 
-`Ctrl + Alt + Q` exits this prototype. It is a temporary development shortcut, not a final product requirement. If either shortcut is already registered by another application, startup reports an error.
+Use the notification-area icon (possibly under **Show Hidden Icons**) to take a screenshot or quit. Left-click, right-click, or keyboard activation opens the native menu. `Ctrl + Alt + Q` remains available as a development exit shortcut. If either shortcut is already registered by another application, startup reports an error.
 
-The prototype keeps a console for status messages. The final background/tray application will not require it.
+For everyday use, build with `cargo build --release`, then launch `target/release/simple-screenshot.exe` directly. It runs without a console window; errors still appear in a native dialog. No auto-start or installer is configured. Debug builds keep a console, and redirected stdout/stderr remain available for automated tests.
 
 ## Engineering checks
 
@@ -119,7 +123,16 @@ Input clicks and final drag releases use atomic `SendInput` batches to prevent r
 
 Both smoke modes use a unique test-only `LOCALAPPDATA` directory, never the user's real screenshots. Startup cleanup is tested with expired, recent, unrelated, abandoned-write, and locked-file fixtures. Unit tests additionally cover the exact 24-hour boundary, future timestamps, release of active-file protection, and cleanup-worker shutdown.
 
-Logs and visual artifacts (`overlay.png`, `thumbnail.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
+To additionally test the real notification-area icon/menu and background executable:
+
+```powershell
+./scripts/smoke-capture.ps1 -Configuration release -Tray
+./scripts/smoke-capture.ps1 -Configuration release -Tray -DragDrop
+```
+
+Tray tests use Windows UI Automation and actual mouse/keyboard input. They verify menu capture/quit, keyboard activation, Escape dismissal, hotkeys during a popup, thumbnail lifetime across a long popup, and the release GUI subsystem. Explorer recovery is tested by removing our icon registration and simulating its `TaskbarCreated` notification, not by restarting the user's shell. Combined drag mode verifies that the tray quit request cancels an active OLE drag safely. Tray discovery and visual checks currently expect an English Windows shell with the native light context menu.
+
+Logs and visual artifacts (`overlay.png`, `thumbnail.png`, `tray-menu.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
 
 Initial successful release validation:
 
@@ -135,6 +148,7 @@ These are observations on the available desktop, not cross-hardware performance 
 
 ## Remaining validation and limitations
 
+- Explorer recovery has been validated through registration loss plus a simulated `TaskbarCreated` message, not a real Explorer restart. Native popup menus defer controller lifecycle updates until they close; a preview's remaining timeout can resume afterward.
 - Mixed-DPI and physical multi-monitor E2E testing remains pending. DPI awareness is enabled; rotation transforms are unit-tested, not yet validated on rotated hardware.
 - Selection is limited to one monitor. Cross-monitor region selection is not implemented.
 - A lost capture session is discarded and recreated on the next request. Display changes during selection cancel the overlay.
@@ -150,7 +164,8 @@ These are observations on the available desktop, not cross-hardware performance 
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Hotkeys, controller message loop, capture lifecycle |
+| `src/main.rs` | Hotkeys, hidden controller, capture lifecycle, nested-loop message deferral |
+| `src/tray.rs` | Native notification icon, menu, Explorer recovery, and icon ownership |
 | `src/capture.rs` | DXGI GPU capture, staging readback, rotation, cropping |
 | `src/geometry.rs` | Physical-pixel selection bounds |
 | `src/drag_drop.rs` | OLE STA, Shell file object, copy-only source, cached layered drag visual |

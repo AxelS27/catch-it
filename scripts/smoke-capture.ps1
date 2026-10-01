@@ -1,7 +1,8 @@
 param(
     [switch]$Scene,
     [ValidateSet('debug', 'release')][string]$Configuration = 'debug',
-    [switch]$DragDrop
+    [switch]$DragDrop,
+    [switch]$Tray
 )
 
 $ErrorActionPreference = 'Stop'
@@ -71,6 +72,38 @@ public static class CaptureInput {
         int count = 0; IntPtr window = IntPtr.Zero;
         while ((window = FindWindowEx(IntPtr.Zero, window, "SimpleScreenshot.Thumbnail", null)) != IntPtr.Zero) { count++; }
         return count;
+    }
+    public static IntPtr ControllerWindow() { return FindWindow("SimpleScreenshot.Controller", null); }
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
+    public static IntPtr MenuWindow() {
+        uint controllerPid; GetWindowThreadProcessId(ControllerWindow(), out controllerPid);
+        if (controllerPid == 0) { return IntPtr.Zero; }
+        IntPtr result = IntPtr.Zero;
+        EnumWindows((window, data) => {
+            uint pid; GetWindowThreadProcessId(window, out pid);
+            if (pid == controllerPid && IsWindowVisible(window)) {
+                var cls = new System.Text.StringBuilder(256); GetClassName(window, cls, 256);
+                if (cls.ToString() == "#32768") { result=window; return false; }
+            }
+            return true;
+        }, IntPtr.Zero);
+        return result;
+    }
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr window, System.Text.StringBuilder name, int max);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern uint RegisterWindowMessage(string name);
+    [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] struct NotifyIconData {
+        public uint Size; public IntPtr Window; public uint Id, Flags, Message; public IntPtr Icon;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string Tip;
+        public uint State, StateMask;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=256)] public string Info;
+        public uint Version;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=64)] public string Title;
+        public uint InfoFlags; public Guid Guid; public IntPtr Balloon;
+    }
+    [DllImport("shell32.dll", CharSet=CharSet.Unicode)] static extern bool Shell_NotifyIcon(uint message, ref NotifyIconData data);
+    public static bool RemoveTray(IntPtr window) {
+        var data = new NotifyIconData { Size=(uint)Marshal.SizeOf(typeof(NotifyIconData)), Window=window, Id=1 };
+        return Shell_NotifyIcon(2, ref data);
     }
     public static IntPtr SceneWindow() { return FindWindow(null, "SimpleScreenshot E2E Scene"); }
     public static IntPtr OverlayWindow() { return FindWindow("SimpleScreenshot.Selection", null); }
@@ -293,6 +326,131 @@ function Save-DragVisual([string]$Name, [int]$X, [int]$Y) {
         }
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
 }
+function Find-TrayButton {
+    $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Simple Screenshot - Alt + Shift + S')
+    return [System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+}
+function Open-TrayMenu {
+    $button = Find-TrayButton
+    if (-not $button -or $button.Current.IsOffscreen) {
+        $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Show Hidden Icons')
+        $overflow = [System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        if ($overflow) { $overflow.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
+        for ($i = 0; $i -lt 100; $i++) {
+            $button = Find-TrayButton
+            if ($button -and -not $button.Current.IsOffscreen) { break }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+    if (-not $button -or $button.Current.IsOffscreen) { throw 'Real notification-area icon not accessible (test expects English Windows shell).' }
+    $rect = $button.Current.BoundingRectangle
+    [CaptureInput]::ClickAt([int]($rect.X + $rect.Width/2), [int]($rect.Y + $rect.Height/2), 8, 16)
+    for ($i = 0; $i -lt 100; $i++) {
+        if ([CaptureInput]::MenuWindow() -ne [IntPtr]::Zero) { return }
+        Start-Sleep -Milliseconds 25
+    }
+    throw 'Real tray right-click did not open the native menu.'
+}
+function Select-TrayItem([string]$Name, [switch]$Accessible) {
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, $Name),
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::MenuItem))
+    for ($i = 0; $i -lt 100; $i++) {
+        $menuWindow = [CaptureInput]::MenuWindow()
+        $item = if ($menuWindow -ne [IntPtr]::Zero) {
+            [System.Windows.Automation.AutomationElement]::FromHandle($menuWindow).FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        } else { $null }
+        if ($item) {
+            if ($Accessible) {
+                $item.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            } else {
+                $rect = $item.Current.BoundingRectangle
+                [CaptureInput]::ClickAt([int]($rect.X + $rect.Width/2), [int]($rect.Y + $rect.Height/2))
+            }
+            return
+        }
+        Start-Sleep -Milliseconds 25
+    }
+    throw "Native tray menu item not found: $Name"
+}
+function Test-Tray {
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+    $controller = [CaptureInput]::ControllerWindow()
+    if ($controller -eq [IntPtr]::Zero -or [CaptureInput]::IsWindowVisible($controller)) { throw 'Tray controller missing or unexpectedly visible.' }
+    # Release builds must be Windows GUI executables, not console executables.
+    if ($Configuration -eq 'release') {
+        $bytes = [IO.File]::ReadAllBytes($exe)
+        $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+        if ([BitConverter]::ToUInt16($bytes, $pe + 24 + 68) -ne 2) { throw 'Release executable still uses the console subsystem.' }
+    }
+    Open-TrayMenu
+    $menu = [CaptureInput]::MenuWindow()
+    $rect = New-Object CaptureInput+Rect
+    [void][CaptureInput]::GetWindowRect($menu, [ref]$rect)
+    $bitmap = [Drawing.Bitmap]::new($rect.Right-$rect.Left, $rect.Bottom-$rect.Top)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $rendered = $false
+        for ($i = 0; $i -lt 100; $i++) {
+            $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
+            $background = $bitmap.GetPixel($bitmap.Width-8, $bitmap.Height-8)
+            if ($background.R -ge 230 -and $background.G -ge 230 -and $background.B -ge 230) { $rendered = $true; break }
+            Start-Sleep -Milliseconds 25
+        }
+        $bitmap.Save((Join-Path $artifacts 'tray-menu.png'))
+        if (-not $rendered) { throw 'Native light tray menu never reached its rendered background. See tray-menu.png.' }
+    } finally { $graphics.Dispose(); $bitmap.Dispose() }
+    Press-Key 0x1B
+    Start-Sleep -Milliseconds 200
+    if ([CaptureInput]::MenuWindow() -ne [IntPtr]::Zero) { throw 'Escape did not dismiss the tray menu.' }
+    Write-Host 'PASS: real tray icon opens native menu, Escape dismisses, release has no console subsystem'
+    $button = Find-TrayButton
+    $button.SetFocus()
+    Start-Sleep -Milliseconds 100
+    Press-Key 0x0D
+    for ($i = 0; $i -lt 100 -and [CaptureInput]::MenuWindow() -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 25 }
+    if ([CaptureInput]::MenuWindow() -eq [IntPtr]::Zero) { throw 'Keyboard activation of the focused tray icon did not open its menu.' }
+    Press-Key 0x1B
+    Start-Sleep -Milliseconds 200
+    Write-Host 'PASS: focused tray icon opens via keyboard Enter and dismisses via Escape'
+
+    # Simulate Explorer losing our registration, without restarting the user's shell.
+    if (-not [CaptureInput]::RemoveTray($controller)) { throw 'Cannot remove tray registration for restart simulation.' }
+    $taskbarCreated = [CaptureInput]::RegisterWindowMessage('TaskbarCreated')
+    [void][CaptureInput]::PostMessage($controller, $taskbarCreated, [IntPtr]::Zero, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 400
+    Open-TrayMenu
+    $before = @(Get-Shots)
+    Select-TrayItem 'Take screenshot' -Accessible
+    [void](Wait-Overlay $true)
+    Start-Sleep -Milliseconds 150
+    Drag-Selection $false
+    $shot = Wait-NewShot $before
+    $script:created += $shot
+    Assert-Png $shot
+    $preview = Wait-Thumbnail $true
+    $previewRect = Assert-Preview $preview
+    [CaptureInput]::ClickAt([int](($previewRect.Left+$previewRect.Right)/2), [int](($previewRect.Top+$previewRect.Bottom)/2), 8, 16)
+    [void](Wait-Thumbnail $false 1500)
+    Write-Host 'PASS: TaskbarCreated simulation restores icon; real tray Take screenshot captures exact PNG'
+    $record = New-TestPreview
+    Open-TrayMenu
+    Start-Sleep -Milliseconds 5500
+    Press-Key 0x1B
+    # Moving to the tray can briefly hover the preview. Deferred hover/timer
+    # processing may resume its remaining budget only when the menu closes.
+    [CaptureInput]::MouseAt($sceneRect.Left + 25, $sceneRect.Top + 25, 0)
+    [void](Wait-Thumbnail $false 6000)
+    if (-not (Test-Path -LiteralPath $record.Shot)) { throw 'Tray popup timeout deleted the screenshot.' }
+    Write-Host 'PASS: thumbnail timeout resumes after a long native tray-menu loop; source survives'
+    Open-TrayMenu
+    Press-Capture
+    [void](Wait-Overlay $true)
+    Press-Key 0x1B
+    [void](Wait-Overlay $false)
+    Write-Host 'PASS: capture hotkey closes an open tray menu and starts selection without reentering App'
+}
 function Test-DragDrop {
     $targetX = $sceneRect.Left + 400
     $targetY = $sceneRect.Top + 250
@@ -457,6 +615,7 @@ try {
     $cleanupLock = $null
     Write-Host 'PASS: real app startup cleans expired files, preserves recent/unrelated/locked files'
     Start-Sleep -Milliseconds 350
+    if ($Tray) { Test-Tray }
 
     foreach ($reverse in @($false, $true)) {
         $before = @(Get-Shots)
@@ -581,11 +740,22 @@ try {
         Begin-PreviewDrag $finalPreview ($sceneRect.Left + 400) ($sceneRect.Top + 250)
         Wait-DragLog 'Drag started:'
     }
-    [CaptureInput]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero)
-    [CaptureInput]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
-    Press-Key 0x51
-    [CaptureInput]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
-    [CaptureInput]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
+    if ($Tray -and -not $DragDrop) {
+        # The topmost color fixture was moved into this corner for exclusion tests;
+        # move it away so it cannot obscure Windows' tray overflow panel.
+        [void][CaptureInput]::SetWindowPos($sceneWindow, [IntPtr]::Zero, 200, 200, 0, 0, 0x15)
+        Open-TrayMenu
+        Select-TrayItem 'Quit'
+    } elseif ($Tray) {
+        # The same quit request must be observed inside OLE's nested message loop.
+        [void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(), 0x8008, [IntPtr]::Zero, [IntPtr]::Zero)
+    } else {
+        [CaptureInput]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero)
+        [CaptureInput]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        Press-Key 0x51
+        [CaptureInput]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [CaptureInput]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
+    }
     if ($DragDrop) {
         for ($i = 0; $i -lt 100 -and -not $app.HasExited; $i++) {
             [CaptureInput]::MouseAt($sceneRect.Left + 400, $sceneRect.Top + 250, 0)
@@ -597,7 +767,23 @@ try {
     if (-not $app.WaitForExit(5000)) { throw 'Exit shortcut did not stop the application.' }
     if ($app.ExitCode -ne 0) { throw "Application exited with $($app.ExitCode)." }
     if ([CaptureInput]::ThumbnailWindow() -ne [IntPtr]::Zero -or -not (Test-Path -LiteralPath $finalShot)) { throw 'Shutdown left a window or removed the PNG.' }
-    Write-Host "PASS: clean shutdown with active preview/drag (drag=$DragDrop); file survives"
+    if ($Tray -and [CaptureInput]::ControllerWindow() -ne [IntPtr]::Zero) { throw 'Tray controller survived quit.' }
+    Write-Host "PASS: clean shutdown with active preview/drag (drag=$DragDrop tray=$Tray); file survives"
+    if ($Tray) {
+        # Validate quit while TrackPopupMenu, rather than the outer loop, owns input.
+        [void][CaptureInput]::SetWindowPos($sceneWindow, [IntPtr]::Zero, 200, 200, 0, 0, 0x15)
+        $app = Start-Process @launch
+        for ($i = 0; $i -lt 100 -and [CaptureInput]::ControllerWindow() -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 50 }
+        Start-Sleep -Milliseconds 500
+        Open-TrayMenu
+        [CaptureInput]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero)
+        [CaptureInput]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        Press-Key 0x51
+        [CaptureInput]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [CaptureInput]::keybd_event(0x11, 0, 2, [UIntPtr]::Zero)
+        if (-not $app.WaitForExit(5000) -or $app.ExitCode -ne 0) { throw 'Quit hotkey was lost in the native tray-menu loop.' }
+        Write-Host 'PASS: quit hotkey unwinds open tray menu and shuts down cleanly'
+    }
     Write-Host "Visual artifacts: $artifacts/overlay.png and thumbnail.png"
 } finally {
     if ($cleanupLock) { $cleanupLock.Dispose() }

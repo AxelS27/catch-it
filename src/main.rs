@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod capture;
 mod cleanup;
 mod drag_drop;
@@ -5,10 +7,12 @@ mod geometry;
 mod overlay;
 mod storage;
 mod thumbnail;
+mod tray;
 mod worker;
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
+    collections::VecDeque,
     rc::Rc,
     sync::mpsc::{self, Receiver},
     time::Instant,
@@ -33,7 +37,11 @@ const QUIT_HOTKEY: i32 = 2;
 const WORK_READY: u32 = WM_APP + 1;
 const THUMBNAIL_TIMER: usize = 1;
 
-thread_local! { static EXIT_REQUESTED: Cell<bool> = const { Cell::new(false) }; }
+thread_local! {
+    static EXIT_REQUESTED: Cell<bool> = const { Cell::new(false) };
+    static CAPTURE_REQUESTED: Cell<bool> = const { Cell::new(false) };
+    static DEFERRED_MESSAGES: RefCell<VecDeque<MSG>> = const { RefCell::new(VecDeque::new()) };
+}
 
 fn exit_requested() -> bool {
     EXIT_REQUESTED.get()
@@ -46,6 +54,7 @@ enum WorkResult {
 
 struct App {
     controller: HWND,
+    tray: Option<Box<tray::Tray>>,
     receiver: Receiver<WorkResult>,
     worker: worker::Worker,
     pending: bool,
@@ -241,6 +250,7 @@ impl Drop for App {
         self.overlay.take();
         self.clear_thumbnail();
         self.worker.shutdown();
+        self.tray.take();
         unsafe {
             let _ = UnregisterHotKey(Some(self.controller), CAPTURE_HOTKEY);
             let _ = UnregisterHotKey(Some(self.controller), QUIT_HOTKEY);
@@ -268,10 +278,58 @@ unsafe extern "system" fn controller_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_HOTKEY && wparam.0 == QUIT_HOTKEY as usize {
+    if message == tray::QUIT_REQUEST || (message == WM_HOTKEY && wparam.0 == QUIT_HOTKEY as usize) {
         // DoDragDrop dispatches directly to this callback rather than our outer
         // loop. IDropSource observes this flag and cancels safely before exit.
         EXIT_REQUESTED.set(true);
+        // Also unwind a tray popup's nested loop. OLE observes the same flag.
+        unsafe {
+            let _ = EndMenu();
+        }
+        return LRESULT(0);
+    }
+    if message == tray::CAPTURE_REQUEST
+        || (message == WM_HOTKEY && wparam.0 == CAPTURE_HOTKEY as usize)
+    {
+        // Defer capture until the nested menu/drag loop unwinds. Never reenter App.
+        CAPTURE_REQUESTED.set(true);
+        unsafe {
+            let _ = EndMenu();
+        }
+        return LRESULT(0);
+    }
+    if matches!(
+        message,
+        WORK_READY
+            | overlay::FINISH_SELECTION
+            | thumbnail::HOVER_CHANGED
+            | thumbnail::DISMISS
+            | thumbnail::BEGIN_DRAG
+    ) || (message == WM_TIMER && wparam.0 == THUMBNAIL_TIMER)
+    {
+        // Modal Windows loops dispatch messages directly, bypassing run(). Keep
+        // worker completions and lifecycle changes for the outer App loop.
+        DEFERRED_MESSAGES.with(|queue| {
+            let mut queue = queue.borrow_mut();
+            if !queue
+                .iter()
+                .any(|m| m.message == message && m.wParam == wparam && m.lParam == lparam)
+            {
+                queue.push_back(MSG {
+                    hwnd,
+                    message,
+                    wParam: wparam,
+                    lParam: lparam,
+                    ..Default::default()
+                });
+            }
+        });
+        return LRESULT(0);
+    }
+    // Tray callbacks can run inside TrackPopupMenu or DoDragDrop. This stable
+    // immutable owner never borrows App and is detached before window teardown.
+    let tray = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const tray::Tray;
+    if !tray.is_null() && unsafe { &*tray }.handle(message, wparam, lparam) {
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -308,7 +366,7 @@ fn run() -> Result<()> {
             0,
             0,
             0,
-            Some(HWND_MESSAGE),
+            None, // Hidden top-level controller receives TaskbarCreated broadcasts.
             None,
             Some(class.hInstance),
             None,
@@ -323,6 +381,7 @@ fn run() -> Result<()> {
     let worker = worker::Worker::new(controller, initial_monitor, sender);
     let mut app = App {
         controller,
+        tray: None,
         receiver,
         worker,
         pending: false,
@@ -347,7 +406,8 @@ fn run() -> Result<()> {
         )
         .context("Prototype exit shortcut Ctrl + Alt + Q is unavailable")?;
     }
-    println!("Simple Screenshot floating-thumbnail prototype");
+    app.tray = Some(tray::Tray::new(controller)?);
+    println!("Simple Screenshot - running in the notification area");
     println!("Alt + Shift + S: select a region on the monitor under the pointer");
     println!("Esc / right-click: cancel. Ctrl + Alt + Q: quit.");
     println!("Output: %LOCALAPPDATA%\\SimpleScreenshot\\Temp\\");
@@ -356,7 +416,23 @@ fn run() -> Result<()> {
     );
     let mut message = MSG::default();
     loop {
-        let status = unsafe { GetMessageW(&mut message, None, 0, 0) }.0;
+        // A quit hotkey may have been dispatched by a tray menu's modal loop.
+        if EXIT_REQUESTED.replace(false) {
+            break;
+        }
+        if CAPTURE_REQUESTED.replace(false)
+            && let Err(error) = app.start_capture()
+        {
+            show_error(&error);
+        }
+        let status = if let Some(deferred) =
+            DEFERRED_MESSAGES.with(|queue| queue.borrow_mut().pop_front())
+        {
+            message = deferred;
+            1
+        } else {
+            unsafe { GetMessageW(&mut message, None, 0, 0) }.0
+        };
         if status == -1 {
             return Err(windows::core::Error::from_thread().into());
         }
@@ -365,6 +441,8 @@ fn run() -> Result<()> {
         }
         if message.hwnd == controller {
             let result = match message.message {
+                tray::CAPTURE_REQUEST => app.start_capture(),
+                tray::QUIT_REQUEST => break,
                 WM_HOTKEY if message.wParam.0 == CAPTURE_HOTKEY as usize => app.start_capture(),
                 WM_HOTKEY if message.wParam.0 == QUIT_HOTKEY as usize => break,
                 WORK_READY => app.receive_work(),
@@ -399,5 +477,40 @@ fn main() {
     if let Err(error) = run() {
         show_error(&error);
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_loop_preserves_completions_and_coalesces_lifecycle_messages() {
+        DEFERRED_MESSAGES.with(|queue| queue.borrow_mut().clear());
+        for (message, source) in [
+            (WORK_READY, 0),
+            (WM_TIMER, THUMBNAIL_TIMER),
+            (WM_TIMER, THUMBNAIL_TIMER),
+            (thumbnail::HOVER_CHANGED, 10),
+            (thumbnail::HOVER_CHANGED, 10),
+            (thumbnail::HOVER_CHANGED, 20),
+        ] {
+            unsafe {
+                controller_proc(HWND::default(), message, WPARAM(source), LPARAM(0));
+            }
+        }
+        DEFERRED_MESSAGES.with(|queue| {
+            let mut queue = queue.borrow_mut();
+            let messages: Vec<_> = queue.drain(..).map(|m| (m.message, m.wParam.0)).collect();
+            assert_eq!(
+                messages,
+                vec![
+                    (WORK_READY, 0),
+                    (WM_TIMER, THUMBNAIL_TIMER),
+                    (thumbnail::HOVER_CHANGED, 10),
+                    (thumbnail::HOVER_CHANGED, 20),
+                ]
+            );
+        });
     }
 }
