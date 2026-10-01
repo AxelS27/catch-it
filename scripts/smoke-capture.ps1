@@ -2,7 +2,8 @@ param(
     [switch]$Scene,
     [ValidateSet('debug', 'release')][string]$Configuration = 'debug',
     [switch]$DragDrop,
-    [switch]$Tray
+    [switch]$Tray,
+    [switch]$Layout
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,12 +69,14 @@ public static class CaptureInput {
         return result;
     }
     public static IntPtr ThumbnailWindow() { return FindWindow("SimpleScreenshot.Thumbnail", null); }
+    public static IntPtr DragWindow() { return FindWindow("SimpleScreenshot.DragImage", null); }
     public static int ThumbnailCount() {
         int count = 0; IntPtr window = IntPtr.Zero;
         while ((window = FindWindowEx(IntPtr.Zero, window, "SimpleScreenshot.Thumbnail", null)) != IntPtr.Zero) { count++; }
         return count;
     }
     public static IntPtr ControllerWindow() { return FindWindow("SimpleScreenshot.Controller", null); }
+    public static IntPtr TaskbarWindow() { return FindWindow("Shell_TrayWnd", null); }
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
     public static IntPtr MenuWindow() {
         uint controllerPid; GetWindowThreadProcessId(ControllerWindow(), out controllerPid);
@@ -221,7 +224,8 @@ function Wait-Thumbnail([bool]$Visible, [int]$TimeoutMs = 6000) {
     }
     throw "Thumbnail visibility did not become $Visible. Check $artifacts logs."
 }
-function Assert-Preview([IntPtr]$Window) {
+function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeight = 200,
+    $Samples = @(@(20,170,'Blue'), @(30,30,'Red'), @(200,30,'Lime')), [string]$Artifact = 'thumbnail.png') {
     $rect = New-Object CaptureInput+Rect
     [void][CaptureInput]::GetWindowRect($Window, [ref]$rect)
     $scale = [CaptureInput]::GetDpiForWindow($Window) / 96.0
@@ -231,7 +235,22 @@ function Assert-Preview([IntPtr]$Window) {
     $margin = [int][Math]::Round(18 * $scale, [MidpointRounding]::AwayFromZero)
     $cardWidth = $rect.Right - $rect.Left - $padding - $margin
     $cardHeight = $rect.Bottom - $rect.Top - $padding - $margin
-    if ([Math]::Abs($cardWidth / $cardHeight - 1.75) -gt 0.015) { throw 'Thumbnail image aspect ratio changed.' }
+    if ($cardWidth -ne [int][Math]::Round(220*$scale) -or $cardHeight -ne [int][Math]::Round(160*$scale)) { throw 'Thumbnail card is not fixed at 220x160 logical pixels.' }
+    $taskbar = [CaptureInput]::TaskbarWindow()
+    if ($taskbar -ne [IntPtr]::Zero) {
+        $bar = New-Object CaptureInput+Rect
+        [void][CaptureInput]::GetWindowRect($taskbar, [ref]$bar)
+        $bounds = [System.Windows.Forms.Screen]::FromHandle($Window).Bounds
+        if ($bar.Right -gt $bounds.Left -and $bar.Left -lt $bounds.Right -and $bar.Top -gt $bounds.Top + $bounds.Height/2 -and $bar.Bottom-$bar.Top -lt $bar.Right-$bar.Left) {
+            $reservedTop = $bounds.Bottom - ($bar.Bottom-$bar.Top)
+            if ($rect.Bottom -gt $reservedTop -or $rect.Bottom-$margin -gt $reservedTop-$margin) { throw 'Thumbnail/shadow collides with the actual taskbar (including auto-hide reveal area).' }
+        }
+    }
+    $fit = [Math]::Min($cardWidth/$ImageWidth, $cardHeight/$ImageHeight)
+    $fitWidth = [int][Math]::Round($ImageWidth*$fit, [MidpointRounding]::AwayFromZero)
+    $fitHeight = [int][Math]::Round($ImageHeight*$fit, [MidpointRounding]::AwayFromZero)
+    $fitLeft = $padding + [int][Math]::Floor(($cardWidth-$fitWidth)/2)
+    $fitTop = $padding + [int][Math]::Floor(($cardHeight-$fitHeight)/2)
     $bitmap = New-Object System.Drawing.Bitmap(($rect.Right - $rect.Left), ($rect.Bottom - $rect.Top))
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     try {
@@ -242,15 +261,21 @@ function Assert-Preview([IntPtr]$Window) {
         while ($clock.ElapsedMilliseconds -lt 1500) {
             $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
             $ready = $true
-            foreach ($sample in @(@(20,170,'Blue'), @(30,30,'Red'), @(200,30,'Lime'))) {
-                $x = $padding + [int][Math]::Floor($sample[0] * $cardWidth / 350)
-                $y = $padding + [int][Math]::Floor($sample[1] * $cardHeight / 200)
+            foreach ($sample in $Samples) {
+                $x = $fitLeft + [int][Math]::Floor($sample[0] * $fitWidth / $ImageWidth)
+                $y = $fitTop + [int][Math]::Floor($sample[1] * $fitHeight / $ImageHeight)
                 if ($bitmap.GetPixel($x,$y).ToArgb() -ne [System.Drawing.Color]::FromName($sample[2]).ToArgb()) { $ready = $false; break }
+            }
+            if ($ready -and ($cardHeight-$fitHeight -ge 12*$scale -or $cardWidth-$fitWidth -ge 12*$scale)) {
+                $letterboxX = if ($cardWidth-$fitWidth -ge 12*$scale) { $padding + [int](4*$scale) } else { $padding + [int]($cardWidth/2) }
+                $letterboxY = if ($cardHeight-$fitHeight -ge 12*$scale) { $padding + [int](4*$scale) } else { $padding + [int]($cardHeight/2) }
+                $background = $bitmap.GetPixel($letterboxX, $letterboxY)
+                if ($background.R -ne 26 -or $background.G -ne 24 -or $background.B -ne 24) { $ready = $false }
             }
             if ($ready) { break }
             Start-Sleep -Milliseconds 25
         }
-        $bitmap.Save((Join-Path $artifacts 'thumbnail.png'))
+        $bitmap.Save((Join-Path $artifacts $Artifact))
         if (-not $ready) { throw "Thumbnail preview never reached the expected rendered colors at $x,${y}: $($bitmap.GetPixel($x,$y)). See thumbnail.png." }
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
     if ([CaptureInput]::ThumbnailCount() -ne 1) { throw 'Expected exactly one floating preview.' }
@@ -302,11 +327,11 @@ function Wait-DragLog([string]$Text) {
     }
     throw "No '$Text' received from native drag loop."
 }
-function Begin-PreviewDrag([IntPtr]$Window, [int]$TargetX, [int]$TargetY) {
+function Begin-PreviewDrag([IntPtr]$Window, [int]$TargetX, [int]$TargetY, [switch]$Letterbox) {
     $script:dragBaseline = @(Get-Content (Join-Path $artifacts 'stdout.log')).Count
     $rect = New-Object CaptureInput+Rect
     [void][CaptureInput]::GetWindowRect($Window, [ref]$rect)
-    $x = [int](($rect.Left + $rect.Right) / 2)
+    $x = if ($Letterbox) { $rect.Left + [int][Math]::Round(20*[CaptureInput]::GetDpiForWindow($Window)/96.0) } else { [int](($rect.Left + $rect.Right) / 2) }
     $y = [int](($rect.Top + $rect.Bottom) / 2)
     [CaptureInput]::MouseAt($x, $y, 2)
     Start-Sleep -Milliseconds 50
@@ -325,6 +350,109 @@ function Save-DragVisual([string]$Name, [int]$X, [int]$Y) {
             if ($bitmap.GetPixel($sample[0], $sample[1]).ToArgb() -ne $sample[2].ToArgb()) { throw 'Drag image is missing, moved away from the pointer, or has incorrect colors.' }
         }
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
+}
+function Test-Layout {
+    $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $fullSamples = @(
+        @(($sceneRect.Left+100-$screen.Left), ($sceneRect.Top+100-$screen.Top), 'Red'),
+        @(($sceneRect.Left+230-$screen.Left), ($sceneRect.Top+100-$screen.Top), 'Lime'),
+        @(($sceneRect.Left+450-$screen.Left), ($sceneRect.Top+250-$screen.Top), 'Blue'))
+    $reference = $null
+    foreach ($reverse in @($false, $true)) {
+        $before = @(Get-Shots)
+        [void](Start-Selection)
+        $x1, $y1, $x2, $y2 = $screen.Left, $screen.Top, ($screen.Right-1), ($screen.Bottom-1)
+        if ($reverse) { $x1, $x2 = $x2, $x1; $y1, $y2 = $y2, $y1 }
+        [CaptureInput]::MouseAt($x1, $y1, 2)
+        Start-Sleep -Milliseconds 100
+        for ($i = 1; $i -le 20; $i++) {
+            [CaptureInput]::MouseAt([int]($x1+($x2-$x1)*$i/20), [int]($y1+($y2-$y1)*$i/20), 0)
+            Start-Sleep -Milliseconds 15
+        }
+        [CaptureInput]::DropAt($x2, $y2)
+        [void](Wait-Overlay $false)
+        $shot = Wait-NewShot $before
+        $script:created += $shot
+        $bitmap = [Drawing.Bitmap]::new($shot)
+        try {
+            if ($bitmap.Width -ne $screen.Width -or $bitmap.Height -ne $screen.Height) { throw "Full-screen PNG omits monitor edge pixels: $($bitmap.Size)" }
+            foreach ($sample in $fullSamples) {
+                if ($bitmap.GetPixel($sample[0],$sample[1]).ToArgb() -ne [Drawing.Color]::FromName($sample[2]).ToArgb()) { throw 'Full-screen PNG contains overlay pixels or incorrect coordinates.' }
+            }
+        } finally { $bitmap.Dispose() }
+        $preview = Wait-Thumbnail $true
+        $reference = Assert-Preview $preview $screen.Width $screen.Height $fullSamples "fullscreen-$reverse.png"
+        Write-Host "PASS: full-screen corner-to-corner reverse=$reverse saves exact $($screen.Width)x$($screen.Height) PNG and renders preview without error"
+    }
+    foreach ($spec in @(
+        @{ Width=350; Height=200; Name='landscape'; Samples=@(@(20,170,'Blue'),@(30,30,'Red'),@(200,30,'Lime')) },
+        @{ Width=200; Height=350; Name='portrait'; Samples=@(@(80,55,'Red'),@(185,55,'Lime'),@(80,250,'Blue')) },
+        @{ Width=200; Height=200; Name='square'; Samples=@(@(55,55,'Red'),@(185,55,'Lime'),@(20,170,'Blue')) },
+        @{ Width=10; Height=10; Name='tiny'; Samples=@(,@(5,5,'Blue')) })) {
+        $before = @(Get-Shots)
+        [void](Start-Selection)
+        $x = $sceneRect.Left+25; $y = $sceneRect.Top+25
+        [CaptureInput]::MouseAt($x, $y, 2)
+        Start-Sleep -Milliseconds 75
+        [CaptureInput]::DropAt($x+$spec.Width, $y+$spec.Height)
+        [void](Wait-Overlay $false)
+        $shot = Wait-NewShot $before
+        $script:created += $shot
+        $bitmap = [Drawing.Bitmap]::new($shot)
+        try {
+            if ($bitmap.Width -ne $spec.Width -or $bitmap.Height -ne $spec.Height) { throw 'Region dimensions changed.' }
+        } finally { $bitmap.Dispose() }
+        $preview = Wait-Thumbnail $true
+        $rect = Assert-Preview $preview $spec.Width $spec.Height $spec.Samples ("thumbnail-"+$spec.Name+'.png')
+        if ($rect.Left -ne $reference.Left -or $rect.Top -ne $reference.Top -or $rect.Right -ne $reference.Right -or $rect.Bottom -ne $reference.Bottom) { throw 'Thumbnail card changes size or position with capture aspect ratio.' }
+        Write-Host "PASS: $($spec.Name) content aspect-fits the same fixed card; rounded matte and actual taskbar clearance verified"
+        if ($DragDrop -and $spec.Name -eq 'portrait') {
+            $targetX = $sceneRect.Left+400; $targetY = $sceneRect.Top+250
+            Begin-PreviewDrag $preview $targetX $targetY -Letterbox
+            Wait-DragLog 'Drag started:'
+            $dragRect = New-Object CaptureInput+Rect
+            [void][CaptureInput]::GetWindowRect([CaptureInput]::DragWindow(), [ref]$dragRect)
+            $dragWidth = $dragRect.Right-$dragRect.Left; $dragHeight = $dragRect.Bottom-$dragRect.Top
+            $fitWidth = [int][Math]::Round($dragHeight*200/350, [MidpointRounding]::AwayFromZero)
+            $fitLeft = [int][Math]::Floor(($dragWidth-$fitWidth)/2)
+            $bitmap = [Drawing.Bitmap]::new($dragWidth, $dragHeight)
+            $graphics = [Drawing.Graphics]::FromImage($bitmap)
+            try {
+                $ready = $false
+                for ($i = 0; $i -lt 100; $i++) {
+                    [CaptureInput]::MouseAt($targetX, $targetY, 0)
+                    $graphics.CopyFromScreen($dragRect.Left, $dragRect.Top, 0, 0, $bitmap.Size)
+                    $ready = $true
+                    foreach ($sample in $spec.Samples) {
+                        $color = $bitmap.GetPixel($fitLeft+[int][Math]::Floor($sample[0]*$fitWidth/200), [int][Math]::Floor($sample[1]*$dragHeight/350))
+                        if ($color.ToArgb() -ne [Drawing.Color]::FromName($sample[2]).ToArgb()) { $ready=$false; break }
+                    }
+                    if ($ready) { break }
+                    Start-Sleep -Milliseconds 25
+                }
+                $bitmap.Save((Join-Path $artifacts 'drag-portrait.png'))
+                if (-not $ready) { throw 'Portrait drag image stretches/crops content or has incorrect pixels.' }
+                $matte = $bitmap.GetPixel(4, [int]($dragHeight/2))
+                if ($matte.R -ne 26 -or $matte.G -ne 24 -or $matte.B -ne 24) { throw 'Drag image letterboxing does not match the thumbnail.' }
+            } finally { $graphics.Dispose(); $bitmap.Dispose() }
+            [CaptureInput]::DropAt($targetX, $targetY)
+            Wait-DragLog 'Drag result: canceled'
+            [void](Wait-Thumbnail $true)
+            if (-not (Test-Path -LiteralPath $shot)) { throw 'Portrait drag lost the source PNG.' }
+            Write-Host 'PASS: dragging from letterbox keeps the fixed card and portrait aspect ratio; rejected drop restores preview'
+        }
+    }
+    $bitmap = [Drawing.Bitmap]::new([Math]::Min(400,$screen.Width), [Math]::Min(320,$screen.Height))
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.CopyFromScreen($screen.Right-$bitmap.Width, $screen.Bottom-$bitmap.Height, 0, 0, $bitmap.Size)
+        $bitmap.Save((Join-Path $artifacts 'thumbnail-taskbar.png'))
+    } finally { $graphics.Dispose(); $bitmap.Dispose() }
+    # Dismiss from letterboxing, not the screenshot, to verify whole-card hit testing.
+    $scale = [CaptureInput]::GetDpiForWindow($preview)/96.0
+    [CaptureInput]::ClickAt([int]($rect.Left+20*$scale), [int](($rect.Top+$rect.Bottom)/2), 8, 16)
+    [void](Wait-Thumbnail $false 1500)
+    Write-Host 'PASS: letterbox area remains interactive'
 }
 function Find-TrayButton {
     $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Simple Screenshot - Alt + Shift + S')
@@ -615,6 +743,7 @@ try {
     $cleanupLock = $null
     Write-Host 'PASS: real app startup cleans expired files, preserves recent/unrelated/locked files'
     Start-Sleep -Milliseconds 350
+    if ($Layout) { Test-Layout }
     if ($Tray) { Test-Tray }
 
     foreach ($reverse in @($false, $true)) {
@@ -689,7 +818,8 @@ try {
     $padding = [int][Math]::Round(14 * $scale, [MidpointRounding]::AwayFromZero)
     $offset = [int][Math]::Round(20 * $scale, [MidpointRounding]::AwayFromZero)
     $x = $previewRect.Left + $padding + $offset
-    $y = $previewRect.Top + $padding + $offset
+    $letterboxTop = [int][Math]::Floor(([Math]::Round(160*$scale) - [Math]::Round(220*$scale*200/350))/2)
+    $y = $previewRect.Top + $padding + $letterboxTop + $offset
     [CaptureInput]::MouseAt($x, $y, 2)
     [CaptureInput]::MouseAt($x + 60, $y + 40, 4)
     [void](Wait-Overlay $false)

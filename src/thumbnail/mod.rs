@@ -1,6 +1,7 @@
 mod layout;
 mod lifecycle;
 mod render;
+mod work_area;
 
 use std::{
     cell::Cell,
@@ -29,10 +30,12 @@ use crate::{
     drag_drop::{Outcome, PreparedDrag},
     geometry::Point,
 };
-use layout::{Layout, WorkArea};
+use layout::Layout;
 use lifecycle::{Action, Lifecycle, Timing};
 pub use render::Compositor;
 use render::Surface;
+
+pub(crate) const CARD_BACKGROUND: [u8; 4] = [24, 24, 26, 255];
 
 pub const HOVER_CHANGED: u32 = WM_APP + 3;
 pub const DISMISS: u32 = WM_APP + 4;
@@ -88,29 +91,16 @@ impl Thumbnail {
             );
         }
         let timing = Timing::for_motion_enabled(motion_enabled.as_bool());
-        let mut info = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        unsafe {
-            let monitor = MonitorFromPoint(
+        let monitor = unsafe {
+            MonitorFromPoint(
                 POINT {
                     x: image.origin.x,
                     y: image.origin.y,
                 },
                 MONITOR_DEFAULTTONEAREST,
-            );
-            anyhow::ensure!(
-                GetMonitorInfoW(monitor, &mut info).as_bool(),
-                "Cannot read capture monitor work area"
-            );
-        }
-        let area = WorkArea {
-            left: info.rcWork.left,
-            top: info.rcWork.top,
-            width: (info.rcWork.right - info.rcWork.left) as u32,
-            height: (info.rcWork.bottom - info.rcWork.top) as u32,
+            )
         };
+        let area = work_area::for_monitor(monitor)?;
         let mut state = Box::new(WindowState {
             controller,
             layout: Layout::new(area, 96, image.width, image.height)?,
@@ -242,13 +232,13 @@ impl Thumbnail {
         self.state.dragging = true;
         self.state.cancel_drag.set(false);
         let layout = self.state.layout;
-        let width = (layout.image_width * layout.scale).round() as u32;
-        let height = (layout.image_height * layout.scale).round() as u32;
+        let width = (layout.card_width * layout.scale).round() as u32;
+        let height = (layout.card_height * layout.scale).round() as u32;
         let anchor = self.state.drag_anchor;
         let offset = POINT {
-            x: (anchor.x - (layout.image_left * layout.scale).round() as i32)
+            x: (anchor.x - (layout.card_left * layout.scale).round() as i32)
                 .clamp(0, width as i32 - 1),
-            y: (anchor.y - (layout.image_top * layout.scale).round() as i32)
+            y: (anchor.y - (layout.card_top * layout.scale).round() as i32)
                 .clamp(0, height as i32 - 1),
         };
         let result = (|| {

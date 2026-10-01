@@ -14,6 +14,25 @@ pub struct Region {
     pub height: u32,
 }
 
+impl Point {
+    /// Mouse coordinates cannot reach the exclusive right/bottom monitor edge.
+    /// Snap the last addressable pixel there so corner-to-corner selects every pixel.
+    pub fn at_monitor_edge(self, width: u32, height: u32) -> Self {
+        Self {
+            x: if i64::from(self.x) == i64::from(width) - 1 {
+                width as i32
+            } else {
+                self.x
+            },
+            y: if i64::from(self.y) == i64::from(height) - 1 {
+                height as i32
+            } else {
+                self.y
+            },
+        }
+    }
+}
+
 impl Region {
     pub fn between(a: Point, b: Point, width: u32, height: u32) -> Option<Self> {
         let clamp_x = |x: i32| i64::from(x).clamp(0, i64::from(width)) as u32;
@@ -29,6 +48,28 @@ impl Region {
             height: bottom - top,
         })
     }
+}
+
+/// Fit an image inside fixed physical-pixel bounds without stretching/cropping.
+pub fn aspect_fit(
+    source_width: u32,
+    source_height: u32,
+    width: u32,
+    height: u32,
+) -> Option<(u32, u32)> {
+    if source_width == 0 || source_height == 0 || width == 0 || height == 0 {
+        return None;
+    }
+    let fit = (f64::from(width) / f64::from(source_width))
+        .min(f64::from(height) / f64::from(source_height));
+    Some((
+        (f64::from(source_width) * fit)
+            .round()
+            .clamp(1.0, f64::from(width)) as u32,
+        (f64::from(source_height) * fit)
+            .round()
+            .clamp(1.0, f64::from(height)) as u32,
+    ))
 }
 
 #[cfg(test)]
@@ -69,6 +110,34 @@ mod tests {
                 height: 1080
             })
         );
+    }
+
+    #[test]
+    fn corner_to_corner_includes_every_monitor_pixel_in_both_directions() {
+        let edge = Point { x: 1919, y: 1079 }.at_monitor_edge(1920, 1080);
+        let origin = Point { x: 0, y: 0 };
+        let expected = Some(Region {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        });
+        assert_eq!(Region::between(origin, edge, 1920, 1080), expected);
+        assert_eq!(Region::between(edge, origin, 1920, 1080), expected);
+        assert_eq!(
+            Point { x: 100, y: 200 }.at_monitor_edge(1920, 1080),
+            Point { x: 100, y: 200 }
+        );
+    }
+
+    #[test]
+    fn aspect_fit_preserves_bounds_and_direction() {
+        assert_eq!(aspect_fit(350, 200, 220, 160), Some((220, 126)));
+        assert_eq!(aspect_fit(200, 350, 220, 160), Some((91, 160)));
+        assert_eq!(aspect_fit(100, 100, 220, 160), Some((160, 160)));
+        assert_eq!(aspect_fit(0, 10, 220, 160), None);
+        assert_eq!(aspect_fit(10, 10, 0, 160), None);
+        assert_eq!(aspect_fit(u32::MAX, 1, 220, 160), Some((220, 1)));
     }
 
     #[test]

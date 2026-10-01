@@ -299,8 +299,19 @@ fn drag_bitmap(path: &Path, width: u32, height: u32, radius: f32, scale: f32) ->
             WICDecodeMetadataCacheOnLoad,
         )?;
         let frame = decoder.GetFrame(0)?;
+        let mut source_width = 0;
+        let mut source_height = 0;
+        frame.GetSize(&mut source_width, &mut source_height)?;
+        let (fit_width, fit_height) =
+            crate::geometry::aspect_fit(source_width, source_height, width, height)
+                .context("Invalid screenshot dimensions for drag preview")?;
         let scaler = factory.CreateBitmapScaler()?;
-        scaler.Initialize(&frame, width, height, WICBitmapInterpolationModeFant)?;
+        scaler.Initialize(
+            &frame,
+            fit_width,
+            fit_height,
+            WICBitmapInterpolationModeFant,
+        )?;
         let converter = factory.CreateFormatConverter()?;
         // Apply the rounded mask in straight BGRA, then premultiply exactly once.
         converter.Initialize(
@@ -311,8 +322,20 @@ fn drag_bitmap(path: &Path, width: u32, height: u32, radius: f32, scale: f32) ->
             0.0,
             WICBitmapPaletteTypeCustom,
         )?;
+        let mut fitted = vec![0; fit_width as usize * fit_height as usize * 4];
+        converter.CopyPixels(std::ptr::null(), fit_width * 4, &mut fitted)?;
         let mut pixels = vec![0; len];
-        converter.CopyPixels(std::ptr::null(), width * 4, &mut pixels)?;
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&crate::thumbnail::CARD_BACKGROUND);
+        }
+        let left = (width - fit_width) / 2;
+        let top = (height - fit_height) / 2;
+        for y in 0..fit_height as usize {
+            let dst = ((top as usize + y) * width as usize + left as usize) * 4;
+            let src = y * fit_width as usize * 4;
+            pixels[dst..dst + fit_width as usize * 4]
+                .copy_from_slice(&fitted[src..src + fit_width as usize * 4]);
+        }
         round_and_border(&mut pixels, width, height, radius, scale);
         premultiply(&mut pixels);
         let info = BITMAPINFO {

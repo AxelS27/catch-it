@@ -236,6 +236,12 @@ fn render(
             },
         )?;
         let rect = D2D_RECT_F {
+            left: layout.card_left,
+            top: layout.card_top,
+            right: layout.card_left + layout.card_width,
+            bottom: layout.card_top + layout.card_height,
+        };
+        let image_rect = D2D_RECT_F {
             left: layout.image_left,
             top: layout.image_top,
             right: layout.image_left + layout.image_width,
@@ -249,7 +255,36 @@ fn render(
         let geometry = compositor
             .factory
             .CreateRoundedRectangleGeometry(&rounded)?;
-        let commands = context.CreateCommandList()?;
+        // Rasterize the clipped card once. Replaying a layered command list as
+        // both Shadow input and foreground causes D2DERR_LAYER_ALREADY_IN_USE
+        // for large downscales (reproduced with a full-screen screenshot).
+        let card = context.CreateBitmap(
+            D2D_SIZE_U {
+                width: layout.width,
+                height: layout.height,
+            },
+            None,
+            0,
+            &D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                dpiX: dpi,
+                dpiY: dpi,
+                bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET,
+                ..Default::default()
+            },
+        )?;
+        let background = context.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: super::CARD_BACKGROUND[2] as f32 / 255.0,
+                g: super::CARD_BACKGROUND[1] as f32 / 255.0,
+                b: super::CARD_BACKGROUND[0] as f32 / 255.0,
+                a: 1.0,
+            },
+            None,
+        )?;
         let border = context.CreateSolidColorBrush(
             &D2D1_COLOR_F {
                 r: 1.0,
@@ -267,19 +302,21 @@ fn render(
             opacity: 1.0,
             ..Default::default()
         };
-        context.SetTarget(&commands);
+        context.SetTarget(&card);
         context.BeginDraw();
+        context.Clear(Some(&D2D1_COLOR_F::default()));
         context.PushLayer(&layer, None);
+        context.FillRectangle(&rect, &background);
         context.DrawBitmap(
             &source,
-            Some(&rect),
+            Some(&image_rect),
             1.0,
             D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
             None,
             None,
         );
         context.PopLayer();
-        let stroke = 1.0_f32.min(layout.image_width).min(layout.image_height);
+        let stroke = 1.0_f32.min(layout.card_width).min(layout.card_height);
         let inset = stroke / 2.0;
         context.DrawRoundedRectangle(
             &D2D1_ROUNDED_RECT {
@@ -300,8 +337,7 @@ fn render(
         context.SetTarget(None);
         // windows-rs uses ManuallyDrop for COM fields in native parameter structs.
         std::mem::ManuallyDrop::drop(&mut layer.geometricMask);
-        draw_result?;
-        commands.Close()?;
+        draw_result.context("Cannot rasterize thumbnail card")?;
 
         let surface: IDXGISurface = swap_chain.GetBuffer(0)?;
         let target = context.CreateBitmapFromDxgiSurface(
@@ -318,7 +354,7 @@ fn render(
             }),
         )?;
         let shadow = context.CreateEffect(&CLSID_D2D1Shadow)?;
-        shadow.SetInput(0, &commands, true);
+        shadow.SetInput(0, &card, true);
         shadow.SetValue(
             D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION.0 as u32,
             D2D1_PROPERTY_TYPE_FLOAT,
@@ -345,7 +381,7 @@ fn render(
             D2D1_COMPOSITE_MODE_SOURCE_OVER,
         );
         context.DrawImage(
-            &commands,
+            &card,
             None,
             None,
             D2D1_INTERPOLATION_MODE_LINEAR,
@@ -353,7 +389,7 @@ fn render(
         );
         let draw_result = context.EndDraw(None, None);
         context.SetTarget(None);
-        draw_result?;
+        draw_result.context("Cannot compose thumbnail and shadow")?;
         swap_chain.Present(1, DXGI_PRESENT(0)).ok()?;
     }
     Ok(())

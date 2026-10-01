@@ -14,7 +14,7 @@ Implemented:
 - Region selection on the monitor under the pointer.
 - Frozen desktop preview, dimmed outside the selected region.
 - Native Direct2D rendering and physical-pixel selection coordinates.
-- Drag in any direction; clamp selection to the chosen monitor.
+- Drag in any direction; clamp selection to the chosen monitor. Corner-to-corner selection includes the final row/column of pixels for a complete monitor capture.
 - `Esc`, right-click, or switching applications cancels capture.
 - Empty selections do not create files.
 - Restore the previous foreground window after capture or cancellation, without overriding a deliberate application switch.
@@ -22,8 +22,9 @@ Implemented:
 - Unique filenames and atomic publication of complete PNG files.
 - GPU capture session reused on a sleeping worker, without idle frame polling.
 - Capture and save errors are reported rather than silently ignored.
-- Floating preview in the capture monitor's bottom-right work area, above the taskbar.
-- Transparent, rounded preview with a subtle shadow and preserved image aspect ratio.
+- Floating preview in the capture monitor's bottom-right usable area, above the actual shell taskbar even when Windows reports an incorrect work area. Reserve taskbar thickness for auto-hide reveal too.
+- Fixed 220 x 160 logical-pixel rounded card with a subtle shadow; centered screenshot content aspect-fits inside a dark matte without stretching or cropping. Only DPI or a very small available work area changes the card size.
+- Rasterize the card once before composing its shadow, avoiding the Direct2D layer-reuse error reproduced with full-screen captures.
 - DirectComposition slide/fade animations, without per-frame CPU repainting.
 - No keyboard focus activation when showing, hovering, clicking, or dismissing the preview.
 - Monotonic timeout that pauses on hover and resumes the remaining time after mouse exit.
@@ -34,7 +35,7 @@ Implemented:
 - Native OLE file drag using Shell `IDataObject` / `CF_HDROP` and a non-agile `IDropSource` on the UI STA.
 - DPI-aware system drag threshold; a click alone does not initiate a drag.
 - Copy-only operation: Explorer copies the PNG, and compatible terminals receive its file path.
-- Cached, rounded native drag image follows the pointer even over unsupported targets; no focus activation or target hit-test interference.
+- Cached, rounded native drag image uses the same fixed card, aspect-fit content, and matte as the thumbnail. It follows the pointer even over unsupported targets; no focus activation or target hit-test interference. The letterbox area supports hover, drag, and dismissal too.
 - Lifetime pauses for the entire OLE modal loop. Escape or rejected drops restore the preview and its remaining lifetime.
 - Successful drops dismiss the preview, not the PNG. Quit safely cancels an active drag.
 - Automatic cleanup at startup and once per hour on a separate sleeping thread, never on the capture/render thread.
@@ -55,7 +56,7 @@ The floating implementation is functional, but exact macOS parity is **not yet v
 
 | Property | Provisional value |
 | --- | --- |
-| Preview image bounds | Up to 220 x 160 logical pixels, aspect-fit |
+| Preview card bounds | Fixed 220 x 160 logical pixels, centered aspect-fit content |
 | Screen-edge margin | 18 logical pixels |
 | Corner radius | Up to 6 logical pixels |
 | Entrance / exit duration | 180 ms each, native cubic-out interpolation |
@@ -132,7 +133,15 @@ To additionally test the real notification-area icon/menu and background executa
 
 Tray tests use Windows UI Automation and actual mouse/keyboard input. They verify menu capture/quit, keyboard activation, Escape dismissal, hotkeys during a popup, thumbnail lifetime across a long popup, and the release GUI subsystem. Explorer recovery is tested by removing our icon registration and simulating its `TaskbarCreated` notification, not by restarting the user's shell. Combined drag mode verifies that the tray quit request cancels an active OLE drag safely. Tray discovery and visual checks currently expect an English Windows shell with the native light context menu.
 
-Logs and visual artifacts (`overlay.png`, `thumbnail.png`, `tray-menu.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
+To validate the full-screen/layout regressions along with the complete flow:
+
+```powershell
+./scripts/smoke-capture.ps1 -Configuration release -Layout -Tray -DragDrop
+```
+
+Layout checks capture the entire monitor corner-to-corner in both directions and verify exact PNG dimensions/pixels and successful preview rendering. Landscape, portrait, square, and tiny regions must render inside an identical fixed card, with preserved content colors, matte letterboxing, and clearance above the actual taskbar. Portrait dragging from the letterbox additionally validates native drag pixels, aspect ratio, and rejected-drop recovery. The validation desktop reproduced `rcWork` incorrectly covering all 1080 pixels despite a visible 52-pixel bottom taskbar; the corrected preview reserves those 52 pixels plus its normal card margin. Top/left/right taskbars, auto-hide reveal thickness, negative origins, and DPI layouts are unit-tested; physical multi-monitor and mixed-DPI validation remains pending.
+
+Logs and visual artifacts (`overlay.png`, `thumbnail.png`, `tray-menu.png`, `fullscreen-False.png`, `fullscreen-True.png`, `thumbnail-portrait.png`, `thumbnail-taskbar.png`, `drag-portrait.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
 
 Initial successful release validation:
 
@@ -174,7 +183,8 @@ These are observations on the available desktop, not cross-hardware performance 
 | `src/cleanup.rs` | Conservative 24-hour temp retention and sleeping cleanup worker |
 | `src/worker.rs` | Reusable GPU session and background work queue |
 | `src/thumbnail/mod.rs` | Non-activating Win32 floating window and interactions |
-| `src/thumbnail/layout.rs` | DPI-aware preview bounds and rounded hit testing |
+| `src/thumbnail/layout.rs` | Fixed DPI-aware card, centered aspect-fit image, rounded hit testing |
+| `src/thumbnail/work_area.rs` | Monitor work area corrected for real shell taskbar/reveal bounds |
 | `src/thumbnail/lifecycle.rs` | Monotonic timeout, hover/drag pauses, and dismissal states |
 | `src/thumbnail/render.rs` | Shared Direct2D/DirectComposition rendering and animation |
 | `scripts/smoke-capture.ps1` | Interactive Windows end-to-end smoke test |

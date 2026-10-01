@@ -93,14 +93,14 @@ Requirements:
 
 - Borderless window
 - Always on top
-- Small screenshot preview
+- Fixed-size preview card, with screenshot content centered and aspect-fit inside it without stretching or cropping; capture aspect ratio must not change the card size
 - Rounded corners
 - Small margin from screen edges
 - Does not steal keyboard focus
 - Automatic dismissal timing matched to the observed native macOS reference, not an arbitrary 7-second timeout
 - Appearance and dismissal motion matched to the reference, including duration and easing
 - DPI-aware preview with preserved image aspect ratio, crisp edges, and reference-matched corner radius, shadow, size, and spacing
-- Position within the capture monitor's Windows work area so the thumbnail does not overlap the taskbar
+- Position above the capture monitor's taskbar with clear spacing, using both the Windows work area and actual shell taskbar bounds where work-area reporting is inconsistent; reserve clearance for auto-hide reveal too
 
 ```text
 Desktop

@@ -1,4 +1,6 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+
+use crate::geometry::aspect_fit;
 
 /// Physical monitor work area, which can have a negative desktop origin.
 #[derive(Clone, Copy)]
@@ -9,7 +11,7 @@ pub struct WorkArea {
     pub height: u32,
 }
 
-/// Geometry is provisional until compared against a native macOS reference.
+/// Fixed card with aspect-fit image; only DPI or available space changes its size.
 #[derive(Clone, Copy)]
 pub struct Layout {
     pub x: i32,
@@ -17,6 +19,10 @@ pub struct Layout {
     pub width: u32,
     pub height: u32,
     pub scale: f32,
+    pub card_left: f32,
+    pub card_top: f32,
+    pub card_width: f32,
+    pub card_height: f32,
     pub image_left: f32,
     pub image_top: f32,
     pub image_width: f32,
@@ -36,11 +42,18 @@ impl Layout {
             .min(area.width.min(area.height) as f32 / 4.0)
             .floor() as u32;
         let padding = (14.0 * scale).round().min(margin as f32) as u32;
-        let max_width = (220.0 * scale).min((area.width - margin * 2).max(1) as f32);
-        let max_height = (160.0 * scale).min((area.height - margin * 2).max(1) as f32);
-        let fit = (max_width / image_width as f32).min(max_height / image_height as f32);
-        let card_width = (image_width as f32 * fit).round().max(1.0) as u32;
-        let card_height = (image_height as f32 * fit).round().max(1.0) as u32;
+        let card_width = (220.0 * scale)
+            .round()
+            .min((area.width - margin * 2).max(1) as f32) as u32;
+        let card_height = (160.0 * scale)
+            .round()
+            .min((area.height - margin * 2).max(1) as f32) as u32;
+        let (fit_width, fit_height) =
+            aspect_fit(image_width, image_height, card_width, card_height)
+                .context("Cannot fit thumbnail image")?;
+        // Center on physical pixels so the GPU and WIC drag image use identical bounds.
+        let fit_left = padding + (card_width - fit_width) / 2;
+        let fit_top = padding + (card_height - fit_height) / 2;
         let width = card_width + padding + margin;
         let height = card_height + padding + margin;
         Ok(Self {
@@ -49,22 +62,26 @@ impl Layout {
             width,
             height,
             scale,
-            image_left: padding as f32 / scale,
-            image_top: padding as f32 / scale,
-            image_width: card_width as f32 / scale,
-            image_height: card_height as f32 / scale,
+            card_left: padding as f32 / scale,
+            card_top: padding as f32 / scale,
+            card_width: card_width as f32 / scale,
+            card_height: card_height as f32 / scale,
+            image_left: fit_left as f32 / scale,
+            image_top: fit_top as f32 / scale,
+            image_width: fit_width as f32 / scale,
+            image_height: fit_height as f32 / scale,
             radius: 6.0_f32.min(card_width.min(card_height) as f32 / (scale * 2.0)),
         })
     }
 
     pub fn contains(&self, client_x: f32, client_y: f32) -> bool {
-        let x = client_x / self.scale - self.image_left;
-        let y = client_y / self.scale - self.image_top;
-        if x < 0.0 || y < 0.0 || x >= self.image_width || y >= self.image_height {
+        let x = client_x / self.scale - self.card_left;
+        let y = client_y / self.scale - self.card_top;
+        if x < 0.0 || y < 0.0 || x >= self.card_width || y >= self.card_height {
             return false;
         }
-        let near_x = x.clamp(self.radius, self.image_width - self.radius);
-        let near_y = y.clamp(self.radius, self.image_height - self.radius);
+        let near_x = x.clamp(self.radius, self.card_width - self.radius);
+        let near_y = y.clamp(self.radius, self.card_height - self.radius);
         (x - near_x).powi(2) + (y - near_y).powi(2) <= self.radius.powi(2)
     }
 }
@@ -74,7 +91,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn anchors_to_work_area_at_all_supported_scales() -> Result<()> {
+    fn fixed_card_anchors_to_work_area_at_all_supported_scales() -> Result<()> {
         let area = WorkArea {
             left: -1920,
             top: -200,
@@ -82,13 +99,39 @@ mod tests {
             height: 1040,
         };
         for dpi in [96, 120, 144, 192] {
-            let layout = Layout::new(area, dpi, 350, 200)?;
-            let right = layout.x as f32 + (layout.image_left + layout.image_width) * layout.scale;
-            let bottom = layout.y as f32 + (layout.image_top + layout.image_height) * layout.scale;
-            let margin = (18.0 * layout.scale).round();
-            assert!((right - (area.left as f32 + area.width as f32 - margin)).abs() < 0.01);
-            assert!((bottom - (area.top as f32 + area.height as f32 - margin)).abs() < 0.01);
-            assert!((layout.image_width / layout.image_height - 1.75).abs() < 0.015);
+            let reference = Layout::new(area, dpi, 350, 200)?;
+            for (w, h) in [
+                (350, 200),
+                (200, 350),
+                (1920, 1080),
+                (100, 100),
+                (1, 10000),
+                (10000, 1),
+            ] {
+                let layout = Layout::new(area, dpi, w, h)?;
+                assert_eq!(
+                    (layout.x, layout.y, layout.width, layout.height),
+                    (reference.x, reference.y, reference.width, reference.height)
+                );
+                assert_eq!((layout.card_width, layout.card_height), (220.0, 160.0));
+                let right = layout.x as f32 + (layout.card_left + layout.card_width) * layout.scale;
+                let bottom =
+                    layout.y as f32 + (layout.card_top + layout.card_height) * layout.scale;
+                let margin = (18.0 * layout.scale).round();
+                assert!((right - (area.left as f32 + area.width as f32 - margin)).abs() < 0.01);
+                assert!((bottom - (area.top as f32 + area.height as f32 - margin)).abs() < 0.01);
+                assert!(
+                    layout.image_left >= layout.card_left && layout.image_top >= layout.card_top
+                );
+                assert!(
+                    layout.image_left + layout.image_width
+                        <= layout.card_left + layout.card_width + 0.01
+                );
+                assert!(
+                    layout.image_top + layout.image_height
+                        <= layout.card_top + layout.card_height + 0.01
+                );
+            }
         }
         Ok(())
     }
@@ -116,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn shadow_and_transparent_corners_are_not_interactive() -> Result<()> {
+    fn whole_card_including_letterbox_is_interactive_except_shadow_and_corners() -> Result<()> {
         let layout = Layout::new(
             WorkArea {
                 left: 0,
@@ -125,11 +168,15 @@ mod tests {
                 height: 1040,
             },
             96,
-            350,
             200,
+            350,
         )?;
         assert!(!layout.contains(0.0, 0.0));
-        assert!(!layout.contains(layout.image_left, layout.image_top));
+        assert!(!layout.contains(layout.card_left, layout.card_top));
+        assert!(layout.contains(
+            layout.card_left + 10.0,
+            layout.card_top + layout.card_height / 2.0
+        ));
         assert!(layout.contains(
             layout.image_left + layout.image_width / 2.0,
             layout.image_top + layout.image_height / 2.0

@@ -183,7 +183,8 @@ impl OverlayState {
         self.pointer = Point {
             x: (position.0 as u16 as i16) as i32,
             y: ((position.0 >> 16) as u16 as i16) as i32,
-        };
+        }
+        .at_monitor_edge(self.snapshot.width, self.snapshot.height);
     }
 }
 
