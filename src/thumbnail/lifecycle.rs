@@ -54,6 +54,9 @@ pub struct Lifecycle {
     remaining: Duration,
     hovered: bool,
     dragging: bool,
+    paused: bool,
+    pinned: bool,
+    auto_close: bool,
 }
 
 impl Lifecycle {
@@ -65,6 +68,9 @@ impl Lifecycle {
             remaining: timing.lifetime,
             hovered,
             dragging: false,
+            paused: false,
+            pinned: false,
+            auto_close: true,
         }
     }
 
@@ -80,14 +86,19 @@ impl Lifecycle {
                 }
             }
             Phase::Visible => {
-                if !self.hovered && !self.dragging {
+                if !self.hovered
+                    && !self.dragging
+                    && !self.paused
+                    && !self.pinned
+                    && self.auto_close
+                {
                     self.remaining = self
                         .remaining
                         .saturating_sub(now.saturating_duration_since(self.checkpoint));
                 }
                 self.checkpoint = now;
                 self.hovered = hovered;
-                if self.remaining.is_zero() {
+                if self.remaining.is_zero() && !self.paused && !self.pinned && self.auto_close {
                     return self.dismiss(now);
                 }
             }
@@ -100,6 +111,47 @@ impl Lifecycle {
             Phase::Closed => return Action::Close,
         }
         Action::None
+    }
+
+    pub fn set_paused(&mut self, now: Instant, paused: bool) -> Action {
+        let action = self.update(now, self.hovered);
+        self.paused = paused;
+        action
+    }
+
+    pub fn set_pinned(&mut self, now: Instant, pinned: bool) -> Action {
+        if !self.can_drag() {
+            return Action::None;
+        }
+        let action = self.update(now, self.hovered);
+        self.pinned = pinned;
+        if !pinned {
+            self.remaining = self.timing.lifetime;
+        }
+        action
+    }
+
+    pub fn set_timeout(&mut self, now: Instant, lifetime: Option<Duration>) {
+        if !self.can_drag() {
+            return;
+        }
+        self.checkpoint = now;
+        self.auto_close = lifetime.is_some();
+        if let Some(lifetime) = lifetime {
+            self.timing.lifetime = lifetime;
+            self.remaining = lifetime;
+        }
+    }
+
+    pub fn restart_entrance(&mut self, now: Instant) {
+        if self.can_drag() {
+            self.phase = Phase::Appearing;
+            self.checkpoint = now;
+        }
+    }
+
+    pub fn closed(&self) -> bool {
+        self.phase == Phase::Closed
     }
 
     pub fn can_drag(&self) -> bool {
@@ -136,8 +188,14 @@ impl Lifecycle {
     pub fn next_wake(&self, now: Instant) -> Option<Duration> {
         let elapsed = now.saturating_duration_since(self.checkpoint);
         match self.phase {
-            Phase::Appearing => Some(self.timing.appear.saturating_sub(elapsed)),
-            Phase::Visible if !self.hovered && !self.dragging => {
+            Phase::Appearing if !self.paused => Some(self.timing.appear.saturating_sub(elapsed)),
+            Phase::Visible
+                if !self.hovered
+                    && !self.dragging
+                    && !self.paused
+                    && !self.pinned
+                    && self.auto_close =>
+            {
                 Some(self.remaining.saturating_sub(elapsed))
             }
             Phase::Dismissing => Some(self.timing.dismiss.saturating_sub(elapsed)),
@@ -246,6 +304,79 @@ mod tests {
         assert_eq!(timing.lifetime, Timing::default().lifetime);
         assert_eq!(timing.appear, Duration::from_millis(1));
         assert_eq!(timing.dismiss, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn queued_and_capture_hidden_time_do_not_consume_remaining_budget() {
+        let now = Instant::now();
+        let timing = Timing::default();
+        let mut life = Lifecycle::new(now, timing, false);
+        life.update(now + timing.appear, false);
+        let pause = now + timing.appear + Duration::from_secs(2);
+        life.set_paused(pause, true);
+        assert_eq!(life.next_wake(pause), None);
+        let resume = pause + Duration::from_secs(120);
+        life.set_paused(resume, false);
+        assert_eq!(life.next_wake(resume), Some(Duration::from_secs(3)));
+        assert_eq!(
+            life.update(resume + Duration::from_secs(3), false),
+            Action::BeginDismiss
+        );
+    }
+
+    #[test]
+    fn pin_survives_timeout_and_unpin_starts_a_fresh_configured_interval() {
+        let now = Instant::now();
+        let timing = Timing::default();
+        let mut life = Lifecycle::new(now, timing, false);
+        life.update(now + timing.appear, false);
+        let pin = now + timing.appear + Duration::from_secs(2);
+        life.set_pinned(pin, true);
+        assert_eq!(
+            life.update(pin + Duration::from_secs(3600), false),
+            Action::None
+        );
+        assert_eq!(life.next_wake(pin + Duration::from_secs(3600)), None);
+        let unpin = pin + Duration::from_secs(3600);
+        life.set_pinned(unpin, false);
+        assert_eq!(life.next_wake(unpin), Some(timing.lifetime));
+        assert_eq!(
+            life.update(unpin + timing.lifetime, false),
+            Action::BeginDismiss
+        );
+    }
+
+    #[test]
+    fn never_and_changed_settings_do_not_prevent_explicit_close_or_revive_dismissal() {
+        let now = Instant::now();
+        let timing = Timing::default();
+        let mut life = Lifecycle::new(now, timing, false);
+        life.set_timeout(now, None);
+        assert_eq!(
+            life.update(now + Duration::from_secs(600), false),
+            Action::None
+        );
+        assert_eq!(life.next_wake(now + Duration::from_secs(600)), None);
+        let close = now + Duration::from_secs(601);
+        life.dismiss(close);
+        life.set_timeout(
+            close + Duration::from_millis(100),
+            Some(Duration::from_secs(15)),
+        );
+        assert_eq!(life.update(close + timing.dismiss, false), Action::Close);
+    }
+
+    #[test]
+    fn changing_timer_while_pinned_applies_after_unpin() {
+        let now = Instant::now();
+        let mut life = Lifecycle::new(now, Timing::default(), false);
+        life.set_pinned(now, true);
+        life.update(now + Duration::from_secs(30), false);
+        let change = now + Duration::from_secs(31);
+        life.set_timeout(change, Some(Duration::from_secs(15)));
+        assert_eq!(life.next_wake(change), None);
+        life.set_pinned(change, false);
+        assert_eq!(life.next_wake(change), Some(Duration::from_secs(15)));
     }
 
     #[test]

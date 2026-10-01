@@ -3,8 +3,10 @@
 mod capture;
 mod cleanup;
 mod drag_drop;
+mod gallery;
 mod geometry;
 mod overlay;
+mod settings;
 mod storage;
 mod thumbnail;
 mod tray;
@@ -59,7 +61,7 @@ struct App {
     worker: worker::Worker,
     pending: bool,
     overlay: Option<overlay::ActiveOverlay>,
-    thumbnail: Option<thumbnail::Thumbnail>,
+    gallery: gallery::Gallery,
     compositor: Rc<thumbnail::Compositor>,
     started: Instant,
 }
@@ -74,16 +76,21 @@ impl App {
             GetCursorPos(&mut pointer)?;
         }
         let monitor = unsafe { MonitorFromPoint(pointer, MONITOR_DEFAULTTONEAREST) }.0 as isize;
-        // Remove the old preview before capture and wait for DWM to present
-        // its removal. The PNG must not include our previous thumbnail.
-        if self.clear_thumbnail() {
+        // Hide all pending/pinned cards, without discarding them, before DXGI.
+        // Their clocks pause for the entire selection and PNG publication.
+        if self.gallery.capture_hidden(true)? {
             unsafe {
                 DwmFlush()?;
             }
         }
         self.started = Instant::now();
-        self.worker.capture(monitor)?;
+        if let Err(error) = self.worker.capture(monitor) {
+            self.gallery.capture_hidden(false)?;
+            self.schedule_thumbnail_timer()?;
+            return Err(error);
+        }
         self.pending = true;
+        self.schedule_thumbnail_timer()?;
         Ok(())
     }
 
@@ -95,8 +102,22 @@ impl App {
         self.pending = false;
         match result {
             WorkResult::Captured(result) => {
-                let snapshot = result?;
-                self.overlay = Some(overlay::ActiveOverlay::create(self.controller, snapshot)?);
+                let snapshot = match result {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.gallery.capture_hidden(false)?;
+                        self.schedule_thumbnail_timer()?;
+                        return Err(error);
+                    }
+                };
+                match overlay::ActiveOverlay::create(self.controller, snapshot) {
+                    Ok(overlay) => self.overlay = Some(overlay),
+                    Err(error) => {
+                        self.gallery.capture_hidden(false)?;
+                        self.schedule_thumbnail_timer()?;
+                        return Err(error);
+                    }
+                }
                 println!(
                     "Selection ready in {} ms",
                     self.started.elapsed().as_millis()
@@ -109,12 +130,13 @@ impl App {
                     self.started.elapsed().as_millis(),
                     image.path.display()
                 );
-                self.clear_thumbnail();
-                self.thumbnail = Some(thumbnail::Thumbnail::create(
+                let preview = thumbnail::Thumbnail::create(
                     self.controller,
                     Rc::clone(&self.compositor),
                     image,
-                )?);
+                    self.gallery.timeout(),
+                )?;
+                self.gallery.insert(preview)?;
                 self.schedule_thumbnail_timer()?;
                 println!("Preview ready in {} ms", self.started.elapsed().as_millis());
             }
@@ -129,10 +151,14 @@ impl App {
         let (region, error) = overlay.result();
         if let Some(error) = error {
             drop(overlay);
+            self.gallery.capture_hidden(false)?;
+            self.schedule_thumbnail_timer()?;
             anyhow::bail!("{error}");
         }
         let Some(region) = region else {
             drop(overlay);
+            self.gallery.capture_hidden(false)?;
+            self.schedule_thumbnail_timer()?;
             println!("Selection canceled");
             return Ok(());
         };
@@ -142,23 +168,22 @@ impl App {
             region.width, region.height
         );
         self.started = Instant::now();
-        self.worker.save(snapshot, region)?;
+        if let Err(error) = self.worker.save(snapshot, region) {
+            self.gallery.capture_hidden(false)?;
+            self.schedule_thumbnail_timer()?;
+            return Err(error);
+        }
         self.pending = true;
         Ok(())
     }
 }
 impl App {
     fn begin_drag(&mut self, source: WPARAM) -> Result<()> {
-        if !self
-            .thumbnail
-            .as_ref()
-            .is_some_and(|thumbnail| thumbnail.matches(source))
-        {
+        let Some((index, mut thumbnail)) = self.gallery.take(source) else {
             return Ok(());
-        }
-        // Move the owner out of App before entering OLE's reentrant message loop.
-        // The stable window state stays alive; no callback borrows the App.
-        let mut thumbnail = self.thumbnail.take().expect("thumbnail checked");
+        };
+        // Owner out of the collection before OLE's modal/reentrant loop.
+        self.gallery.pause_all()?;
         unsafe {
             let _ = KillTimer(Some(self.controller), THUMBNAIL_TIMER);
         }
@@ -170,41 +195,39 @@ impl App {
             }
             return Ok(());
         }
-        match result {
-            Ok(drag_drop::Outcome::Copied) => {
-                println!("Drag result: copied");
-                drop(thumbnail);
-            }
-            Ok(drag_drop::Outcome::Canceled) => {
-                println!("Drag result: canceled or rejected");
-                self.thumbnail = Some(thumbnail);
-                self.schedule_thumbnail_timer()?;
-            }
-            Err(error) => {
-                self.thumbnail = Some(thumbnail);
-                self.schedule_thumbnail_timer()?;
-                return Err(error);
-            }
+        match &result {
+            Ok(drag_drop::Outcome::Copied) => println!("Drag result: copied"),
+            Ok(drag_drop::Outcome::Canceled) => println!("Drag result: canceled or rejected"),
+            Err(_) => (),
         }
-        Ok(())
+        if thumbnail.pinned() || !matches!(result, Ok(drag_drop::Outcome::Copied)) {
+            self.gallery.restore(index, thumbnail);
+        }
+        self.gallery.reflow()?;
+        self.schedule_thumbnail_timer()?;
+        result.map(|_| ())
     }
 
     fn clear_thumbnail(&mut self) -> bool {
         unsafe {
             let _ = KillTimer(Some(self.controller), THUMBNAIL_TIMER);
         }
-        self.thumbnail.take().is_some()
+        let had_items = self.gallery.len() > 0;
+        self.gallery.clear();
+        if let Some(tray) = &self.tray {
+            tray.update(self.gallery.timeout(), 0);
+        }
+        had_items
     }
 
     fn schedule_thumbnail_timer(&mut self) -> Result<()> {
         unsafe {
             let _ = KillTimer(Some(self.controller), THUMBNAIL_TIMER);
         }
-        if let Some(delay) = self
-            .thumbnail
-            .as_ref()
-            .and_then(|thumbnail| thumbnail.next_wake())
-        {
+        if let Some(tray) = &self.tray {
+            tray.update(self.gallery.timeout(), self.gallery.len());
+        }
+        if let Some(delay) = self.gallery.next_wake() {
             let millis = delay
                 .as_millis()
                 .saturating_add(1)
@@ -220,28 +243,47 @@ impl App {
     }
 
     fn update_thumbnail(&mut self, source: Option<WPARAM>, dismiss: bool) -> Result<()> {
-        let Some(thumbnail) = self.thumbnail.as_mut() else {
+        self.gallery.tick(source, dismiss)?;
+        self.schedule_thumbnail_timer()
+    }
+
+    fn pin_thumbnail(&mut self, source: WPARAM) -> Result<()> {
+        self.gallery.toggle_pin(source)?;
+        self.schedule_thumbnail_timer()
+    }
+
+    fn navigate(&mut self, source: WPARAM, older: bool) -> Result<()> {
+        self.gallery.navigate(source, older)?;
+        self.schedule_thumbnail_timer()
+    }
+
+    fn context_menu(&mut self, source: WPARAM) -> Result<()> {
+        self.gallery.context_menu(source, self.controller)?;
+        self.schedule_thumbnail_timer()
+    }
+
+    fn report_error(&mut self, error: &anyhow::Error) {
+        // Failed capture/PNG/render work must not strand older previews hidden
+        // or leave their resumed clocks without a timer.
+        if !self.pending
+            && self.overlay.is_none()
+            && let Err(recovery) = self.gallery.capture_hidden(false)
+        {
+            eprintln!("Preview recovery failed: {recovery:#}");
+        }
+        if let Err(recovery) = self.schedule_thumbnail_timer() {
+            eprintln!("Preview timer recovery failed: {recovery:#}");
+        }
+        show_error(error);
+    }
+
+    fn configure_timeout(&mut self, index: usize) -> Result<()> {
+        let Some(timeout) = settings::AutoClose::ALL.get(index).copied() else {
             return Ok(());
         };
-        if source.is_some_and(|source| !thumbnail.matches(source)) {
-            return Ok(());
-        }
-        let result = if dismiss {
-            thumbnail.dismiss()
-        } else {
-            thumbnail.tick()
-        };
-        match result {
-            Ok(true) => {
-                self.clear_thumbnail();
-            }
-            Ok(false) => self.schedule_thumbnail_timer()?,
-            Err(error) => {
-                self.clear_thumbnail();
-                return Err(error);
-            }
-        }
-        Ok(())
+        timeout.save()?;
+        self.gallery.configure(timeout)?;
+        self.schedule_thumbnail_timer()
     }
 }
 
@@ -305,6 +347,11 @@ unsafe extern "system" fn controller_proc(
             | thumbnail::HOVER_CHANGED
             | thumbnail::DISMISS
             | thumbnail::BEGIN_DRAG
+            | thumbnail::PIN
+            | thumbnail::CONTEXT_MENU
+            | thumbnail::NAVIGATE
+            | tray::SET_TIMEOUT_REQUEST
+            | tray::CLOSE_ALL_REQUEST
     ) || (message == WM_TIMER && wparam.0 == THUMBNAIL_TIMER)
     {
         // Modal Windows loops dispatch messages directly, bypassing run(). Keep
@@ -324,6 +371,9 @@ unsafe extern "system" fn controller_proc(
                 });
             }
         });
+        return LRESULT(0);
+    }
+    if message == WM_COMMAND && gallery::handle_menu_command(hwnd, wparam, lparam) {
         return LRESULT(0);
     }
     // Tray callbacks can run inside TrackPopupMenu or DoDragDrop. This stable
@@ -386,7 +436,7 @@ fn run() -> Result<()> {
         worker,
         pending: false,
         overlay: None,
-        thumbnail: None,
+        gallery: gallery::Gallery::new(settings::AutoClose::load()),
         compositor,
         started: Instant::now(),
     };
@@ -406,13 +456,13 @@ fn run() -> Result<()> {
         )
         .context("Prototype exit shortcut Ctrl + Alt + Q is unavailable")?;
     }
-    app.tray = Some(tray::Tray::new(controller)?);
+    app.tray = Some(tray::Tray::new(controller, app.gallery.timeout())?);
     println!("Simple Screenshot - running in the notification area");
     println!("Alt + Shift + S: select a region on the monitor under the pointer");
     println!("Esc / right-click: cancel. Ctrl + Alt + Q: quit.");
     println!("Output: %LOCALAPPDATA%\\SimpleScreenshot\\Temp\\");
     println!(
-        "Preview: drag to copy a file, hover to pause, right-click to dismiss. Timing is provisional."
+        "Preview: drag to copy, hover for pin/close, right-click for actions, wheel to browse. Timing is provisional."
     );
     let mut message = MSG::default();
     loop {
@@ -423,7 +473,7 @@ fn run() -> Result<()> {
         if CAPTURE_REQUESTED.replace(false)
             && let Err(error) = app.start_capture()
         {
-            show_error(&error);
+            app.report_error(&error);
         }
         let status = if let Some(deferred) =
             DEFERRED_MESSAGES.with(|queue| queue.borrow_mut().pop_front())
@@ -453,6 +503,14 @@ fn run() -> Result<()> {
                 thumbnail::HOVER_CHANGED => app.update_thumbnail(Some(message.wParam), false),
                 thumbnail::DISMISS => app.update_thumbnail(Some(message.wParam), true),
                 thumbnail::BEGIN_DRAG => app.begin_drag(message.wParam),
+                thumbnail::PIN => app.pin_thumbnail(message.wParam),
+                thumbnail::CONTEXT_MENU => app.context_menu(message.wParam),
+                thumbnail::NAVIGATE => app.navigate(message.wParam, message.lParam.0 > 0),
+                tray::SET_TIMEOUT_REQUEST => app.configure_timeout(message.wParam.0),
+                tray::CLOSE_ALL_REQUEST => {
+                    app.clear_thumbnail();
+                    Ok(())
+                }
                 _ => {
                     unsafe {
                         DispatchMessageW(&message);
@@ -461,7 +519,7 @@ fn run() -> Result<()> {
                 }
             };
             if let Err(error) = result {
-                show_error(&error);
+                app.report_error(&error);
             }
         } else {
             unsafe {

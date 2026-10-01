@@ -1,31 +1,39 @@
 //! Native notification-area icon and menu. No polling or App borrows in modal loops.
+use crate::settings::AutoClose;
 use anyhow::Result;
+use std::cell::Cell;
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, POINT, WPARAM},
         UI::{Shell::*, WindowsAndMessaging::*},
     },
-    core::w,
+    core::{PCWSTR, w},
 };
 
 pub const CALLBACK: u32 = WM_APP + 6;
 pub const CAPTURE_REQUEST: u32 = WM_APP + 7;
 pub const QUIT_REQUEST: u32 = WM_APP + 8;
+pub const SET_TIMEOUT_REQUEST: u32 = WM_APP + 12;
+pub const CLOSE_ALL_REQUEST: u32 = WM_APP + 13;
 const ICON_ID: u32 = 1;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1; // NINF_KEY
 const CAPTURE_ITEM: usize = 1;
 const QUIT_ITEM: usize = 2;
+const CLOSE_ALL_ITEM: usize = 3;
+const TIMER_BASE: usize = 100;
 
 pub struct Tray {
     hwnd: HWND,
     icon: HICON,
     taskbar_created: u32,
+    timeout: Cell<AutoClose>,
+    count: Cell<usize>,
 }
 
 impl Tray {
     /// The controller must be a hidden top-level window, not HWND_MESSAGE,
     /// so it receives Explorer's TaskbarCreated broadcast.
-    pub fn new(hwnd: HWND) -> Result<Box<Self>> {
+    pub fn new(hwnd: HWND, timeout: AutoClose) -> Result<Box<Self>> {
         let pixels = icon_pixels();
         let mask = [0u8; 128]; // 32 x 32 monochrome AND mask, alpha supplies transparency.
         let icon = unsafe { CreateIcon(None, 32, 32, 1, 32, mask.as_ptr(), pixels.as_ptr()) }?;
@@ -33,6 +41,8 @@ impl Tray {
             hwnd,
             icon,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+            timeout: Cell::new(timeout),
+            count: Cell::new(0),
         });
         anyhow::ensure!(
             tray.taskbar_created != 0,
@@ -44,6 +54,27 @@ impl Tray {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&*tray as *const Self) as isize);
         }
         Ok(tray)
+    }
+
+    pub fn update(&self, timeout: AutoClose, count: usize) {
+        self.timeout.set(timeout);
+        self.count.set(count);
+    }
+
+    fn post_choice(&self, chosen: usize) -> Result<bool> {
+        let (message, parameter) = match chosen {
+            CAPTURE_ITEM => (CAPTURE_REQUEST, 0),
+            QUIT_ITEM => (QUIT_REQUEST, 0),
+            CLOSE_ALL_ITEM => (CLOSE_ALL_REQUEST, 0),
+            id if (TIMER_BASE..TIMER_BASE + AutoClose::ALL.len()).contains(&id) => {
+                (SET_TIMEOUT_REQUEST, id - TIMER_BASE)
+            }
+            _ => return Ok(false),
+        };
+        unsafe {
+            PostMessageW(Some(self.hwnd), message, WPARAM(parameter), LPARAM(0))?;
+        }
+        Ok(true)
     }
 
     fn data(&self) -> NOTIFYICONDATAW {
@@ -91,16 +122,12 @@ impl Tray {
         // Accessibility providers may invoke a menu item by sending WM_COMMAND
         // rather than returning a selection from TrackPopupMenu.
         if message == WM_COMMAND && lparam.0 == 0 && wparam.0 >> 16 == 0 {
-            let request = match wparam.0 {
-                CAPTURE_ITEM => CAPTURE_REQUEST,
-                QUIT_ITEM => QUIT_REQUEST,
-                _ => return false,
-            };
-            unsafe {
-                let _ = EndMenu();
-                if let Err(error) = PostMessageW(Some(self.hwnd), request, WPARAM(0), LPARAM(0)) {
-                    eprintln!("Tray command failed: {error}");
-                }
+            match self.post_choice(wparam.0) {
+                Ok(true) => unsafe {
+                    let _ = EndMenu();
+                },
+                Ok(false) => return false,
+                Err(error) => eprintln!("Tray command failed: {error}"),
             }
             return true;
         }
@@ -128,7 +155,7 @@ impl Tray {
                 GetCursorPos(&mut point)?;
             }
         }
-        let menu = Menu::new()?;
+        let menu = Menu::new(self.timeout.get(), self.count.get())?;
         let previous = unsafe { GetForegroundWindow() };
         // Required by the shell for outside-click/Escape dismissal of tray menus.
         unsafe {
@@ -155,13 +182,7 @@ impl Tray {
                 let _ = SetForegroundWindow(previous);
             }
             PostMessageW(Some(self.hwnd), WM_NULL, WPARAM(0), LPARAM(0))?;
-            match chosen {
-                CAPTURE_ITEM => {
-                    PostMessageW(Some(self.hwnd), CAPTURE_REQUEST, WPARAM(0), LPARAM(0))?
-                }
-                QUIT_ITEM => PostMessageW(Some(self.hwnd), QUIT_REQUEST, WPARAM(0), LPARAM(0))?,
-                _ => (),
-            }
+            self.post_choice(chosen)?;
         }
         Ok(())
     }
@@ -179,7 +200,7 @@ impl Drop for Tray {
 
 struct Menu(HMENU);
 impl Menu {
-    fn new() -> Result<Self> {
+    fn new(timeout: AutoClose, count: usize) -> Result<Self> {
         let menu = Self(unsafe { CreatePopupMenu() }?);
         unsafe {
             AppendMenuW(
@@ -187,6 +208,33 @@ impl Menu {
                 MF_STRING,
                 CAPTURE_ITEM,
                 w!("Take screenshot\tAlt+Shift+S"),
+            )?;
+            let timers = Self(CreatePopupMenu()?);
+            for (index, choice) in AutoClose::ALL.into_iter().enumerate() {
+                let label: Vec<u16> = choice.label().encode_utf16().chain(Some(0)).collect();
+                AppendMenuW(
+                    timers.0,
+                    MF_STRING
+                        | if timeout == choice {
+                            MF_CHECKED
+                        } else {
+                            MF_UNCHECKED
+                        },
+                    TIMER_BASE + index,
+                    PCWSTR(label.as_ptr()),
+                )?;
+            }
+            AppendMenuW(menu.0, MF_POPUP, timers.0.0 as usize, w!("Auto-close"))?;
+            std::mem::forget(timers); // parent menu owns and destroys its submenu
+            let label: Vec<u16> = format!("Close all screenshots ({count})")
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
+            AppendMenuW(
+                menu.0,
+                MF_STRING | if count > 0 { MF_ENABLED } else { MF_GRAYED },
+                CLOSE_ALL_ITEM,
+                PCWSTR(label.as_ptr()),
             )?;
             AppendMenuW(menu.0, MF_SEPARATOR, 0, None)?;
             AppendMenuW(menu.0, MF_STRING, QUIT_ITEM, w!("Quit"))?;
@@ -281,12 +329,15 @@ mod tests {
     }
 
     #[test]
-    fn native_menu_contains_only_capture_separator_and_quit() -> Result<()> {
-        let menu = Menu::new().context("Cannot create tray menu")?;
+    fn native_menu_has_timer_submenu_checked_choice_and_close_all() -> Result<()> {
+        let menu = Menu::new(AutoClose::Never, 5).context("Cannot create tray menu")?;
         unsafe {
-            assert_eq!(GetMenuItemCount(Some(menu.0)), 3);
+            assert_eq!(GetMenuItemCount(Some(menu.0)), 5);
             assert_eq!(GetMenuItemID(menu.0, 0), CAPTURE_ITEM as u32);
-            assert_eq!(GetMenuItemID(menu.0, 2), QUIT_ITEM as u32);
+            assert_eq!(GetMenuItemID(menu.0, 4), QUIT_ITEM as u32);
+            let timers = GetSubMenu(menu.0, 1);
+            assert_eq!(GetMenuItemCount(Some(timers)), 6);
+            assert!(GetMenuState(timers, TIMER_BASE as u32 + 5, MF_BYCOMMAND) & MF_CHECKED.0 != 0);
         }
         Ok(())
     }

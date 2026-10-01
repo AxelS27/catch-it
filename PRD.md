@@ -12,6 +12,8 @@ The application has one primary purpose:
 
 No screenshot editor, library, annotation tools, account system, or complex UI.
 
+**Approved follow-up milestone:** add a CleanShot-inspired pending thumbnail queue, persistent pinned reference cards, and a configurable auto-close timer through the native tray. This is a limited Windows extension, not a complete CleanShot clone. Our three-visible-card policy and timer defaults are design choices; CleanShot's exact overflow layout, default lifetime, and hover semantics are not yet verified.
+
 ---
 
 ## 2. Core User Flow
@@ -97,7 +99,7 @@ Requirements:
 - Rounded corners
 - Small margin from screen edges
 - Does not steal keyboard focus
-- Automatic dismissal timing matched to the observed native macOS reference, not an arbitrary 7-second timeout
+- Configurable automatic dismissal: 5 seconds by default, 15 seconds, 30 seconds, 5 minutes, 10 minutes, or Never. Record reference timings separately; do not present these development choices as measured macOS or CleanShot defaults
 - Appearance and dismissal motion matched to the reference, including duration and easing
 - DPI-aware preview with preserved image aspect ratio, crisp edges, and reference-matched corner radius, shadow, size, and spacing
 - Position above the capture monitor's taskbar with clear spacing, using both the Windows work area and actual shell taskbar bounds where work-area reporting is inconsistent; reserve clearance for auto-hide reveal too
@@ -210,6 +212,19 @@ Apple's public documentation describes the lifetime as "a few seconds" rather th
 - Use explicit lifecycle states so hover, drag, new capture, and animation completion cannot trigger conflicting transitions.
 - Preserve temporary files independently of thumbnail dismissal, even where macOS save behavior differs.
 
+### 5.3 Approved Queue, Pin, and Timer Extension
+
+- Preserve earlier captures in a newest-first, session-only pending queue. Show up to three pending cards per monitor, reducing the visible count on small work areas.
+- Provide older/newer page navigation through a native context menu, with a wheel shortcut when Windows routes inactive-window scrolling. Fourth and later captures remain accessible, not silently discarded.
+- Pause hidden queued cards' remaining timeout. Keep only a small cached preview and file guard for hidden entries, releasing full decoded images and GPU surfaces.
+- Expose pin and close controls on hover, plus native context-menu actions and tray close-all.
+- Pins remain always on top and do not auto-expire. They occupy independent positions beside the dock and can be moved using Alt+drag without activating the window.
+- A successful file drop closes an unpinned card but preserves a pinned reference. Closing a card never deletes its PNG.
+- Pins currently use the same fixed centered-cover card. Resizing, opacity, click-through locking, full-size reference windows, and editing are not part of this milestone.
+- Hide all previews and pins before capture and pause their clocks through selection and PNG publication. Restore them after completion or cancellation, including error recovery.
+- Changing the selected timer starts a fresh interval; unpinning also starts a fresh interval. Hover and active drag pause rather than reset the remaining interval.
+- Persist the timer preference across launches, not the queue/pin session. Closing the app or changing display/DPI dismisses reference cards; temporary files remain governed by retention independently.
+
 ---
 
 ## 6. Performance Requirements
@@ -286,9 +301,9 @@ This allows Windows applications to treat the screenshot as a normal file.
 
 ---
 
-## 8. MVP Scope
+## 8. Initial MVP Scope
 
-The first version should contain **ONLY**:
+The initial baseline contains:
 
 1. Global screenshot shortcut
 2. Region selection
@@ -300,7 +315,7 @@ The first version should contain **ONLY**:
 8. Automatic thumbnail dismissal
 9. Temporary file cleanup
 
-Nothing else.
+The approved follow-up adds a session-only multi-thumbnail queue, pinned reference cards, native timer choices, and close-all as specified in section 5.3. An editor or screenshot library is still excluded.
 
 ---
 

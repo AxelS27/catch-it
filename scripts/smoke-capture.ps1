@@ -3,7 +3,8 @@ param(
     [ValidateSet('debug', 'release')][string]$Configuration = 'debug',
     [switch]$DragDrop,
     [switch]$Tray,
-    [switch]$Layout
+    [switch]$Layout,
+    [switch]$Gallery
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,13 +70,33 @@ public static class CaptureInput {
         }, IntPtr.Zero);
         return result;
     }
-    public static IntPtr ThumbnailWindow() { return FindWindow("SimpleScreenshot.Thumbnail", null); }
-    public static IntPtr DragWindow() { return FindWindow("SimpleScreenshot.DragImage", null); }
-    public static int ThumbnailCount() {
-        int count = 0; IntPtr window = IntPtr.Zero;
-        while ((window = FindWindowEx(IntPtr.Zero, window, "SimpleScreenshot.Thumbnail", null)) != IntPtr.Zero) { count++; }
-        return count;
+    public static IntPtr[] ThumbnailWindows(bool visibleOnly = true) {
+        var list = new System.Collections.Generic.List<IntPtr>(); IntPtr window = IntPtr.Zero;
+        while ((window=FindWindowEx(IntPtr.Zero,window,"SimpleScreenshot.Thumbnail",null)) != IntPtr.Zero) {
+            if (!visibleOnly || IsWindowVisible(window)) { list.Add(window); }
+        }
+        list.Sort((a,b) => {
+            if (Pinned(a) != Pinned(b)) { return Pinned(a) ? 1 : -1; }
+            Rect ar,br; GetWindowRect(a,out ar); GetWindowRect(b,out br);
+            int right=br.Right.CompareTo(ar.Right); return right!=0 ? right : br.Bottom.CompareTo(ar.Bottom);
+        });
+        return list.ToArray();
     }
+    public static bool Pinned(IntPtr window) {
+        var title=new System.Text.StringBuilder(256); GetWindowText(window,title,256);
+        return title.ToString().StartsWith("Pinned screenshot");
+    }
+    public static IntPtr ThumbnailWindow() {
+        var windows=ThumbnailWindows(); if(windows.Length>0){return windows[0];}
+        windows=ThumbnailWindows(false); return windows.Length>0 ? windows[0] : IntPtr.Zero;
+    }
+    [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr window,int x,int y,int width,int height,bool repaint);
+    [DllImport("user32.dll")] static extern bool SystemParametersInfo(uint action,uint p,out uint result,uint flags);
+    public static bool InactiveWheelEnabled(){uint mode;return SystemParametersInfo(8220,0,out mode,0)&&mode==2;}
+    public static void WheelAt(int x,int y,int delta) { MouseAt(x,y,0); System.Threading.Thread.Sleep(100); mouse_event(2048,0,0,unchecked((uint)delta),UIntPtr.Zero); }
+    public static IntPtr DragWindow() { return FindWindow("SimpleScreenshot.DragImage", null); }
+    public static int ThumbnailCount() { return ThumbnailWindows().Length; }
+    public static int PendingCount() { return ThumbnailWindows(false).Length; }
     public static IntPtr ControllerWindow() { return FindWindow("SimpleScreenshot.Controller", null); }
     public static IntPtr TaskbarWindow() { return FindWindow("Shell_TrayWnd", null); }
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
@@ -180,9 +201,31 @@ function Wait-Overlay([bool]$Visible) {
     }
     throw "Overlay visibility did not become $Visible. Check $artifacts logs."
 }
-function Start-Selection {
+function Close-AllPreviews {
+    [void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(), 0x800d, [IntPtr]::Zero, [IntPtr]::Zero)
+    for ($i=0; $i -lt 100; $i++) {
+        if ([CaptureInput]::PendingCount() -eq 0) { return }
+        Start-Sleep -Milliseconds 25
+    }
+    throw 'Fixture cleanup could not close pending previews.'
+}
+function Click-PreviewControl([IntPtr]$Window, [switch]$Pin) {
+    $rect=New-Object CaptureInput+Rect
+    [void][CaptureInput]::GetWindowRect($Window,[ref]$rect)
+    $scale=[CaptureInput]::GetDpiForWindow($Window)/96.0
+    $offset=if($Pin){51}else{21}
+    $x=[int]($rect.Right-(18+$offset)*$scale)
+    $y=[int]($rect.Top+(14+18)*$scale)
+    [CaptureInput]::MouseAt($x,$y,0)
+    Start-Sleep -Milliseconds 100
+    [CaptureInput]::ClickAt($x,$y)
+    Start-Sleep -Milliseconds 180
+}
+function Start-Selection([switch]$KeepPreviews) {
+    if (-not $KeepPreviews) { Close-AllPreviews }
     [void][CaptureInput]::SetForegroundWindow($script:sceneWindow)
-    [void][CaptureInput]::SetCursorPos($script:sceneRect.Left + 25, $script:sceneRect.Top + 25)
+    # Keep a software-composited RDP cursor away from sampled capture pixels.
+    [void][CaptureInput]::SetCursorPos($script:sceneRect.Left + 450, $script:sceneRect.Top + 350)
     Start-Sleep -Milliseconds 100
     [void][CaptureInput]::SetForegroundWindow($script:sceneWindow)
     $script:expectedFocus = [CaptureInput]::GetForegroundWindow()
@@ -220,13 +263,13 @@ function Wait-Thumbnail([bool]$Visible, [int]$TimeoutMs = 6000) {
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     while ($clock.ElapsedMilliseconds -lt $TimeoutMs) {
         $hwnd = [CaptureInput]::ThumbnailWindow()
-        if (($hwnd -ne [IntPtr]::Zero) -eq $Visible) { return $hwnd }
+        if (($hwnd -ne [IntPtr]::Zero -and [CaptureInput]::IsWindowVisible($hwnd)) -eq $Visible) { return $hwnd }
         Start-Sleep -Milliseconds 25
     }
     throw "Thumbnail visibility did not become $Visible. Check $artifacts logs."
 }
 function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeight = 200,
-    $Samples = @(@(80,170,'Blue'), @(80,55,'Red'), @(200,55,'Lime')), [string]$Artifact = 'thumbnail.png') {
+    $Samples = @(@(80,170,'Blue'), @(80,55,'Red'), @(200,55,'Lime')), [string]$Artifact = 'thumbnail.png', [int]$ExpectedCount = 1) {
     $rect = New-Object CaptureInput+Rect
     [void][CaptureInput]::GetWindowRect($Window, [ref]$rect)
     $scale = [CaptureInput]::GetDpiForWindow($Window) / 96.0
@@ -277,7 +320,7 @@ function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeig
         $bitmap.Save((Join-Path $artifacts $Artifact))
         if (-not $ready) { throw "Thumbnail preview never reached the expected rendered colors at $x,${y}: $($bitmap.GetPixel($x,$y)). See thumbnail.png." }
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
-    if ([CaptureInput]::ThumbnailCount() -ne 1) { throw 'Expected exactly one floating preview.' }
+    if ($ExpectedCount -gt 0 -and [CaptureInput]::ThumbnailCount() -ne $ExpectedCount) { throw "Expected $ExpectedCount visible previews." }
     return $rect
 }
 function Get-Shots {
@@ -305,15 +348,25 @@ function Assert-Png([string]$Path) {
     } finally { $bitmap.Dispose() }
 }
 
-function New-TestPreview {
+function Wait-NewPreview([IntPtr[]]$Before) {
+    for($i=0;$i -lt 100;$i++){
+        foreach($window in [CaptureInput]::ThumbnailWindows()){
+            if($window -notin $Before){return $window}
+        }
+        Start-Sleep -Milliseconds 25
+    }
+    throw 'New capture did not publish a new visible preview.'
+}
+function New-TestPreview([switch]$KeepPreviews) {
+    $beforeWindows=[CaptureInput]::ThumbnailWindows($false)
     $before = @(Get-Shots)
-    [void](Start-Selection)
+    [void](Start-Selection -KeepPreviews:$KeepPreviews)
     Drag-Selection $false
     $shot = Wait-NewShot $before
     $script:created += $shot
     Assert-Png $shot
-    $preview = Wait-Thumbnail $true
-    [void](Assert-Preview $preview)
+    $preview = Wait-NewPreview $beforeWindows
+    [void](Assert-Preview $preview -ExpectedCount $(if($KeepPreviews){0}else{1}))
     return @{ Shot = $shot; Window = $preview; Foreground = [CaptureInput]::GetForegroundWindow() }
 }
 function Wait-DragLog([string]$Text) {
@@ -450,28 +503,48 @@ function Test-Layout {
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
     # The card edge remains interactive after changing from fit to cover.
     $scale = [CaptureInput]::GetDpiForWindow($preview)/96.0
-    [CaptureInput]::ClickAt([int]($rect.Left+20*$scale), [int](($rect.Top+$rect.Bottom)/2), 8, 16)
+    Click-PreviewControl $preview
     [void](Wait-Thumbnail $false 1500)
-    Write-Host 'PASS: filled card edge remains interactive'
+    Write-Host 'PASS: filled card supports a close control without changing its bounds'
 }
 function Find-TrayButton {
     $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Simple Screenshot - Alt + Shift + S')
-    return [System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+    $fallback=$null
+    foreach($button in [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition)){
+        if(-not $button.Current.IsOffscreen){return $button}
+        $fallback=$button
+    }
+    return $fallback
 }
 function Open-TrayMenu {
     $button = Find-TrayButton
     if (-not $button -or $button.Current.IsOffscreen) {
+        # An overflow popup can survive a previous process/menu. Close it before
+        # toggling the chevron, otherwise that click can hide rather than open it.
+        $scene=New-Object CaptureInput+Rect
+        [void][CaptureInput]::GetWindowRect($sceneWindow,[ref]$scene)
+        [CaptureInput]::ClickAt(($scene.Left+10),($scene.Top+10))
+        Start-Sleep -Milliseconds 150
         $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Show Hidden Icons')
         $overflow = [System.Windows.Automation.AutomationElement]::RootElement.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-        if ($overflow) { $overflow.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke() }
+        if ($overflow -and -not $overflow.Current.IsOffscreen) {
+            $overflow.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+        }
         for ($i = 0; $i -lt 100; $i++) {
             $button = Find-TrayButton
             if ($button -and -not $button.Current.IsOffscreen) { break }
             Start-Sleep -Milliseconds 50
         }
     }
-    if (-not $button -or $button.Current.IsOffscreen) { throw 'Real notification-area icon not accessible (test expects English Windows shell).' }
+    if (-not $button -or $button.Current.IsOffscreen) {
+        Save-GalleryScreenshot 'tray-unavailable.png'
+        $shell=[System.Windows.Automation.AutomationElement]::FromHandle([CaptureInput]::TaskbarWindow())
+        @($shell.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition) | ForEach-Object { $_.Current | Select-Object Name,AutomationId,ClassName,IsOffscreen,BoundingRectangle }) | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $artifacts 'tray-uia.json')
+        throw 'Real notification-area icon not accessible (test expects English Windows shell). See tray-unavailable.png.'
+    }
     $rect = $button.Current.BoundingRectangle
+    [CaptureInput]::MouseAt([int]($rect.X+$rect.Width/2),[int]($rect.Y+$rect.Height/2),0)
+    Start-Sleep -Milliseconds 100
     [CaptureInput]::ClickAt([int]($rect.X + $rect.Width/2), [int]($rect.Y + $rect.Height/2), 8, 16)
     for ($i = 0; $i -lt 100; $i++) {
         if ([CaptureInput]::MenuWindow() -ne [IntPtr]::Zero) { return }
@@ -484,10 +557,11 @@ function Select-TrayItem([string]$Name, [switch]$Accessible) {
         [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, $Name),
         [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::MenuItem))
     for ($i = 0; $i -lt 100; $i++) {
-        $menuWindow = [CaptureInput]::MenuWindow()
-        $item = if ($menuWindow -ne [IntPtr]::Zero) {
-            [System.Windows.Automation.AutomationElement]::FromHandle($menuWindow).FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
-        } else { $null }
+        $matches = [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+        $item = $null
+        foreach ($candidate in $matches) {
+            if ($candidate.Current.ProcessId -eq $app.Id -and -not $candidate.Current.IsOffscreen) { $item=$candidate; break }
+        }
         if ($item) {
             if ($Accessible) {
                 $item.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
@@ -499,7 +573,168 @@ function Select-TrayItem([string]$Name, [switch]$Accessible) {
         }
         Start-Sleep -Milliseconds 25
     }
-    throw "Native tray menu item not found: $Name"
+    Save-GalleryScreenshot 'menu-item-unavailable.png'
+    throw "Native tray menu item not found: $Name. See menu-item-unavailable.png."
+}
+function Set-AutoClose([string]$Label, [string]$Value) {
+    Open-TrayMenu
+    $condition=[System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Auto-close'),
+        [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ControlTypeProperty,[System.Windows.Automation.ControlType]::MenuItem))
+    $item=$null
+    foreach($candidate in [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition)){
+        if($candidate.Current.ProcessId -eq $app.Id -and -not $candidate.Current.IsOffscreen){$item=$candidate;break}
+    }
+    if(-not $item){throw 'Auto-close submenu missing.'}
+    $r=$item.Current.BoundingRectangle
+    [CaptureInput]::MouseAt([int]($r.X+$r.Width/2),[int]($r.Y+$r.Height/2),0)
+    Start-Sleep -Milliseconds 100
+    $item.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+    Select-TrayItem $Label -Accessible
+    $settings=Join-Path (Split-Path $output -Parent) 'settings.txt'
+    for($i=0;$i -lt 100;$i++){
+        if((Test-Path $settings) -and (Get-Content -Raw $settings).Trim() -eq "auto_close=$Value"){return}
+        Start-Sleep -Milliseconds 25
+    }
+    throw "Timer setting $Label was not persisted."
+}
+function Wait-GalleryCounts([int]$Visible,[int]$Pending,[int]$TimeoutMs=2500) {
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    while($clock.ElapsedMilliseconds -lt $TimeoutMs){
+        if([CaptureInput]::ThumbnailCount() -eq $Visible -and [CaptureInput]::PendingCount() -eq $Pending){return}
+        Start-Sleep -Milliseconds 25
+    }
+    Save-GalleryScreenshot 'gallery-count-failure.png'
+    throw "Gallery counts: visible=$([CaptureInput]::ThumbnailCount()), pending=$([CaptureInput]::PendingCount()); expected $Visible/$Pending."
+}
+function Save-GalleryScreenshot([string]$Name) {
+    $screen=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $bitmap=[Drawing.Bitmap]::new($screen.Width,$screen.Height)
+    $graphics=[Drawing.Graphics]::FromImage($bitmap)
+    try{$graphics.CopyFromScreen($screen.Left,$screen.Top,0,0,$bitmap.Size);$bitmap.Save((Join-Path $artifacts $Name))}
+    finally{$graphics.Dispose();$bitmap.Dispose()}
+}
+function Test-Gallery {
+    $taskbar=New-Object CaptureInput+Rect
+    [void][CaptureInput]::GetWindowRect([CaptureInput]::TaskbarWindow(),[ref]$taskbar)
+    Close-AllPreviews
+    Set-AutoClose 'Never' 'never'
+    $pin=New-TestPreview
+    Click-PreviewControl $pin.Window -Pin
+    for($i=0;$i -lt 100 -and -not [CaptureInput]::Pinned($pin.Window);$i++){Start-Sleep -Milliseconds 25}
+    if(-not [CaptureInput]::Pinned($pin.Window)){throw 'Pin control did not create a persistent reference.'}
+    $old=New-Object CaptureInput+Rect
+    [void][CaptureInput]::GetWindowRect($pin.Window,[ref]$old)
+    [void][CaptureInput]::SetForegroundWindow($sceneWindow)
+    $focus=[CaptureInput]::GetForegroundWindow()
+    $x=[int](($old.Left+$old.Right)/2);$y=[int](($old.Top+$old.Bottom)/2)
+    [CaptureInput]::keybd_event(18,0,0,[UIntPtr]::Zero)
+    [CaptureInput]::HoldAt($x,$y)
+    Start-Sleep -Milliseconds 100
+    for($i=1;$i -le 20;$i++){[CaptureInput]::MouseAt(($x-$i*10),($y-$i*8),0);Start-Sleep -Milliseconds 15}
+    [CaptureInput]::DropAt(($x-200),($y-160))
+    [CaptureInput]::keybd_event(18,0,2,[UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 150
+    $moved=New-Object CaptureInput+Rect
+    [void][CaptureInput]::GetWindowRect($pin.Window,[ref]$moved)
+    if($moved.Left -ge $old.Left -or $moved.Top -ge $old.Top -or [CaptureInput]::GetForegroundWindow() -ne $focus){Save-GalleryScreenshot 'pin-move-failure.png';throw "Alt+drag failed: old=$($old.Left),$($old.Top), moved=$($moved.Left),$($moved.Top), focus=$focus/$([CaptureInput]::GetForegroundWindow())."}
+    Write-Host 'PASS: pin control and Alt+drag move persistent reference without stealing focus'
+
+    # Put known blue desktop pixels underneath the pin, then select through it.
+    [void][CaptureInput]::MoveWindow($sceneWindow,($moved.Left-10),($moved.Top-250),600,400,$true)
+    [void][CaptureInput]::GetWindowRect($sceneWindow,[ref]$script:sceneRect)
+    Start-Sleep -Milliseconds 150
+    $beforeWindows=[CaptureInput]::ThumbnailWindows($false)
+    $before=@(Get-Shots)
+    [void](Start-Selection -KeepPreviews)
+    Wait-GalleryCounts 0 1
+    [CaptureInput]::HoldAt(($moved.Left+60),($moved.Top+54))
+    Start-Sleep -Milliseconds 75
+    [CaptureInput]::DropAt(($moved.Left+120),($moved.Top+94))
+    [void](Wait-Overlay $false)
+    $shot=Wait-NewShot $before
+    $script:created+=$shot
+    $bitmap=[Drawing.Bitmap]::new($shot)
+    try{
+        if($bitmap.Width -ne 60 -or $bitmap.Height -ne 40 -or $bitmap.GetPixel(10,10).ToArgb() -ne [Drawing.Color]::Blue.ToArgb()){throw 'Pinned reference leaked into the source PNG.'}
+    }finally{$bitmap.Dispose()}
+    $preview=Wait-NewPreview $beforeWindows
+    Start-Sleep -Milliseconds 220
+    Click-PreviewControl $preview
+    Wait-GalleryCounts 1 1
+    [void][CaptureInput]::MoveWindow($sceneWindow,200,200,600,400,$true)
+    [void][CaptureInput]::GetWindowRect($sceneWindow,[ref]$script:sceneRect)
+    Write-Host 'PASS: pinned reference is hidden during capture, restored afterwards, and excluded from PNG'
+
+    $records=@()
+    for($i=1;$i -le 5;$i++){
+        $records+=New-TestPreview -KeepPreviews
+        Wait-GalleryCounts ([Math]::Min(3,$i)+1) ($i+1)
+    }
+    Save-GalleryScreenshot 'gallery-four-visible.png'
+    foreach($window in [CaptureInput]::ThumbnailWindows()){
+        $r=New-Object CaptureInput+Rect
+        [void][CaptureInput]::GetWindowRect($window,[ref]$r)
+        $scale=[CaptureInput]::GetDpiForWindow($window)/96.0
+        $cardBottom=$r.Bottom-[int][Math]::Round(18*$scale)
+        if($cardBottom -gt $taskbar.Top-[int][Math]::Round(18*$scale)){throw 'Stack or pin overlaps taskbar clearance.'}
+    }
+    $gdiBefore=[CaptureInput]::GetGuiResources($app.Handle,0)
+    $latest=$records[4].Window
+    $r=New-Object CaptureInput+Rect
+    [void][CaptureInput]::GetWindowRect($latest,[ref]$r)
+    [CaptureInput]::ClickAt([int](($r.Left+$r.Right)/2),[int](($r.Top+$r.Bottom)/2),8,16)
+    Select-TrayItem 'Older screenshots'
+    Wait-GalleryCounts 3 6
+    if(-not [CaptureInput]::IsWindowVisible($records[0].Window) -or -not [CaptureInput]::IsWindowVisible($records[1].Window) -or [CaptureInput]::IsWindowVisible($records[4].Window)){throw 'Fourth-plus captures are not reachable through queue navigation.'}
+    [void](Assert-Preview $records[1].Window -Artifact 'gallery-restored-card.png' -ExpectedCount 3)
+    for($i=0;$i -lt 5;$i++){
+        $r=New-Object CaptureInput+Rect
+        [void][CaptureInput]::GetWindowRect($records[1].Window,[ref]$r)
+        if([CaptureInput]::InactiveWheelEnabled()){
+            [CaptureInput]::WheelAt([int](($r.Left+$r.Right)/2),[int](($r.Top+$r.Bottom)/2),120)
+        }else{
+            [CaptureInput]::ClickAt([int](($r.Left+$r.Right)/2),[int](($r.Top+$r.Bottom)/2),8,16)
+            Select-TrayItem 'Newer screenshots'
+        }
+        Wait-GalleryCounts 4 6
+        if(-not [CaptureInput]::IsWindowVisible($records[4].Window)){throw 'Navigation did not show newer page.'}
+        [void][CaptureInput]::GetWindowRect($records[4].Window,[ref]$r)
+        if([CaptureInput]::InactiveWheelEnabled()){
+            [CaptureInput]::WheelAt([int](($r.Left+$r.Right)/2),[int](($r.Top+$r.Bottom)/2),-120)
+        }else{
+            [CaptureInput]::ClickAt([int](($r.Left+$r.Right)/2),[int](($r.Top+$r.Bottom)/2),8,16)
+            Select-TrayItem 'Older screenshots'
+        }
+        Wait-GalleryCounts 3 6
+    }
+    if([CaptureInput]::GetGuiResources($app.Handle,0) -gt $gdiBefore+2){throw 'Paging leaked GDI resources.'}
+    Write-Host "PASS: five pending captures plus pin; three-card limit, native paging (inactive wheel enabled=$([CaptureInput]::InactiveWheelEnabled())), cached pixel restoration, stable GDI resources"
+
+    Set-AutoClose '5 seconds' '5'
+    [CaptureInput]::MouseAt(($sceneRect.Left+450),($sceneRect.Top+350),0)
+    Wait-GalleryCounts 1 1 15000
+    if(-not [CaptureInput]::Pinned($pin.Window) -or -not (Test-Path $pin.Shot)){
+        Save-GalleryScreenshot 'pin-lifetime-failure.png'
+        throw "Pinned reference lost: hwnd=$($pin.Window), pinned=$([CaptureInput]::Pinned($pin.Window)), visible=$([CaptureInput]::IsWindowVisible($pin.Window)), file=$([bool](Test-Path $pin.Shot))."
+    }
+    foreach($record in $records){if(-not (Test-Path $record.Shot)){throw 'Auto-close deleted a screenshot file.'}}
+    Click-PreviewControl $pin.Window -Pin
+    Wait-GalleryCounts 0 0 7000
+    Write-Host 'PASS: configurable timer expires visible queue in stages, keeps pins/files, and unpin receives a fresh interval'
+
+    Set-AutoClose 'Never' 'never'
+    $record=New-TestPreview
+    [void][CaptureInput]::SetForegroundWindow($sceneWindow)
+    [CaptureInput]::MouseAt(($sceneRect.Left+450),($sceneRect.Top+350),0)
+    Start-Sleep -Seconds 6
+    Wait-GalleryCounts 1 1
+    Open-TrayMenu
+    Select-TrayItem 'Close all screenshots (1)' -Accessible
+    Wait-GalleryCounts 0 0
+    if(-not (Test-Path $record.Shot)){throw 'Close all deleted source PNG.'}
+    Write-Host 'PASS: Never disables timeout; accessible tray Close all closes previews without deleting files'
+    Set-AutoClose '5 seconds' '5'
 }
 function Test-Tray {
     Add-Type -AssemblyName UIAutomationClient
@@ -559,7 +794,7 @@ function Test-Tray {
     Assert-Png $shot
     $preview = Wait-Thumbnail $true
     $previewRect = Assert-Preview $preview
-    [CaptureInput]::ClickAt([int](($previewRect.Left+$previewRect.Right)/2), [int](($previewRect.Top+$previewRect.Bottom)/2), 8, 16)
+    Click-PreviewControl $preview
     [void](Wait-Thumbnail $false 1500)
     Write-Host 'PASS: TaskbarCreated simulation restores icon; real tray Take screenshot captures exact PNG'
     $record = New-TestPreview
@@ -646,6 +881,26 @@ function Test-DragDrop {
     if ((Get-FileHash -LiteralPath $copy).Hash -ne $hash) { throw 'Explorer copy has incorrect bytes.' }
     Write-Host 'PASS: real Explorer drop copies identical PNG bytes and keeps the source'
     Remove-Item -LiteralPath $copy
+
+    $record=New-TestPreview
+    Click-PreviewControl $record.Window -Pin
+    if(-not [CaptureInput]::Pinned($record.Window)){throw 'Drag fixture did not pin.'}
+    $hash=(Get-FileHash -LiteralPath $record.Shot).Hash
+    Begin-PreviewDrag $record.Window $x $y
+    Wait-DragLog 'Drag started:'
+    [CaptureInput]::DropAt($x,$y)
+    Wait-DragLog 'Drag result: copied'
+    Wait-GalleryCounts 1 1
+    $copy=Join-Path $destination (Split-Path -Leaf $record.Shot)
+    for($i=0;$i -lt 200 -and -not(Test-Path -LiteralPath $copy);$i++){Start-Sleep -Milliseconds 25}
+    if(-not [CaptureInput]::Pinned($record.Window) -or -not(Test-Path -LiteralPath $record.Shot) -or
+        -not(Test-Path -LiteralPath $copy) -or (Get-FileHash -LiteralPath $copy).Hash -ne $hash){
+        throw 'Successful pinned drag lost the reference/source or changed copy bytes.'
+    }
+    Click-PreviewControl $record.Window
+    Wait-GalleryCounts 0 0
+    Remove-Item -LiteralPath $copy
+    Write-Host 'PASS: successful real Explorer drop keeps pinned reference and unchanged original PNG'
 
     $tag = 'SimpleScreenshot Terminal E2E ' + $PID
     $receiver = Join-Path $artifacts 'terminal-receiver.ps1'
@@ -744,6 +999,7 @@ try {
     Write-Host 'PASS: real app startup cleans expired files, preserves recent/unrelated/locked files'
     Start-Sleep -Milliseconds 350
     if ($Layout) { Test-Layout }
+    if ($Gallery) { Test-Gallery }
     if ($Tray) { Test-Tray }
 
     foreach ($reverse in @($false, $true)) {
@@ -761,9 +1017,14 @@ try {
         $centerY = [int](($previewRect.Top + $previewRect.Bottom) / 2)
         if (-not $reverse) {
             Start-Sleep -Milliseconds 1800
+            [CaptureInput]::MouseAt($centerX,$centerY,0)
+            Start-Sleep -Milliseconds 100
+            # Focus at the gesture is authoritative; activation before it must
+            # not be misattributed to a non-activating preview click.
+            $clickFocus=[CaptureInput]::GetForegroundWindow()
             [CaptureInput]::ClickAt($centerX, $centerY)
             Start-Sleep -Milliseconds 100
-            if ([CaptureInput]::GetForegroundWindow() -ne $script:expectedFocus) { throw 'Clicking the preview stole keyboard focus.' }
+            if ([CaptureInput]::GetForegroundWindow() -ne $clickFocus) { throw 'Clicking the preview stole keyboard focus.' }
             # Keep injecting the hover position during the hold, just as the
             # drag test controls its position. Remote pointer updates can reset
             # a one-off synthetic move even when no physical mouse is moving.
@@ -786,11 +1047,11 @@ try {
             if (-not (Test-Path -LiteralPath $shot)) { throw 'Dismissal deleted the PNG.' }
             Write-Host "PASS: mouse exit resumes remaining time ($($remaining.ElapsedMilliseconds) ms), file survives automatic dismissal"
         } else {
-            [CaptureInput]::ClickAt($centerX, $centerY, 8, 16)
+            Click-PreviewControl $preview
             [void](Wait-Thumbnail $false 1500)
             if (-not (Test-Path -LiteralPath $shot)) { throw 'Manual dismissal deleted the PNG.' }
             if ([CaptureInput]::GetForegroundWindow() -ne $script:expectedFocus) { throw 'Dismissal stole keyboard focus.' }
-            Write-Host 'PASS: right-click dismisses without stealing focus or deleting the file'
+            Write-Host 'PASS: close control dismisses without stealing focus or deleting the file'
         }
     }
 
@@ -812,7 +1073,7 @@ try {
     $oldShot = $shot
     $before = @(Get-Shots)
     [void](Start-Selection)
-    if ([CaptureInput]::ThumbnailWindow() -ne [IntPtr]::Zero) { throw 'Old preview remained visible during capture.' }
+    if ([CaptureInput]::ThumbnailCount() -ne 0) { throw 'Old preview remained visible during capture.' }
     # The old HWND is now destroyed; use the known DPI of this desktop instead.
     $scale = [CaptureInput]::GetDpiForWindow($sceneWindow) / 96.0
     $padding = [int][Math]::Round(14 * $scale, [MidpointRounding]::AwayFromZero)
@@ -859,6 +1120,11 @@ try {
         Write-Host "PASS: $cancel cancels without creating a file or stale thumbnail"
     }
 
+    if($Gallery){
+        [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr]::Zero,200,200,0,0,0x15)
+        [void][CaptureInput]::GetWindowRect($sceneWindow,[ref]$sceneRect)
+        Set-AutoClose 'Never' 'never'
+    }
     $before = @(Get-Shots)
     [void](Start-Selection)
     Drag-Selection $false
@@ -898,12 +1164,25 @@ try {
     if ([CaptureInput]::ThumbnailWindow() -ne [IntPtr]::Zero -or -not (Test-Path -LiteralPath $finalShot)) { throw 'Shutdown left a window or removed the PNG.' }
     if ($Tray -and [CaptureInput]::ControllerWindow() -ne [IntPtr]::Zero) { throw 'Tray controller survived quit.' }
     Write-Host "PASS: clean shutdown with active preview/drag (drag=$DragDrop tray=$Tray); file survives"
-    if ($Tray) {
+    if ($Tray -or $Gallery) {
+        # Preserve the first process's diagnostics before the restart reopens streams.
+        Copy-Item (Join-Path $artifacts 'stdout.log') (Join-Path $artifacts 'stdout-first-session.log') -Force
+        Copy-Item (Join-Path $artifacts 'stderr.log') (Join-Path $artifacts 'stderr-first-session.log') -Force
         # Validate quit while TrackPopupMenu, rather than the outer loop, owns input.
         [void][CaptureInput]::SetWindowPos($sceneWindow, [IntPtr]::Zero, 200, 200, 0, 0, 0x15)
+        [void][CaptureInput]::GetWindowRect($sceneWindow,[ref]$sceneRect)
         $app = Start-Process @launch
         for ($i = 0; $i -lt 100 -and [CaptureInput]::ControllerWindow() -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 50 }
         Start-Sleep -Milliseconds 500
+        if($Gallery){
+            $record=New-TestPreview
+            [CaptureInput]::MouseAt(($sceneRect.Left+450),($sceneRect.Top+350),0)
+            Start-Sleep -Seconds 6
+            Wait-GalleryCounts 1 1
+            Click-PreviewControl $record.Window
+            Wait-GalleryCounts 0 0
+            Write-Host 'PASS: selected Never preference survives an actual process restart'
+        }
         Open-TrayMenu
         [CaptureInput]::keybd_event(0x11, 0, 0, [UIntPtr]::Zero)
         [CaptureInput]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)

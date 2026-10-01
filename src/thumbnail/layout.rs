@@ -27,7 +27,31 @@ pub struct Layout {
     pub radius: f32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    Pin,
+    Close,
+}
+
 impl Layout {
+    pub fn control_at(&self, x: f32, y: f32) -> Option<Control> {
+        if self.card_width < 70.0 || self.card_height < 36.0 {
+            return None;
+        }
+        let x = x / self.scale - (self.card_left + self.card_width - 66.0);
+        let y = y / self.scale - (self.card_top + 6.0);
+        if !(0.0..24.0).contains(&y) {
+            return None;
+        }
+        if (0.0..28.0).contains(&x) {
+            Some(Control::Pin)
+        } else if (30.0..60.0).contains(&x) {
+            Some(Control::Close)
+        } else {
+            None
+        }
+    }
+
     pub fn new(area: WorkArea, dpi: u32, image_width: u32, image_height: u32) -> Result<Self> {
         anyhow::ensure!(
             area.width > 0 && area.height > 0 && dpi > 0 && image_width > 0 && image_height > 0,
@@ -79,6 +103,43 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controls_have_distinct_dpi_scaled_targets_inside_the_card() -> Result<()> {
+        let area = WorkArea {
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+        };
+        for dpi in [96, 120, 144, 192] {
+            let layout = Layout::new(area, dpi, 350, 200)?;
+            let left = layout.card_left + layout.card_width - 66.0;
+            let top = layout.card_top + 6.0;
+            for (x, expected) in [
+                (14.0, Some(Control::Pin)),
+                (45.0, Some(Control::Close)),
+                (29.0, None),
+                (61.0, None),
+            ] {
+                assert!(
+                    layout.control_at((left + x) * layout.scale, (top + 12.0) * layout.scale)
+                        == expected
+                );
+            }
+            assert!(
+                layout
+                    .control_at(left * layout.scale, (top - 1.0) * layout.scale)
+                    .is_none()
+            );
+            assert!(
+                layout
+                    .control_at(left * layout.scale, (top + 24.0) * layout.scale)
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn fixed_card_anchors_to_work_area_at_all_supported_scales() -> Result<()> {

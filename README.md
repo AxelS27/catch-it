@@ -1,13 +1,13 @@
 # Simple Screenshot
 
-A lightweight Windows screenshot utility. The full product targets the native macOS floating-thumbnail experience described in [PRD.md](PRD.md).
+A lightweight Windows screenshot utility with floating capture previews, file drag/drop, a pending queue, and persistent reference cards. The initial macOS-inspired flow and approved CleanShot-inspired extension are described in [PRD.md](PRD.md). Exact reference parity is not claimed.
 
-## Current milestone: capture-to-drag flow, temp cleanup, and system tray
+## Current milestone: multi-thumbnail queue, pin, and configurable timer
 
 Implemented:
 
 - Global `Alt + Shift + S` hotkey.
-- Native notification-area icon with **Take screenshot** and **Quit**, accessible by mouse or keyboard.
+- Native notification-area icon with **Take screenshot**, **Auto-close**, **Close all screenshots**, and **Quit**, accessible by mouse or keyboard.
 - Release builds run as a Windows GUI/background application, without a console window. Debug builds keep console diagnostics.
 - Tray registration is restored when Explorer sends `TaskbarCreated`; shutdown explicitly removes the icon.
 - Capture/quit hotkeys work inside the native tray menu. Worker completions and thumbnail lifecycle messages are deferred safely across nested menu/OLE loops.
@@ -28,19 +28,23 @@ Implemented:
 - DirectComposition slide/fade animations, without per-frame CPU repainting.
 - No keyboard focus activation when showing, hovering, clicking, or dismissing the preview.
 - Monotonic timeout that pauses on hover and resumes the remaining time after mouse exit.
-- Event-driven timers: no recurring timer while hovered or after dismissal.
-- Right-click dismissal and Windows client-area animation preference support.
-- One preview at a time; a new capture removes the previous preview before capturing.
-- Files survive timeout, manual dismissal, replacement, and application shutdown.
+- Event-driven timers: no recurring timer for an idle pin, hidden queue, hovered card, Never setting, or dismissed gallery.
+- Hover exposes pin and close controls. Right-click opens pin/unpin, close, older/newer page, and close-all actions. Windows client-area animation preference is respected.
+- Newest-first pending queue with up to three visible cards per monitor (fewer if space is limited). Older captures remain accessible through the context menu or mouse wheel; wheel shortcuts require Windows inactive-window scrolling.
+- Pins are independent always-on-top reference cards, outside the three-card pending limit. Pinning moves a card beside the dock; Alt+drag repositions it without stealing keyboard focus. Pins keep the fixed cover-card design for now, not a full-size resizable editor/reference window.
+- Hide all pending cards and pins before desktop capture; pause their clocks until selection cancellation or PNG publication restores them. Captures do not contain older previews.
+- Hidden queued cards release their GPU surfaces and full decoded images; retain small cached card pixels, window state, and file protection. Returning to a page reconstructs the surface from cached pixels without decoding the PNG again.
+- Timer options: 5 seconds (default), 15 seconds, 30 seconds, 5 minutes, 10 minutes, and Never. A changed interval starts a fresh budget; hidden/hovered/dragged cards pause their remaining budget. Unpin starts a fresh selected interval.
+- Files survive timeout, manual dismissal, close-all, and application shutdown.
 - Native OLE file drag using Shell `IDataObject` / `CF_HDROP` and a non-agile `IDropSource` on the UI STA.
 - DPI-aware system drag threshold; a click alone does not initiate a drag.
 - Copy-only operation: Explorer copies the PNG, and compatible terminals receive its file path.
 - Cached, rounded native drag image reuses the exact GPU-rendered card pixels, including the centered cover crop, border, and premultiplied alpha. No second PNG decode or crop occurs when dragging. It follows the pointer even over unsupported targets; no focus activation or target hit-test interference. The entire filled card supports hover, drag, and dismissal.
 - Lifetime pauses for the entire OLE modal loop. Escape or rejected drops restore the preview and its remaining lifetime.
-- Successful drops dismiss the preview, not the PNG. Quit safely cancels an active drag.
+- Successful drops dismiss an unpinned preview, not the PNG. A pinned reference remains available after a successful drop. Quit safely cancels an active drag.
 - Automatic cleanup at startup and once per hour on a separate sleeping thread, never on the capture/render thread.
 - Only generated PNGs and abandoned `.png.part` writes with a last-modified age of at least 24 hours are removed. Recent/future-dated files, unrelated names, directories, and reparse points are left alone.
-- Active previews and drags hold a native file handle that prevents deletion while still allowing reading/copying. Locked or inaccessible expired files are deferred until a later sweep; cleanup errors are logged without interrupting capture.
+- Pending entries, pins, and drags hold a native file handle that prevents deletion while still allowing reading/copying. Locked or inaccessible expired files are deferred until a later sweep; cleanup errors are logged without interrupting capture.
 
 Output directory:
 
@@ -48,11 +52,13 @@ Output directory:
 %LOCALAPPDATA%\SimpleScreenshot\Temp\
 ```
 
-No screenshot editor or settings UI. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
+The timer preference is atomically saved in `%LOCALAPPDATA%\SimpleScreenshot\settings.txt` and loaded on startup. The queue and pins are session-only, not a screenshot history/library, and are not restored after restart.
+
+No screenshot editor, annotation tools, resize/opacity/lock controls, or settings window. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
 
 ### Provisional UX profile
 
-The floating implementation is functional, but exact macOS parity is **not yet validated**. Current development defaults are:
+The floating implementation is functional, but exact macOS or CleanShot parity is **not yet validated**. The three-card limit, paging policy, pin-card size, and timer semantics are our approved Windows design choices, not undocumented CleanShot specifications. Current development defaults are:
 
 | Property | Provisional value |
 | --- | --- |
@@ -60,9 +66,9 @@ The floating implementation is functional, but exact macOS parity is **not yet v
 | Screen-edge margin | 18 logical pixels |
 | Corner radius | Up to 6 logical pixels |
 | Entrance / exit duration | 180 ms each, native cubic-out interpolation |
-| Idle lifetime | 5 seconds after entrance completes |
+| Idle lifetime | 5 seconds by default after entrance; configurable through tray |
 | Hover behavior | Pause and resume remaining time, not reset |
-| Manual dismissal | Right-click, as a provisional Windows interaction |
+| Manual dismissal | Hover close control, context-menu Close, or Close all |
 
 These values are not measured native macOS specifications. Geometry, gestures, animation curves, and timing must still be compared against a versioned macOS reference. Clicking does not open an editor. Holding the left button and moving beyond the system threshold initiates a file drag. When Windows disables client-area animation, transitions become effectively immediate without changing the idle lifetime.
 
@@ -82,7 +88,10 @@ cargo run --release
 2. Press `Alt + Shift + S`.
 3. Drag to select a region, then release to save.
 4. The preview appears in the bottom-right corner without taking keyboard focus.
-5. Drag the preview into Explorer or a compatible terminal. Hover to keep it visible, or right-click to dismiss. The file path is also printed in the console.
+5. Drag a card into Explorer or a compatible terminal. Hover for pin/close controls; right-click for other actions. Wheel down for older captures and up for newer captures, or use the context menu.
+6. Pin a card to keep it beyond the timer; Alt+drag moves a pin. Unpin returns it to the newest pending page with a fresh timeout. Closing cards never deletes their PNGs.
+
+Debug or redirected console diagnostics include saved file paths. Use **Auto-close** in the tray to choose a timeout or Never; **Close all screenshots** closes pending cards and pins.
 
 Use the notification-area icon (possibly under **Show Hidden Icons**) to take a screenshot or quit. Left-click, right-click, or keyboard activation opens the native menu. `Ctrl + Alt + Q` remains available as a development exit shortcut. If either shortcut is already registered by another application, startup reports an error.
 
@@ -97,7 +106,7 @@ cargo test
 cargo build --release
 ```
 
-Unit tests cover selection direction, clamping, empty regions, crop boundaries, display-rotation transforms, invalid PNG buffers, and a real WIC PNG round trip through a Unicode filename containing spaces. Thumbnail tests cover layout at 100%, 125%, 150%, and 200% scaling, negative monitor origins, extreme aspect ratios, rounded hit testing, hover/drag timing, interrupted lifecycles, and disabled motion. Drag tests check actual COM source behavior, STA affinity, unchanged premultiplied card-pixel upload, invalid drag buffers, system thresholds, and native `CF_HDROP` paths with spaces and Unicode.
+Unit tests cover selection direction, clamping, empty regions, crop boundaries, display-rotation transforms, invalid PNG buffers, and a real WIC PNG round trip through a Unicode filename containing spaces. Thumbnail tests cover layout at 100%, 125%, 150%, and 200% scaling, negative monitor origins, extreme aspect ratios, rounded hit testing, hover/drag/hidden-queue timing, pin/unpin lifecycles, Never, interval changes, interrupted dismissal, disabled motion, distinct DPI-scaled controls, queue paging, free pin slots, and persisted settings. Drag tests check actual COM source behavior, STA affinity, unchanged premultiplied card-pixel upload, invalid drag buffers, system thresholds, and native `CF_HDROP` paths with spaces and Unicode.
 
 ### Interactive end-to-end test
 
@@ -136,12 +145,14 @@ Tray tests use Windows UI Automation and actual mouse/keyboard input. They verif
 To validate the full-screen/layout regressions along with the complete flow:
 
 ```powershell
-./scripts/smoke-capture.ps1 -Configuration release -Layout -Tray -DragDrop
+./scripts/smoke-capture.ps1 -Configuration release -Layout -Gallery -Tray -DragDrop
 ```
 
 Layout checks capture the entire monitor corner-to-corner in both directions and verify exact PNG dimensions/pixels and successful preview rendering. Landscape, portrait, square, and tiny regions must render inside an identical fixed card, with preserved visible content colors, a centered cover crop without letterboxing, and clearance above the actual taskbar. Portrait dragging from the card edge additionally validates identical filled drag pixels, aspect ratio, and rejected-drop recovery. The validation desktop reproduced `rcWork` incorrectly covering all 1080 pixels despite a visible 52-pixel bottom taskbar; the corrected preview reserves those 52 pixels plus its normal card margin. Top/left/right taskbars, auto-hide reveal thickness, negative origins, and DPI layouts are unit-tested; physical multi-monitor and mixed-DPI validation remains pending.
 
-Logs and visual artifacts (`overlay.png`, `thumbnail.png`, `tray-menu.png`, `fullscreen-False.png`, `fullscreen-True.png`, `thumbnail-portrait.png`, `thumbnail-taskbar.png`, `drag-portrait.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
+The **Gallery** suite captures five pending screenshots plus a pin, validates the three-card dock and older/newer paging, checks cached card colors and stable GDI resources across repeated pages, moves a pin without focus activation, verifies pin exclusion from capture, and checks staged timeout, unpin, Never, native close-all, and the saved timer preference across an actual process restart. The drag suite also verifies that a pinned reference survives an actual Explorer copy. Tests respect the system inactive-wheel setting and use context-menu paging when wheel routing is disabled.
+
+Logs and visual artifacts (`gallery-four-visible.png`, `gallery-restored-card.png`, `overlay.png`, `thumbnail.png`, `tray-menu.png`, `fullscreen-False.png`, `fullscreen-True.png`, `thumbnail-portrait.png`, `thumbnail-taskbar.png`, `drag-portrait.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
 
 Initial successful release validation:
 
@@ -153,6 +164,8 @@ Floating-thumbnail release validation on the same desktop observed 7-17 ms from 
 
 Drag-and-drop E2E passed on the same desktop with actual Explorer and Windows Terminal + Windows PowerShell, including spaces and Japanese characters in the source directory. Repeated drag operations showed stable GDI handle usage (16 before and after).
 
+The queue/pin/timer milestone passed 46 unit tests, strict Clippy, release build, and the combined `-Layout -Gallery -Tray -DragDrop` E2E suite. Validation included five pending cards plus a pin, repeated native wheel/context paging, unchanged cached colors, successful pinned Explorer copy, Never across a process restart, and stable GDI handles (23 before and after).
+
 These are observations on the available desktop, not cross-hardware performance guarantees or measured macOS parity. They do not include keyboard dispatch latency before the application receives the hotkey. Compositor animations are native; frame pacing still needs measured visual validation on target hardware.
 
 ## Remaining validation and limitations
@@ -163,10 +176,10 @@ These are observations on the available desktop, not cross-hardware performance 
 - A lost capture session is discarded and recreated on the next request. Display changes during selection cancel the overlay.
 - Secure desktops, protected content, and graphics drivers or remote sessions without Desktop Duplication support are not supported by this prototype.
 - Some virtual/remote display drivers bake the pointer into the captured desktop surface. Cursor exclusion is not guaranteed on those drivers yet.
-- The exact native macOS floating appearance, drag/cancel motion, and interaction timings still need direct reference measurements before fidelity acceptance.
+- The exact native macOS/CleanShot floating appearance, drag/cancel motion, overflow layout, and interaction timings still need direct reference measurements before fidelity acceptance. Pin resizing, opacity, click-through locking, and editing remain out of scope.
 - Other terminal hosts, CMD-specific input behavior, and individual CLI attachment integrations still require compatibility testing. The utility supplies a real file object, not simulated typing or application-specific uploads.
 - Drops into elevated applications can be blocked by Windows integrity/UIPI restrictions. Prefer matching, non-elevated permissions.
-- Display/DPI changes dismiss an existing preview; creating the next preview recalculates its monitor DPI and work area.
+- Display/DPI changes dismiss existing previews and pins; creating the next preview recalculates its monitor DPI and work area.
 - A rendering-device loss may require restarting this prototype. Automatic compositor-device recovery is not yet implemented.
 
 ## Source layout
@@ -174,7 +187,9 @@ These are observations on the available desktop, not cross-hardware performance 
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | Hotkeys, hidden controller, capture lifecycle, nested-loop message deferral |
-| `src/tray.rs` | Native notification icon, menu, Explorer recovery, and icon ownership |
+| `src/tray.rs` | Native notification icon, timer/close-all menus, Explorer recovery, and icon ownership |
+| `src/gallery.rs` | Session queue, per-monitor paging, pin placement, GPU surface visibility, context menu |
+| `src/settings.rs` | Persisted auto-close interval and atomic preference publication |
 | `src/capture.rs` | DXGI GPU capture, staging readback, rotation, cropping |
 | `src/geometry.rs` | Physical-pixel selection bounds |
 | `src/drag_drop.rs` | OLE STA, Shell file object, copy-only source, cached layered drag visual |
@@ -182,9 +197,9 @@ These are observations on the available desktop, not cross-hardware performance 
 | `src/storage.rs` | WIC PNG encoding, atomic file publication, and active-file protection |
 | `src/cleanup.rs` | Conservative 24-hour temp retention and sleeping cleanup worker |
 | `src/worker.rs` | Reusable GPU session and background work queue |
-| `src/thumbnail/mod.rs` | Non-activating Win32 floating window and interactions |
+| `src/thumbnail/mod.rs` | Non-activating card/pin windows, controls, visibility, cached surfaces, drag interactions |
 | `src/thumbnail/layout.rs` | Fixed DPI-aware card, centered cover crop, rounded hit testing |
 | `src/thumbnail/work_area.rs` | Monitor work area corrected for real shell taskbar/reveal bounds |
-| `src/thumbnail/lifecycle.rs` | Monotonic timeout, hover/drag pauses, and dismissal states |
+| `src/thumbnail/lifecycle.rs` | Monotonic timeout, hover/drag/hidden pauses, pin, and dismissal states |
 | `src/thumbnail/render.rs` | Shared Direct2D/DirectComposition rendering and animation |
 | `scripts/smoke-capture.ps1` | Interactive Windows end-to-end smoke test |
