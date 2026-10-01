@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use crate::geometry::aspect_fit;
+use crate::geometry::{ImageCrop, aspect_fill};
 
 /// Physical monitor work area, which can have a negative desktop origin.
 #[derive(Clone, Copy)]
@@ -11,7 +11,7 @@ pub struct WorkArea {
     pub height: u32,
 }
 
-/// Fixed card with aspect-fit image; only DPI or available space changes its size.
+/// Fixed card with centered cover/fill crop; only DPI or available space changes its size.
 #[derive(Clone, Copy)]
 pub struct Layout {
     pub x: i32,
@@ -23,10 +23,7 @@ pub struct Layout {
     pub card_top: f32,
     pub card_width: f32,
     pub card_height: f32,
-    pub image_left: f32,
-    pub image_top: f32,
-    pub image_width: f32,
-    pub image_height: f32,
+    pub crop: ImageCrop,
     pub radius: f32,
 }
 
@@ -48,12 +45,8 @@ impl Layout {
         let card_height = (160.0 * scale)
             .round()
             .min((area.height - margin * 2).max(1) as f32) as u32;
-        let (fit_width, fit_height) =
-            aspect_fit(image_width, image_height, card_width, card_height)
-                .context("Cannot fit thumbnail image")?;
-        // Center on physical pixels so the GPU and WIC drag image use identical bounds.
-        let fit_left = padding + (card_width - fit_width) / 2;
-        let fit_top = padding + (card_height - fit_height) / 2;
+        let crop = aspect_fill(image_width, image_height, card_width, card_height)
+            .context("Cannot fill thumbnail card")?;
         let width = card_width + padding + margin;
         let height = card_height + padding + margin;
         Ok(Self {
@@ -66,10 +59,7 @@ impl Layout {
             card_top: padding as f32 / scale,
             card_width: card_width as f32 / scale,
             card_height: card_height as f32 / scale,
-            image_left: fit_left as f32 / scale,
-            image_top: fit_top as f32 / scale,
-            image_width: fit_width as f32 / scale,
-            image_height: fit_height as f32 / scale,
+            crop,
             radius: 6.0_f32.min(card_width.min(card_height) as f32 / (scale * 2.0)),
         })
     }
@@ -121,15 +111,10 @@ mod tests {
                 assert!((right - (area.left as f32 + area.width as f32 - margin)).abs() < 0.01);
                 assert!((bottom - (area.top as f32 + area.height as f32 - margin)).abs() < 0.01);
                 assert!(
-                    layout.image_left >= layout.card_left && layout.image_top >= layout.card_top
-                );
-                assert!(
-                    layout.image_left + layout.image_width
-                        <= layout.card_left + layout.card_width + 0.01
-                );
-                assert!(
-                    layout.image_top + layout.image_height
-                        <= layout.card_top + layout.card_height + 0.01
+                    (layout.crop.width / layout.crop.height
+                        - layout.card_width / layout.card_height)
+                        .abs()
+                        < 0.001
                 );
             }
         }
@@ -159,7 +144,7 @@ mod tests {
     }
 
     #[test]
-    fn whole_card_including_letterbox_is_interactive_except_shadow_and_corners() -> Result<()> {
+    fn whole_card_is_interactive_except_shadow_and_corners() -> Result<()> {
         let layout = Layout::new(
             WorkArea {
                 left: 0,
@@ -178,8 +163,8 @@ mod tests {
             layout.card_top + layout.card_height / 2.0
         ));
         assert!(layout.contains(
-            layout.image_left + layout.image_width / 2.0,
-            layout.image_top + layout.image_height / 2.0
+            layout.card_left + layout.card_width / 2.0,
+            layout.card_top + layout.card_height / 2.0
         ));
         Ok(())
     }

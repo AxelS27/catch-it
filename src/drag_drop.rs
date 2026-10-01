@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use windows::{
     Win32::{
         Foundation::*,
-        Graphics::{Gdi::*, Imaging::*},
+        Graphics::Gdi::*,
         System::{
             Com::*,
             LibraryLoader::GetModuleHandleW,
@@ -96,13 +96,12 @@ impl PreparedDrag {
         path: &Path,
         width: u32,
         height: u32,
-        radius: f32,
-        scale: f32,
+        pixels: &[u8],
         offset: POINT,
         cancel: Rc<Cell<bool>>,
     ) -> Result<Self> {
         let data = file_data_object(path)?;
-        let bitmap = drag_bitmap(path, width, height, radius, scale)?;
+        let bitmap = drag_bitmap(pixels, width, height)?;
         let visual = Rc::new(DragVisual::new(&bitmap, width, height, offset)?);
         let source = DropSource {
             cancel,
@@ -277,67 +276,22 @@ impl Drop for Bitmap {
     }
 }
 
-fn drag_bitmap(path: &Path, width: u32, height: u32, radius: f32, scale: f32) -> Result<Bitmap> {
-    let filename: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+fn drag_bitmap(pixels: &[u8], width: u32, height: u32) -> Result<Bitmap> {
     let len = (width as usize)
         .checked_mul(height as usize)
         .and_then(|size| size.checked_mul(4))
         .context("Drag image is too large")?;
     anyhow::ensure!(
-        width > 0 && height > 0 && width <= i32::MAX as u32 && height <= i32::MAX as u32,
-        "Invalid drag-image dimensions"
+        width > 0
+            && height > 0
+            && width <= i32::MAX as u32
+            && height <= i32::MAX as u32
+            && pixels.len() == len,
+        "Invalid drag-image dimensions or buffer"
     );
-    // SAFETY: WIC runs in this thread's OLE STA. Pixel allocation matches the
-    // scaler's output. The top-down DIB allocation is checked before copying.
+    // GPU card readback is already rounded, bordered and premultiplied. Copy it
+    // unchanged to a top-down DIB; no PNG decoding, second crop or alpha conversion.
     unsafe {
-        let factory: IWICImagingFactory =
-            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
-        let decoder = factory.CreateDecoderFromFilename(
-            PCWSTR(filename.as_ptr()),
-            None,
-            GENERIC_READ,
-            WICDecodeMetadataCacheOnLoad,
-        )?;
-        let frame = decoder.GetFrame(0)?;
-        let mut source_width = 0;
-        let mut source_height = 0;
-        frame.GetSize(&mut source_width, &mut source_height)?;
-        let (fit_width, fit_height) =
-            crate::geometry::aspect_fit(source_width, source_height, width, height)
-                .context("Invalid screenshot dimensions for drag preview")?;
-        let scaler = factory.CreateBitmapScaler()?;
-        scaler.Initialize(
-            &frame,
-            fit_width,
-            fit_height,
-            WICBitmapInterpolationModeFant,
-        )?;
-        let converter = factory.CreateFormatConverter()?;
-        // Apply the rounded mask in straight BGRA, then premultiply exactly once.
-        converter.Initialize(
-            &scaler,
-            &GUID_WICPixelFormat32bppBGRA,
-            WICBitmapDitherTypeNone,
-            None,
-            0.0,
-            WICBitmapPaletteTypeCustom,
-        )?;
-        let mut fitted = vec![0; fit_width as usize * fit_height as usize * 4];
-        converter.CopyPixels(std::ptr::null(), fit_width * 4, &mut fitted)?;
-        let mut pixels = vec![0; len];
-        for pixel in pixels.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&crate::thumbnail::CARD_BACKGROUND);
-        }
-        let left = (width - fit_width) / 2;
-        let top = (height - fit_height) / 2;
-        for y in 0..fit_height as usize {
-            let dst = ((top as usize + y) * width as usize + left as usize) * 4;
-            let src = y * fit_width as usize * 4;
-            pixels[dst..dst + fit_width as usize * 4]
-                .copy_from_slice(&fitted[src..src + fit_width as usize * 4]);
-        }
-        round_and_border(&mut pixels, width, height, radius, scale);
-        premultiply(&mut pixels);
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -362,42 +316,6 @@ fn drag_bitmap(path: &Path, width: u32, height: u32, radius: f32, scale: f32) ->
         anyhow::ensure!(!bits.is_null(), "GDI returned no drag-image pixels");
         std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast(), pixels.len());
         Ok(bitmap)
-    }
-}
-
-fn premultiply(pixels: &mut [u8]) {
-    for pixel in pixels.chunks_exact_mut(4) {
-        let alpha = u16::from(pixel[3]);
-        for color in &mut pixel[..3] {
-            *color = ((u16::from(*color) * alpha + 127) / 255) as u8;
-        }
-    }
-}
-
-/// A small, one-time raster mask for the cached drag bitmap, not a frame renderer.
-fn round_and_border(pixels: &mut [u8], width: u32, height: u32, radius: f32, scale: f32) {
-    let radius = radius.clamp(0.0, width.min(height) as f32 / 2.0);
-    let stroke = scale.min(width.min(height) as f32 / 2.0);
-    for y in 0..height {
-        for x in 0..width {
-            let px = x as f32 + 0.5;
-            let py = y as f32 + 0.5;
-            let dx = px - px.clamp(radius, width as f32 - radius);
-            let dy = py - py.clamp(radius, height as f32 - radius);
-            let corner_distance = (dx * dx + dy * dy).sqrt() - radius;
-            let edge_distance = (-px)
-                .max(-py)
-                .max(px - width as f32)
-                .max(py - height as f32);
-            let distance = corner_distance.max(edge_distance);
-            let alpha = (0.5 - distance).clamp(0.0, 1.0);
-            let border = (distance + stroke + 0.5).clamp(0.0, 1.0) * 0.85;
-            let pixel = &mut pixels[((y * width + x) * 4) as usize..][..4];
-            for color in &mut pixel[..3] {
-                *color = (*color as f32 * (1.0 - border) + 255.0 * border).round() as u8;
-            }
-            pixel[3] = (pixel[3] as f32 * alpha).round() as u8;
-        }
     }
 }
 
@@ -438,24 +356,27 @@ mod tests {
     }
 
     #[test]
-    fn drag_bitmap_has_transparent_corners_and_straight_alpha() {
-        let mut pixels = [0, 0, 255, 255].repeat(20 * 20);
-        round_and_border(&mut pixels, 20, 20, 6.0, 1.0);
-        assert_eq!(pixels[3], 0);
-        let center = (10 * 20 + 10) * 4;
-        assert_eq!(&pixels[center..center + 4], &[0, 0, 255, 255]);
-        assert!(
-            pixels
-                .chunks_exact(4)
-                .any(|p| p[3] > 0 && p[3] < 255 && p[2] == 255)
-        );
+    fn drag_bitmap_rejects_invalid_buffers() {
+        assert!(drag_bitmap(&[], 1, 1).is_err());
+        assert!(drag_bitmap(&[], 0, 1).is_err());
+        assert!(drag_bitmap(&[0; 4], u32::MAX, u32::MAX).is_err());
     }
 
     #[test]
-    fn drag_pixels_premultiply_without_color_bleed() {
-        let mut pixels = vec![255, 128, 64, 128, 255, 128, 64, 255, 255, 128, 64, 0];
-        premultiply(&mut pixels);
-        assert_eq!(pixels, [128, 64, 32, 128, 255, 128, 64, 255, 0, 0, 0, 0]);
+    fn drag_bitmap_preserves_cached_premultiplied_pixels() -> Result<()> {
+        let pixels = [
+            0, 0, 0, 0, 32, 64, 128, 128, 100, 0, 255, 255, 0, 255, 0, 255,
+        ];
+        let bitmap = drag_bitmap(&pixels, 2, 2)?;
+        let mut actual = [0u8; 16];
+        unsafe {
+            assert_eq!(
+                GetBitmapBits(bitmap.0, actual.len() as i32, actual.as_mut_ptr().cast()),
+                16
+            );
+        }
+        assert_eq!(actual, pixels);
+        Ok(())
     }
 
     #[test]

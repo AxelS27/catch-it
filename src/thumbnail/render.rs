@@ -75,6 +75,7 @@ pub struct Surface {
     layout: Layout,
     timing: Timing,
     started: Option<Instant>,
+    drag_pixels: Vec<u8>,
 }
 
 impl Surface {
@@ -105,7 +106,7 @@ impl Surface {
                 },
                 None,
             )?;
-            render(&compositor, &swap_chain, layout, image)?;
+            let drag_pixels = render(&compositor, &swap_chain, layout, image)?;
             let target = compositor.composition.CreateTargetForHwnd(hwnd, true)?;
             let visual = compositor.composition.CreateVisual()?;
             let opacity = compositor.composition.CreateEffectGroup()?;
@@ -125,8 +126,14 @@ impl Surface {
                 layout,
                 timing,
                 started: None,
+                drag_pixels,
             })
         }
+    }
+
+    /// The exact rendered, premultiplied card, cached once per screenshot.
+    pub fn drag_pixels(&self) -> &[u8] {
+        &self.drag_pixels
     }
 
     pub fn appear(&mut self) -> Result<()> {
@@ -213,7 +220,7 @@ fn render(
     swap_chain: &IDXGISwapChain1,
     layout: Layout,
     image: &SavedScreenshot,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     unsafe {
         let context = &compositor.context;
         let dpi = 96.0 * layout.scale;
@@ -241,11 +248,11 @@ fn render(
             right: layout.card_left + layout.card_width,
             bottom: layout.card_top + layout.card_height,
         };
-        let image_rect = D2D_RECT_F {
-            left: layout.image_left,
-            top: layout.image_top,
-            right: layout.image_left + layout.image_width,
-            bottom: layout.image_top + layout.image_height,
+        let source_rect = D2D_RECT_F {
+            left: layout.crop.x,
+            top: layout.crop.y,
+            right: layout.crop.x + layout.crop.width,
+            bottom: layout.crop.y + layout.crop.height,
         };
         let rounded = D2D1_ROUNDED_RECT {
             rect,
@@ -276,15 +283,6 @@ fn render(
                 ..Default::default()
             },
         )?;
-        let background = context.CreateSolidColorBrush(
-            &D2D1_COLOR_F {
-                r: super::CARD_BACKGROUND[2] as f32 / 255.0,
-                g: super::CARD_BACKGROUND[1] as f32 / 255.0,
-                b: super::CARD_BACKGROUND[0] as f32 / 255.0,
-                a: 1.0,
-            },
-            None,
-        )?;
         let border = context.CreateSolidColorBrush(
             &D2D1_COLOR_F {
                 r: 1.0,
@@ -306,13 +304,12 @@ fn render(
         context.BeginDraw();
         context.Clear(Some(&D2D1_COLOR_F::default()));
         context.PushLayer(&layer, None);
-        context.FillRectangle(&rect, &background);
         context.DrawBitmap(
             &source,
-            Some(&image_rect),
+            Some(&rect),
             1.0,
             D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-            None,
+            Some(&source_rect),
             None,
         );
         context.PopLayer();
@@ -391,6 +388,51 @@ fn render(
         context.SetTarget(None);
         draw_result.context("Cannot compose thumbnail and shadow")?;
         swap_chain.Present(1, DXGI_PRESENT(0)).ok()?;
+
+        // Cache only the small card, without shadow/padding. Dragging reuses these
+        // exact GPU-rendered pixels, including fractional crop, border and alpha.
+        let width = (layout.card_width * layout.scale).round() as u32;
+        let height = (layout.card_height * layout.scale).round() as u32;
+        let readback = context.CreateBitmap(
+            D2D_SIZE_U { width, height },
+            None,
+            0,
+            &D2D1_BITMAP_PROPERTIES1 {
+                pixelFormat: D2D1_PIXEL_FORMAT {
+                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                },
+                bitmapOptions: D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                dpiX: dpi,
+                dpiY: dpi,
+                ..Default::default()
+            },
+        )?;
+        let left = (layout.card_left * layout.scale).round() as u32;
+        let top = (layout.card_top * layout.scale).round() as u32;
+        readback.CopyFromBitmap(
+            None,
+            &card,
+            Some(&D2D_RECT_U {
+                left,
+                top,
+                right: left + width,
+                bottom: top + height,
+            }),
+        )?;
+        let stride = width as usize * 4;
+        let mut pixels = vec![0; stride * height as usize];
+        let mapped = readback.Map(D2D1_MAP_OPTIONS_READ)?;
+        if mapped.bits.is_null() || (mapped.pitch as usize) < stride {
+            let _ = readback.Unmap();
+            anyhow::bail!("Invalid thumbnail readback buffer");
+        }
+        for y in 0..height as usize {
+            let row =
+                std::slice::from_raw_parts(mapped.bits.add(y * mapped.pitch as usize), stride);
+            pixels[y * stride..(y + 1) * stride].copy_from_slice(row);
+        }
+        readback.Unmap()?;
+        Ok(pixels)
     }
-    Ok(())
 }

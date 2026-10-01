@@ -23,7 +23,7 @@ Implemented:
 - GPU capture session reused on a sleeping worker, without idle frame polling.
 - Capture and save errors are reported rather than silently ignored.
 - Floating preview in the capture monitor's bottom-right usable area, above the actual shell taskbar even when Windows reports an incorrect work area. Reserve taskbar thickness for auto-hide reveal too.
-- Fixed 220 x 160 logical-pixel rounded card with a subtle shadow; centered screenshot content aspect-fits inside a dark matte without stretching or cropping. Only DPI or a very small available work area changes the card size.
+- Fixed 220 x 160 logical-pixel rounded card with a subtle shadow; screenshot content fills the card using a centered cover crop, preserving aspect ratio without stretching or letterboxing. Preview cropping never changes the saved PNG. Only DPI or a very small available work area changes the card size.
 - Rasterize the card once before composing its shadow, avoiding the Direct2D layer-reuse error reproduced with full-screen captures.
 - DirectComposition slide/fade animations, without per-frame CPU repainting.
 - No keyboard focus activation when showing, hovering, clicking, or dismissing the preview.
@@ -35,7 +35,7 @@ Implemented:
 - Native OLE file drag using Shell `IDataObject` / `CF_HDROP` and a non-agile `IDropSource` on the UI STA.
 - DPI-aware system drag threshold; a click alone does not initiate a drag.
 - Copy-only operation: Explorer copies the PNG, and compatible terminals receive its file path.
-- Cached, rounded native drag image uses the same fixed card, aspect-fit content, and matte as the thumbnail. It follows the pointer even over unsupported targets; no focus activation or target hit-test interference. The letterbox area supports hover, drag, and dismissal too.
+- Cached, rounded native drag image reuses the exact GPU-rendered card pixels, including the centered cover crop, border, and premultiplied alpha. No second PNG decode or crop occurs when dragging. It follows the pointer even over unsupported targets; no focus activation or target hit-test interference. The entire filled card supports hover, drag, and dismissal.
 - Lifetime pauses for the entire OLE modal loop. Escape or rejected drops restore the preview and its remaining lifetime.
 - Successful drops dismiss the preview, not the PNG. Quit safely cancels an active drag.
 - Automatic cleanup at startup and once per hour on a separate sleeping thread, never on the capture/render thread.
@@ -56,7 +56,7 @@ The floating implementation is functional, but exact macOS parity is **not yet v
 
 | Property | Provisional value |
 | --- | --- |
-| Preview card bounds | Fixed 220 x 160 logical pixels, centered aspect-fit content |
+| Preview card bounds | Fixed 220 x 160 logical pixels, centered cover/fill crop |
 | Screen-edge margin | 18 logical pixels |
 | Corner radius | Up to 6 logical pixels |
 | Entrance / exit duration | 180 ms each, native cubic-out interpolation |
@@ -97,7 +97,7 @@ cargo test
 cargo build --release
 ```
 
-Unit tests cover selection direction, clamping, empty regions, crop boundaries, display-rotation transforms, invalid PNG buffers, and a real WIC PNG round trip through a Unicode filename containing spaces. Thumbnail tests cover layout at 100%, 125%, 150%, and 200% scaling, negative monitor origins, extreme aspect ratios, rounded hit testing, hover/drag timing, interrupted lifecycles, and disabled motion. Drag tests check actual COM source behavior, STA affinity, straight-alpha rounding, premultiplication, system thresholds, and native `CF_HDROP` paths with spaces and Unicode.
+Unit tests cover selection direction, clamping, empty regions, crop boundaries, display-rotation transforms, invalid PNG buffers, and a real WIC PNG round trip through a Unicode filename containing spaces. Thumbnail tests cover layout at 100%, 125%, 150%, and 200% scaling, negative monitor origins, extreme aspect ratios, rounded hit testing, hover/drag timing, interrupted lifecycles, and disabled motion. Drag tests check actual COM source behavior, STA affinity, unchanged premultiplied card-pixel upload, invalid drag buffers, system thresholds, and native `CF_HDROP` paths with spaces and Unicode.
 
 ### Interactive end-to-end test
 
@@ -139,7 +139,7 @@ To validate the full-screen/layout regressions along with the complete flow:
 ./scripts/smoke-capture.ps1 -Configuration release -Layout -Tray -DragDrop
 ```
 
-Layout checks capture the entire monitor corner-to-corner in both directions and verify exact PNG dimensions/pixels and successful preview rendering. Landscape, portrait, square, and tiny regions must render inside an identical fixed card, with preserved content colors, matte letterboxing, and clearance above the actual taskbar. Portrait dragging from the letterbox additionally validates native drag pixels, aspect ratio, and rejected-drop recovery. The validation desktop reproduced `rcWork` incorrectly covering all 1080 pixels despite a visible 52-pixel bottom taskbar; the corrected preview reserves those 52 pixels plus its normal card margin. Top/left/right taskbars, auto-hide reveal thickness, negative origins, and DPI layouts are unit-tested; physical multi-monitor and mixed-DPI validation remains pending.
+Layout checks capture the entire monitor corner-to-corner in both directions and verify exact PNG dimensions/pixels and successful preview rendering. Landscape, portrait, square, and tiny regions must render inside an identical fixed card, with preserved visible content colors, a centered cover crop without letterboxing, and clearance above the actual taskbar. Portrait dragging from the card edge additionally validates identical filled drag pixels, aspect ratio, and rejected-drop recovery. The validation desktop reproduced `rcWork` incorrectly covering all 1080 pixels despite a visible 52-pixel bottom taskbar; the corrected preview reserves those 52 pixels plus its normal card margin. Top/left/right taskbars, auto-hide reveal thickness, negative origins, and DPI layouts are unit-tested; physical multi-monitor and mixed-DPI validation remains pending.
 
 Logs and visual artifacts (`overlay.png`, `thumbnail.png`, `tray-menu.png`, `fullscreen-False.png`, `fullscreen-True.png`, `thumbnail-portrait.png`, `thumbnail-taskbar.png`, `drag-portrait.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
 
@@ -183,7 +183,7 @@ These are observations on the available desktop, not cross-hardware performance 
 | `src/cleanup.rs` | Conservative 24-hour temp retention and sleeping cleanup worker |
 | `src/worker.rs` | Reusable GPU session and background work queue |
 | `src/thumbnail/mod.rs` | Non-activating Win32 floating window and interactions |
-| `src/thumbnail/layout.rs` | Fixed DPI-aware card, centered aspect-fit image, rounded hit testing |
+| `src/thumbnail/layout.rs` | Fixed DPI-aware card, centered cover crop, rounded hit testing |
 | `src/thumbnail/work_area.rs` | Monitor work area corrected for real shell taskbar/reveal bounds |
 | `src/thumbnail/lifecycle.rs` | Monotonic timeout, hover/drag pauses, and dismissal states |
 | `src/thumbnail/render.rs` | Shared Direct2D/DirectComposition rendering and animation |

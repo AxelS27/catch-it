@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use windows::{
     Win32::{
         Foundation::*,
@@ -34,8 +34,6 @@ use layout::Layout;
 use lifecycle::{Action, Lifecycle, Timing};
 pub use render::Compositor;
 use render::Surface;
-
-pub(crate) const CARD_BACKGROUND: [u8; 4] = [24, 24, 26, 255];
 
 pub const HOVER_CHANGED: u32 = WM_APP + 3;
 pub const DISMISS: u32 = WM_APP + 4;
@@ -246,8 +244,10 @@ impl Thumbnail {
                 &self.path,
                 width,
                 height,
-                layout.radius * layout.scale,
-                layout.scale,
+                self.surface
+                    .as_ref()
+                    .context("Thumbnail surface unavailable")?
+                    .drag_pixels(),
                 offset,
                 Rc::clone(&self.state.cancel_drag),
             )?;

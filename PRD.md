@@ -93,7 +93,7 @@ Requirements:
 
 - Borderless window
 - Always on top
-- Fixed-size preview card, with screenshot content centered and aspect-fit inside it without stretching or cropping; capture aspect ratio must not change the card size
+- Fixed-size preview card, fully filled by a centered cover crop of the screenshot without stretching or letterboxing; capture aspect ratio must not change the card size, and preview cropping must never alter the saved PNG
 - Rounded corners
 - Small margin from screen edges
 - Does not steal keyboard focus

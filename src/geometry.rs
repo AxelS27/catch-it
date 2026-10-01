@@ -50,26 +50,35 @@ impl Region {
     }
 }
 
-/// Fit an image inside fixed physical-pixel bounds without stretching/cropping.
-pub fn aspect_fit(
+/// Centered source rectangle for cover/fill. Fractional pixels preserve the exact
+/// image aspect ratio, even for tiny or extreme-aspect screenshots.
+#[derive(Clone, Copy, Debug)]
+pub struct ImageCrop {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+pub fn aspect_fill(
     source_width: u32,
     source_height: u32,
     width: u32,
     height: u32,
-) -> Option<(u32, u32)> {
+) -> Option<ImageCrop> {
     if source_width == 0 || source_height == 0 || width == 0 || height == 0 {
         return None;
     }
-    let fit = (f64::from(width) / f64::from(source_width))
-        .min(f64::from(height) / f64::from(source_height));
-    Some((
-        (f64::from(source_width) * fit)
-            .round()
-            .clamp(1.0, f64::from(width)) as u32,
-        (f64::from(source_height) * fit)
-            .round()
-            .clamp(1.0, f64::from(height)) as u32,
-    ))
+    let scale = (f64::from(width) / f64::from(source_width))
+        .max(f64::from(height) / f64::from(source_height));
+    let crop_width = (f64::from(width) / scale).min(f64::from(source_width));
+    let crop_height = (f64::from(height) / scale).min(f64::from(source_height));
+    Some(ImageCrop {
+        x: ((f64::from(source_width) - crop_width) / 2.0) as f32,
+        y: ((f64::from(source_height) - crop_height) / 2.0) as f32,
+        width: crop_width as f32,
+        height: crop_height as f32,
+    })
 }
 
 #[cfg(test)]
@@ -131,13 +140,28 @@ mod tests {
     }
 
     #[test]
-    fn aspect_fit_preserves_bounds_and_direction() {
-        assert_eq!(aspect_fit(350, 200, 220, 160), Some((220, 126)));
-        assert_eq!(aspect_fit(200, 350, 220, 160), Some((91, 160)));
-        assert_eq!(aspect_fit(100, 100, 220, 160), Some((160, 160)));
-        assert_eq!(aspect_fit(0, 10, 220, 160), None);
-        assert_eq!(aspect_fit(10, 10, 0, 160), None);
-        assert_eq!(aspect_fit(u32::MAX, 1, 220, 160), Some((220, 1)));
+    fn aspect_fill_crops_center_without_stretching_or_letterboxing() {
+        for (w, h) in [
+            (350, 200),
+            (200, 350),
+            (100, 100),
+            (1, 10000),
+            (10000, 1),
+            (10, 10),
+        ] {
+            let crop = aspect_fill(w, h, 220, 160).unwrap();
+            assert!(crop.x >= 0.0 && crop.y >= 0.0);
+            assert!(crop.x + crop.width <= w as f32 + 0.001);
+            assert!(crop.y + crop.height <= h as f32 + 0.001);
+            assert!((crop.width / crop.height - 220.0 / 160.0).abs() < 0.0001);
+            assert!((crop.x + crop.width / 2.0 - w as f32 / 2.0).abs() < 0.001);
+            assert!((crop.y + crop.height / 2.0 - h as f32 / 2.0).abs() < 0.001);
+        }
+        let portrait = aspect_fill(200, 350, 220, 160).unwrap();
+        assert!(portrait.x.abs() < 0.001);
+        assert!((portrait.y - 102.27273).abs() < 0.001);
+        assert_eq!(aspect_fill(0, 10, 220, 160).map(|_| ()), None);
+        assert_eq!(aspect_fill(10, 10, 0, 160).map(|_| ()), None);
     }
 
     #[test]
