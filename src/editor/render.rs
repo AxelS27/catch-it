@@ -428,7 +428,7 @@ impl Renderer {
             _ => {}
         }
     }
-    fn palette(&self, layout: &Layout, selected_color: usize) {
+    fn palette(&self, layout: &Layout, selected_color: usize, dark: bool) {
         let Some(r) = layout.palette_rect() else {
             return;
         };
@@ -439,23 +439,29 @@ impl Renderer {
                 w: r.w,
                 h: r.h,
             },
-            0xd0cad1,
+            if dark { 0x141418 } else { 0xd0cad1 },
             18.0,
         );
-        self.pill(r, 0xf6f6f6, 17.0);
-        self.rounded_outline(r, 0xc8c7c9, 17.0);
+        self.pill(r, if dark { 0x303036 } else { 0xf6f6f6 }, 17.0);
+        self.rounded_outline(r, if dark { 0x686870 } else { 0xc8c7c9 }, 17.0);
         for (index, &swatch) in PRESET_COLORS.iter().enumerate() {
             let (x, y) = (r.x + r.w / 2.0, r.y + 20.0 + 32.0 * index as f32);
             if index == selected_color {
-                self.circle(x, y, 13.0, 0xb5d1be, true);
-                self.circle(x, y, 11.0, 0xf6f6f6, true);
+                self.circle(x, y, 13.0, if dark { 0x668773 } else { 0xb5d1be }, true);
+                self.circle(x, y, 11.0, if dark { 0x303036 } else { 0xf6f6f6 }, true);
             }
             self.circle(x, y, 10.0, swatch, true);
             self.circle(
                 x,
                 y,
                 10.0,
-                if index == 9 { 0xc7c7c7 } else { 0x6e6a74 },
+                if dark {
+                    0xb5b5bd
+                } else if index == 9 {
+                    0xc7c7c7
+                } else {
+                    0x6e6a74
+                },
                 false,
             );
         }
@@ -582,7 +588,7 @@ impl Renderer {
                     );
                 }
             }
-            self.outline(r, if dark { 0x4b4b52 } else { 0xd8d6de }, 1.0);
+            self.outline(r, crate::theme::border_rgb(dark), 1.0);
         } else {
             self.text("Opening screenshot...", layout.canvas, muted, false);
         }
@@ -723,13 +729,13 @@ impl Renderer {
                         w: r.w + 4.0,
                         h: r.h + 4.0,
                     },
-                    0x007aff,
+                    crate::theme::border_rgb(dark),
                     1.0,
                 );
             }
         }
         if palette_open {
-            self.palette(layout, selected_color);
+            self.palette(layout, selected_color, dark);
         }
         unsafe {
             self.target

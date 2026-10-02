@@ -96,7 +96,7 @@ pub struct Surface {
     started: Option<Instant>,
     drag_pixels: Vec<u8>,
     card: ID2D1Bitmap1,
-    controls: (bool, bool, bool),
+    controls: (bool, bool, bool, bool),
 }
 
 enum Image<'a> {
@@ -146,10 +146,9 @@ fn compose(
     swap_chain: &IDXGISwapChain1,
     layout: Layout,
     card: &ID2D1Bitmap1,
-    hovered: bool,
-    pinned: bool,
-    highlighted: bool,
+    controls: (bool, bool, bool, bool),
 ) -> Result<()> {
+    let (hovered, pinned, highlighted, dark) = controls;
     unsafe {
         let context = &compositor.context;
         let dpi = 96.0 * layout.scale;
@@ -203,33 +202,33 @@ fn compose(
             D2D1_COMPOSITE_MODE_SOURCE_OVER,
         );
         let controls_result = (|| {
-            if highlighted {
-                let blue = context.CreateSolidColorBrush(
-                    &D2D1_COLOR_F {
-                        r: 0.08,
-                        g: 0.42,
-                        b: 0.92,
-                        a: 1.0,
+            let neutral = if dark { 1.0 } else { 0.0 };
+            let border = context.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: neutral,
+                    g: neutral,
+                    b: neutral,
+                    a: 1.0,
+                },
+                None,
+            )?;
+            let stroke = if highlighted { 3.0 } else { 1.0 };
+            let inset = stroke / 2.0;
+            context.DrawRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: layout.card_left + inset,
+                        top: layout.card_top + inset,
+                        right: layout.card_left + layout.card_width - inset,
+                        bottom: layout.card_top + layout.card_height - inset,
                     },
-                    None,
-                )?;
-                let inset = 1.5;
-                context.DrawRoundedRectangle(
-                    &D2D1_ROUNDED_RECT {
-                        rect: D2D_RECT_F {
-                            left: layout.card_left + inset,
-                            top: layout.card_top + inset,
-                            right: layout.card_left + layout.card_width - inset,
-                            bottom: layout.card_top + layout.card_height - inset,
-                        },
-                        radiusX: layout.radius - inset,
-                        radiusY: layout.radius - inset,
-                    },
-                    &blue,
-                    3.0,
-                    None,
-                );
-            }
+                    radiusX: (layout.radius - inset).max(0.0),
+                    radiusY: (layout.radius - inset).max(0.0),
+                },
+                &border,
+                stroke,
+                None,
+            );
             draw_controls(compositor, layout, hovered, pinned)
         })();
         let draw_result = context.EndDraw(None, None);
@@ -508,7 +507,13 @@ impl Surface {
                     (pixels.to_vec(), cached_card(&compositor, layout, pixels)?)
                 }
             };
-            compose(&compositor, &swap_chain, layout, &card, false, false, false)?;
+            compose(
+                &compositor,
+                &swap_chain,
+                layout,
+                &card,
+                (false, false, false, crate::theme::dark()),
+            )?;
             let target = compositor.composition.CreateTargetForHwnd(hwnd, true)?;
             let visual = compositor.composition.CreateVisual()?;
             let opacity = compositor.composition.CreateEffectGroup()?;
@@ -530,7 +535,7 @@ impl Surface {
                 started: None,
                 drag_pixels,
                 card,
-                controls: (false, false, false),
+                controls: (false, false, false, crate::theme::dark()),
             })
         }
     }
@@ -540,18 +545,22 @@ impl Surface {
         &self.drag_pixels
     }
 
-    pub fn set_controls(&mut self, hovered: bool, pinned: bool, highlighted: bool) -> Result<()> {
-        if self.controls != (hovered, pinned, highlighted) {
+    pub fn set_controls(
+        &mut self,
+        hovered: bool,
+        pinned: bool,
+        highlighted: bool,
+        dark: bool,
+    ) -> Result<()> {
+        if self.controls != (hovered, pinned, highlighted, dark) {
             compose(
                 &self.compositor,
                 &self._swap_chain,
                 self.layout,
                 &self.card,
-                hovered,
-                pinned,
-                highlighted,
+                (hovered, pinned, highlighted, dark),
             )?;
-            self.controls = (hovered, pinned, highlighted);
+            self.controls = (hovered, pinned, highlighted, dark);
         }
         Ok(())
     }
@@ -725,15 +734,6 @@ fn render_card(
                 ..Default::default()
             },
         )?;
-        let border = context.CreateSolidColorBrush(
-            &D2D1_COLOR_F {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.85,
-            },
-            None,
-        )?;
         let mut layer = D2D1_LAYER_PARAMETERS1 {
             contentBounds: rect,
             geometricMask: std::mem::ManuallyDrop::new(Some(geometry.cast()?)),
@@ -755,31 +755,14 @@ fn render_card(
             None,
         );
         context.PopLayer();
-        let stroke = 1.0_f32.min(layout.card_width).min(layout.card_height);
-        let inset = stroke / 2.0;
-        context.DrawRoundedRectangle(
-            &D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left: rect.left + inset,
-                    top: rect.top + inset,
-                    right: rect.right - inset,
-                    bottom: rect.bottom - inset,
-                },
-                radiusX: (layout.radius - inset).max(0.0),
-                radiusY: (layout.radius - inset).max(0.0),
-            },
-            &border,
-            stroke,
-            None,
-        );
         let draw_result = context.EndDraw(None, None);
         context.SetTarget(None);
         // windows-rs uses ManuallyDrop for COM fields in native parameter structs.
         std::mem::ManuallyDrop::drop(&mut layer.geometricMask);
         draw_result.context("Cannot rasterize thumbnail card")?;
 
-        // Cache only the small card, without shadow/padding. Dragging reuses these
-        // exact GPU-rendered pixels, including fractional crop, border and alpha.
+        // Cache only the small card, without shadow/padding or theme-dependent
+        // border. Dragging reuses its premultiplied, rounded GPU pixels.
         let width = (layout.card_width * layout.scale).round() as u32;
         let height = (layout.card_height * layout.scale).round() as u32;
         let readback = context.CreateBitmap(

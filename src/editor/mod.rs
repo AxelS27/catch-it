@@ -7,6 +7,7 @@ mod render;
 use crate::{
     drag_drop::{Outcome, PreparedDrag},
     storage::{self, Raster},
+    theme,
 };
 use anyhow::{Context, Result};
 use layout::{Control, Layout, View, Zoom};
@@ -101,9 +102,9 @@ pub struct Editor {
 impl Editor {
     pub fn create(controller: HWND, source: HWND, path: &Path) -> Result<Self> {
         let protection = storage::protect_png(path)?;
-        // The supplied markup.mp4 is a light-appearance reference. Pin the
-        // editor to that appearance rather than inheriting Windows dark mode.
-        let dark = false;
+        // The reference video is light, but the installed Windows appearance
+        // is authoritative for the actual user's editor.
+        let dark = theme::dark();
         let mut state = Box::new(WindowState {
             controller,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -245,6 +246,16 @@ impl Editor {
     }
     fn theme(&self) {
         apply_theme(self.hwnd, self.state.dark);
+    }
+
+    pub fn refresh_theme(&mut self, dark: bool) {
+        if self.state.dark != dark {
+            self.state.dark = dark;
+            self.theme();
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
+        }
     }
     pub fn capture_hidden(&mut self, hidden: bool) -> Result<bool> {
         if self.state.hidden == hidden {

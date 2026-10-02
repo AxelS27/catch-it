@@ -11,6 +11,7 @@ mod geometry;
 mod overlay;
 mod settings;
 mod storage;
+mod theme;
 mod thumbnail;
 mod tray;
 mod worker;
@@ -479,6 +480,15 @@ impl App {
         show_error(error);
     }
 
+    fn refresh_theme(&mut self) -> Result<()> {
+        let dark = theme::dark();
+        self.gallery.refresh_theme(dark)?;
+        for editor in &mut self.editors {
+            editor.refresh_theme(dark);
+        }
+        Ok(())
+    }
+
     fn configure_timeout(&mut self, index: usize) -> Result<()> {
         let Some(timeout) = settings::AutoClose::ALL.get(index).copied() else {
             return Ok(());
@@ -550,7 +560,9 @@ unsafe extern "system" fn controller_proc(
     }
     if matches!(
         message,
-        WORK_READY
+        WM_SETTINGCHANGE
+            | WM_THEMECHANGED
+            | WORK_READY
             | overlay::FINISH_SELECTION
             | thumbnail::HOVER_CHANGED
             | thumbnail::DISMISS
@@ -711,6 +723,7 @@ fn run() -> Result<()> {
                 WM_HOTKEY if message.wParam.0 == CAPTURE_HOTKEY as usize => app.start_capture(),
                 WM_HOTKEY if message.wParam.0 == QUIT_HOTKEY as usize => break,
                 WORK_READY => app.receive_work(),
+                WM_SETTINGCHANGE | WM_THEMECHANGED => app.refresh_theme(),
                 overlay::FINISH_SELECTION => app.finish_selection(),
                 WM_TIMER if message.wParam.0 == THUMBNAIL_TIMER => {
                     app.update_thumbnail(None, false)

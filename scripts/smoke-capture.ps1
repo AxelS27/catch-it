@@ -9,10 +9,11 @@ param(
     [switch]$FifoOnly,
     [switch]$ActionsOnly,
     [switch]$QuickAccessOnly,
+    [switch]$ThemeOnly,
     [switch]$EditorOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $EditorOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -393,6 +394,10 @@ function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeig
         }
         $bitmap.Save((Join-Path $artifacts $Artifact))
         if (-not $ready) { throw "Thumbnail preview never reached the expected rendered colors at $x,${y}: $($bitmap.GetPixel($x,$y)). See thumbnail.png." }
+        # All fixtures here inspect the newly created (highlighted) card.
+        $light = (Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme' -ErrorAction SilentlyContinue) -ne 0
+        $border = $bitmap.GetPixel(($padding+[int]($cardWidth/2)), ($padding+1))
+        if (($light -and $border.R -gt 35) -or (-not $light -and $border.R -lt 220)) { throw "Quick Access border must be $(if($light){'black'}else{'white'}) in this Windows app theme, got $border." }
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
     if ($ExpectedCount -gt 0 -and [CaptureInput]::ThumbnailCount() -ne $ExpectedCount) { throw "Expected $ExpectedCount visible previews." }
     return $rect
@@ -1030,10 +1035,11 @@ function Test-Editor {
     Click-EditorAction $editor 'Color'
     [CaptureInput]::ClickAt($colorX,[int]($bounds.Top+198*$scale))
     Click-EditorAction $editor 'Color';Press-Key 27
-    Assert-EditorPalettePixel $colorX ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::White.ToArgb())
+    $canvasColor=if((Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme') -eq 0){[Drawing.Color]::FromArgb(25,25,29)}else{[Drawing.Color]::White}
+    Assert-EditorPalettePixel $colorX ([int]($bounds.Top+102*$scale)) ($canvasColor.ToArgb())
     Click-EditorAction $editor 'Color'
     [CaptureInput]::ClickAt([int]($bounds.Left+400*$scale),[int]($bounds.Top+400*$scale))
-    Assert-EditorPalettePixel $colorX ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::White.ToArgb())
+    Assert-EditorPalettePixel $colorX ([int]($bounds.Top+102*$scale)) ($canvasColor.ToArgb())
     Write-Host 'PASS: native color menu matches video swatch order; pointer/keyboard selection and Escape/outside dismissal work'
 
     Click-EditorAction $editor 'Maximize'
@@ -1426,6 +1432,26 @@ function Test-Tray {
     [void](Wait-Overlay $false)
     Write-Host 'PASS: capture hotkey closes an open tray menu and starts selection without reentering App'
 }
+function Test-Theme {
+    $record = New-TestPreview
+    Click-PreviewAction $record.Window 'Annotate'
+    $editor = Wait-Editor
+    Start-Sleep -Milliseconds 200
+    Save-GalleryScreenshot 'theme-annotate.png'
+    $bounds = [CaptureInput]::ClientBounds($editor)
+    $bitmap = [Drawing.Bitmap]::new(1,1)
+    $graphics = [Drawing.Graphics]::FromImage($bitmap)
+    try {
+        $graphics.CopyFromScreen(($bounds.Left+60),($bounds.Top+120),0,0,$bitmap.Size)
+        $pixel = $bitmap.GetPixel(0,0)
+        $light = (Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme' -ErrorAction SilentlyContinue) -ne 0
+        if (($light -and $pixel.R -lt 245) -or (-not $light -and $pixel.R -gt 45)) { throw "Annotate canvas does not match the current Windows app theme: $pixel." }
+    } finally { $graphics.Dispose(); $bitmap.Dispose() }
+    Click-EditorAction $editor 'Color'
+    Start-Sleep -Milliseconds 100
+    Save-GalleryScreenshot 'theme-annotate-palette.png'
+    Write-Host 'PASS: Quick Access neutral border and Annotate chrome/palette follow Windows app theme'
+}
 function Test-DragDrop([switch]$PreviewOnly) {
     $targetX = $sceneRect.Left + 400
     $targetY = $sceneRect.Top + 250
@@ -1615,6 +1641,7 @@ try {
     Start-Sleep -Milliseconds 350
     if ($Layout) { Test-Layout }
     if ($QuickAccessOnly) { Test-DragDrop -PreviewOnly }
+    elseif ($ThemeOnly) { Test-Theme }
     elseif ($EditorOnly) { Test-Editor }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }

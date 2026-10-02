@@ -1,0 +1,44 @@
+//! Follow the Windows *app* appearance, not wallpaper or system taskbar color.
+use windows::{
+    Win32::{Foundation::ERROR_SUCCESS, System::Registry::*},
+    core::w,
+};
+
+pub fn dark() -> bool {
+    let mut value = 1u32; // Windows defaults to light apps if this key is absent.
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+            w!("AppsUseLightTheme"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut size),
+        )
+    };
+    dark_from_value((status == ERROR_SUCCESS && size == 4).then_some(value))
+}
+
+fn dark_from_value(value: Option<u32>) -> bool {
+    value == Some(0)
+}
+
+/// High-contrast neutral outline; blue remains an action accent, not a frame.
+pub fn border_rgb(dark: bool) -> u32 {
+    if dark { 0xffffff } else { 0x000000 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn border_contrasts_with_both_windows_appearances() {
+        assert_eq!(border_rgb(true), 0xffffff);
+        assert_eq!(border_rgb(false), 0x000000);
+        assert!(dark_from_value(Some(0)));
+        assert!(!dark_from_value(Some(1)));
+        assert!(!dark_from_value(None));
+    }
+}

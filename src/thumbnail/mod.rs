@@ -87,6 +87,7 @@ pub struct Thumbnail {
     visible: bool,
     editing: bool,
     highlighted: bool,
+    dark: bool,
 }
 
 impl Thumbnail {
@@ -163,6 +164,7 @@ impl Thumbnail {
                 visible: false,
                 editing: false,
                 highlighted: false,
+                dark: crate::theme::dark(),
             };
             let dpi = GetDpiForWindow(hwnd);
             thumbnail.state.drag_width = GetSystemMetricsForDpi(SM_CXDRAG, dpi).max(1);
@@ -366,7 +368,20 @@ impl Thumbnail {
 
     fn update_controls(&mut self) -> Result<()> {
         if let Some(surface) = &mut self.surface {
-            surface.set_controls(self.state.hovered, self.state.pinned, self.highlighted)?;
+            surface.set_controls(
+                self.state.hovered,
+                self.state.pinned,
+                self.highlighted,
+                self.dark,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn refresh_theme(&mut self, dark: bool) -> Result<()> {
+        if self.dark != dark {
+            self.dark = dark;
+            self.update_controls()?;
         }
         Ok(())
     }
@@ -458,7 +473,7 @@ impl Thumbnail {
                 return Ok(Outcome::Canceled);
             }
             if let Some(surface) = &mut self.surface {
-                surface.set_controls(false, false, false)?;
+                surface.set_controls(false, false, false, self.dark)?;
                 surface.set_dragging(true)?;
             }
             // A disabled popup stays visible in the stack, but Windows routes
@@ -733,7 +748,11 @@ unsafe extern "system" fn window_proc(
                 );
                 LRESULT(0)
             }
-            WM_CLOSE | WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE => {
+            // Appearance broadcasts update the retained card in place. Only
+            // work-area changes dismiss it to avoid stranding it by the taskbar.
+            WM_CLOSE | WM_DISPLAYCHANGE | WM_DPICHANGED | WM_SETTINGCHANGE
+                if message != WM_SETTINGCHANGE || wparam.0 == SPI_SETWORKAREA.0 as usize =>
+            {
                 let state = &*ptr;
                 if state.dragging {
                     state.cancel_drag.set(true);

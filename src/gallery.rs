@@ -57,6 +57,13 @@ impl Gallery {
         self.reflow()?;
         Ok(had_visible)
     }
+    pub fn refresh_theme(&mut self, dark: bool) -> Result<()> {
+        for item in &mut self.items {
+            item.refresh_theme(dark)?;
+        }
+        Ok(())
+    }
+
     pub fn pause_all(&mut self) -> Result<()> {
         for item in &mut self.items {
             item.set_paused(true)?;
