@@ -12,7 +12,7 @@ The application has one primary purpose:
 
 No screenshot editor, library, annotation tools, account system, or complex UI.
 
-**Approved follow-up milestone:** add a CleanShot-inspired pending thumbnail queue, persistent pinned reference cards, and a configurable auto-close timer through the native tray. This is a limited Windows extension, not a complete CleanShot clone. Our three-visible-card policy and timer defaults are design choices; CleanShot's exact overflow layout, default lifetime, and hover semantics are not yet verified.
+**Approved follow-up milestone:** add a CleanShot-inspired pending thumbnail queue, persistent pinned reference cards, and a configurable auto-close timer through the native tray. This is a limited Windows extension, not a complete CleanShot clone. Our screen-derived stack capacity and timer defaults are design choices; CleanShot's exact overflow layout, default lifetime, and hover semantics are not yet verified.
 
 ---
 
@@ -214,15 +214,14 @@ Apple's public documentation describes the lifetime as "a few seconds" rather th
 
 ### 5.3 Approved Queue, Pin, and Timer Extension
 
-- Preserve earlier captures in a newest-first, session-only pending queue. Show up to three pending cards per monitor, reducing the visible count on small work areas.
-- Provide older/newer page navigation through a native context menu, with a wheel shortcut when Windows routes inactive-window scrolling. Fourth and later captures remain accessible, not silently discarded.
-- Pause hidden queued cards' remaining timeout. Keep only a small cached preview and file guard for hidden entries, releasing full decoded images and GPU surfaces.
+- Use a bounded, session-only FIFO preview queue. Capacity follows the monitor's usable height and DPI. Show one bottom-right stack, oldest at the bottom and newest at the top. New captures permanently evict the oldest unpinned thumbnail on overflow; survivors compact downward. For capacity five, 1-6 leaves only 2-6. Eviction destroys the thumbnail window and releases its resources, never its PNG.
+- No hidden backlog or older/newer paging. Evicted thumbnails must never return after timeout, manual close, successful drag, capture cancellation, or a new capture.
 - Expose pin and close controls on hover, plus native context-menu actions and tray close-all.
-- Pins remain always on top and do not auto-expire. They occupy independent positions beside the dock and can be moved using Alt+drag without activating the window.
+- Pins remain always on top and do not auto-expire. Pin/unpin preserves capture order and the existing stack position, without moving cards to another column. Pins reserve slots and remain visible during overflow. Removing a card compacts cards above it, preserving pin state. If every visible slot is pinned, new PNGs are saved but cannot add a preview to the full queue.
 - A successful file drop closes an unpinned card but preserves a pinned reference. Closing a card never deletes its PNG.
 - Pins currently use the same fixed centered-cover card. Resizing, opacity, click-through locking, full-size reference windows, and editing are not part of this milestone.
 - Hide all previews and pins before capture and pause their clocks through selection and PNG publication. Restore them after completion or cancellation, including error recovery.
-- Changing the selected timer starts a fresh interval; unpinning also starts a fresh interval. Hover and active drag pause rather than reset the remaining interval.
+- Changing the selected timer starts a fresh interval; unpinning also starts a fresh interval. Hover and active drag pause rather than reset the remaining interval. Automatic dismissal is FIFO within each visible monitor stack: skip pins, finish the oldest unpinned card's exit before a newer card starts exiting. Newer elapsed budgets wait without resetting; hovering the oldest blocks automatic dismissal behind it. Permanently evicted overflow never blocks or returns to the surviving queue. Manual close and successful file drops remain independent of FIFO.
 - Persist the timer preference across launches, not the queue/pin session. Closing the app or changing display/DPI dismisses reference cards; temporary files remain governed by retention independently.
 
 ---

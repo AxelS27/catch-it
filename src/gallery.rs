@@ -1,15 +1,11 @@
-//! File-backed pending queue. Only visible cards retain GPU surfaces; queued cards
-//! retain small cached card pixels and a source-file deletion guard, not full captures.
+//! Bounded FIFO preview queue. Overflow permanently drops the oldest unpinned
+//! thumbnail, never its PNG. Pins stay in chronological bottom-to-top order.
 use crate::{
     settings::AutoClose,
     thumbnail::{self, Thumbnail},
 };
 use anyhow::Result;
-use std::{
-    cell::Cell,
-    collections::{BTreeMap, BTreeSet},
-    time::Duration,
-};
+use std::{cell::Cell, collections::BTreeMap, time::Duration};
 use windows::{
     Win32::{Foundation::*, UI::WindowsAndMessaging::*},
     core::{PCWSTR, w},
@@ -17,14 +13,11 @@ use windows::{
 
 const PIN_ITEM: usize = 201;
 const CLOSE_ITEM: usize = 202;
-const OLDER_ITEM: usize = 203;
-const NEWER_ITEM: usize = 204;
-const CLOSE_ALL_ITEM: usize = 205;
+const CLOSE_ALL_ITEM: usize = 203;
 thread_local! { static MENU_SOURCE: Cell<usize> = const { Cell::new(0) }; }
 
 pub struct Gallery {
-    items: Vec<Thumbnail>, // newest first, pins excluded from paging
-    pages: BTreeMap<isize, usize>,
+    items: Vec<Thumbnail>, // newest first; pins keep their chronological stack position
     capturing: bool,
     timeout: AutoClose,
 }
@@ -33,7 +26,6 @@ impl Gallery {
     pub fn new(timeout: AutoClose) -> Self {
         Self {
             items: Vec::new(),
-            pages: BTreeMap::new(),
             capturing: false,
             timeout,
         }
@@ -46,11 +38,9 @@ impl Gallery {
     }
     pub fn clear(&mut self) {
         self.items.clear();
-        self.pages.clear();
         self.capturing = false;
     }
     pub fn insert(&mut self, thumbnail: Thumbnail) -> Result<()> {
-        self.pages.insert(thumbnail.monitor(), 0);
         self.items.insert(0, thumbnail);
         self.capturing = false;
         self.reflow()
@@ -107,21 +97,7 @@ impl Gallery {
         let Some(index) = self.items.iter().position(|item| item.matches(source)) else {
             return Ok(());
         };
-        let monitor = self.items[index].monitor();
-        let ordinal = free_pin_slot(
-            self.items
-                .iter()
-                .filter(|item| item.pinned() && item.monitor() == monitor)
-                .filter_map(Thumbnail::pin_slot),
-        );
         self.items[index].toggle_pin()?;
-        if self.items[index].pinned() {
-            self.items[index].place_pin(ordinal)?;
-        } else {
-            let item = self.items.remove(index);
-            self.items.insert(0, item);
-        }
-        self.pages.insert(monitor, 0);
         self.reflow()
     }
     pub fn configure(&mut self, timeout: AutoClose) -> Result<()> {
@@ -131,54 +107,46 @@ impl Gallery {
         }
         self.reflow()
     }
-    pub fn navigate(&mut self, source: WPARAM, older: bool) -> Result<()> {
-        let Some(item) = self.items.iter().find(|item| item.matches(source)) else {
-            return Ok(());
-        };
-        let monitor = item.monitor();
-        let capacity = item.capacity();
-        let count = self
-            .items
-            .iter()
-            .filter(|item| !item.pinned() && item.monitor() == monitor)
-            .count();
-        let current = self.pages.get(&monitor).copied().unwrap_or(0);
-        self.pages
-            .insert(monitor, page_after(current, count, capacity, older));
-        self.reflow()
-    }
     pub fn reflow(&mut self) -> Result<()> {
         loop {
-            let mut counts = BTreeMap::<isize, (usize, usize)>::new();
-            for item in &self.items {
-                if !item.pinned() {
-                    let group = counts.entry(item.monitor()).or_insert((0, item.capacity()));
-                    group.0 += 1;
+            let mut groups = BTreeMap::<isize, Vec<usize>>::new();
+            for (index, item) in self.items.iter().enumerate() {
+                groups.entry(item.monitor()).or_default().push(index);
+            }
+            let mut keep = vec![true; self.items.len()];
+            for indices in groups.into_values() {
+                let pinned: Vec<_> = indices
+                    .iter()
+                    .map(|&index| self.items[index].pinned())
+                    .collect();
+                let capacity = self.items[indices[0]].capacity();
+                let slots = stack_slots(&pinned, capacity);
+                let head = fifo_head(&pinned, &slots);
+                // Gate all timers before resuming visibility. Keep a dismissing
+                // head until its exit finishes, so newer cards cannot vanish first.
+                for (ordinal, &index) in indices.iter().enumerate() {
+                    self.items[index].set_auto_dismiss_blocked(Some(ordinal) != head)?;
                 }
-            }
-            for (monitor, (count, capacity)) in &counts {
-                let page = self.pages.entry(*monitor).or_default();
-                *page = clamp_page(*page, *count, *capacity);
-            }
-            let mut ordinals = BTreeMap::<isize, usize>::new();
-            for item in &mut self.items {
-                if self.capturing {
-                    item.hide(false)?;
-                } else if item.pinned() {
-                    item.show()?;
-                } else {
-                    let ordinal = ordinals.entry(item.monitor()).or_default();
-                    let page = self.pages.get(&item.monitor()).copied().unwrap_or(0);
-                    if *ordinal >= page && *ordinal < page + item.capacity() {
-                        item.show_slot(*ordinal - page)?;
+                for (index, slot) in indices.into_iter().zip(slots) {
+                    let Some(slot) = slot else {
+                        keep[index] = false;
+                        continue;
+                    };
+                    let item = &mut self.items[index];
+                    if self.capturing {
+                        item.hide()?;
                     } else {
-                        item.hide(true)?;
+                        item.show_slot(slot)?;
                     }
-                    *ordinal += 1;
                 }
             }
             let before = self.items.len();
-            self.items.retain(|item| !item.closed());
+            let mut index = 0;
+            self.items.retain(|item| {
+                let retained = keep[index] && !item.closed();
+                index += 1;
+                retained
+            });
             if self.items.len() == before {
                 return Ok(());
             }
@@ -190,60 +158,53 @@ impl Gallery {
         };
         let pinned = item.pinned();
         let monitor = item.monitor();
-        let capacity = item.capacity();
         let count = self
             .items
             .iter()
             .filter(|item| !item.pinned() && item.monitor() == monitor)
             .count();
-        let page = self.pages.get(&monitor).copied().unwrap_or(0);
         self.pause_all()?;
-        let result = show_menu(
-            controller,
-            source,
-            pinned,
-            page > 0,
-            page + capacity < count,
-            count,
-        );
+        let result = show_menu(controller, source, pinned, count);
         self.reflow()?;
         result
     }
 }
 
-fn free_pin_slot(slots: impl Iterator<Item = usize>) -> usize {
-    let used: BTreeSet<_> = slots.collect();
-    (0..)
-        .find(|slot| !used.contains(slot))
-        .expect("A finite gallery has a free pin slot")
+/// Select newest pending cards alongside every pin, then pack oldest-to-newest
+/// from the bottom of the dock. None means permanent eviction, not a hidden page.
+/// Pinning changes lifetime, never capture order.
+fn stack_slots(pinned: &[bool], capacity: usize) -> Vec<Option<usize>> {
+    let pending_capacity = capacity.saturating_sub(pinned.iter().filter(|&&pin| pin).count());
+    let mut pending = 0;
+    let mut selected = Vec::new();
+    for (index, &pin) in pinned.iter().enumerate() {
+        if pin {
+            selected.push(index);
+        } else {
+            if pending < pending_capacity {
+                selected.push(index);
+            }
+            pending += 1;
+        }
+    }
+    let mut slots = vec![None; pinned.len()];
+    for (slot, index) in selected.into_iter().rev().enumerate() {
+        slots[index] = Some(slot);
+    }
+    slots
 }
 
-fn clamp_page(page: usize, count: usize, capacity: usize) -> usize {
-    if count == 0 {
-        0
-    } else {
-        page.min((count - 1) / capacity.max(1) * capacity.max(1))
-    }
-}
-fn page_after(page: usize, count: usize, capacity: usize, older: bool) -> usize {
-    let step = capacity.max(1);
-    clamp_page(
-        if older {
-            page.saturating_add(step)
-        } else {
-            page.saturating_sub(step)
-        },
-        count,
-        step,
-    )
+fn fifo_head(pinned: &[bool], slots: &[Option<usize>]) -> Option<usize> {
+    pinned
+        .iter()
+        .zip(slots)
+        .rposition(|(&pin, slot)| !pin && slot.is_some())
 }
 
 fn send_action(controller: HWND, source: WPARAM, chosen: usize) -> Result<()> {
     let (message, parameter) = match chosen {
         PIN_ITEM => (thumbnail::PIN, 0),
         CLOSE_ITEM => (thumbnail::DISMISS, 0),
-        OLDER_ITEM => (thumbnail::NAVIGATE, 1),
-        NEWER_ITEM => (thumbnail::NAVIGATE, -1),
         CLOSE_ALL_ITEM => (crate::tray::CLOSE_ALL_REQUEST, 0),
         _ => return Ok(()),
     };
@@ -270,14 +231,7 @@ pub fn handle_menu_command(controller: HWND, wparam: WPARAM, lparam: LPARAM) -> 
     true
 }
 
-fn show_menu(
-    controller: HWND,
-    source: WPARAM,
-    pinned: bool,
-    newer: bool,
-    older: bool,
-    count: usize,
-) -> Result<()> {
+fn show_menu(controller: HWND, source: WPARAM, pinned: bool, count: usize) -> Result<()> {
     struct Menu(HMENU);
     impl Drop for Menu {
         fn drop(&mut self) {
@@ -297,8 +251,6 @@ fn show_menu(
         let menu = Menu(CreatePopupMenu()?);
         let title = if count == 0 {
             "Pinned screenshot".to_owned()
-        } else if older || newer {
-            format!("{count} pending screenshots - wheel to browse")
         } else {
             format!("{count} pending screenshots")
         };
@@ -309,25 +261,9 @@ fn show_menu(
             menu.0,
             MF_STRING,
             PIN_ITEM,
-            if pinned {
-                w!("Unpin")
-            } else {
-                w!("Pin (Alt+drag to move)")
-            },
+            if pinned { w!("Unpin") } else { w!("Pin") },
         )?;
         AppendMenuW(menu.0, MF_STRING, CLOSE_ITEM, w!("Close"))?;
-        AppendMenuW(
-            menu.0,
-            MF_STRING | if older { MF_ENABLED } else { MF_GRAYED },
-            OLDER_ITEM,
-            w!("Older screenshots"),
-        )?;
-        AppendMenuW(
-            menu.0,
-            MF_STRING | if newer { MF_ENABLED } else { MF_GRAYED },
-            NEWER_ITEM,
-            w!("Newer screenshots"),
-        )?;
         AppendMenuW(menu.0, MF_SEPARATOR, 0, None)?;
         AppendMenuW(
             menu.0,
@@ -360,22 +296,76 @@ fn show_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn pin_slots_do_not_overlap_survivors_after_an_earlier_pin_is_closed() {
-        assert_eq!(free_pin_slot([].into_iter()), 0);
-        assert_eq!(free_pin_slot([0, 1, 2].into_iter()), 3);
-        assert_eq!(free_pin_slot([1, 2].into_iter()), 0);
-        assert_eq!(free_pin_slot([0, 2].into_iter()), 1);
+    fn pin_and_unpin_preserve_slots_and_removal_compacts_surviving_pins() {
+        let before = stack_slots(&[false; 5], 5);
+        assert_eq!(before, vec![Some(4), Some(3), Some(2), Some(1), Some(0)]);
+        assert_eq!(stack_slots(&[false, false, true, false, true], 5), before);
+        assert_eq!(
+            stack_slots(&[false, false, true, true], 5),
+            vec![Some(3), Some(2), Some(1), Some(0)]
+        );
     }
+
     #[test]
-    fn paging_keeps_fourth_and_later_captures_accessible_and_clamps_after_removal() {
-        assert_eq!(page_after(0, 8, 3, true), 3);
-        assert_eq!(page_after(3, 8, 3, true), 6);
-        assert_eq!(page_after(6, 8, 3, true), 6);
-        assert_eq!(page_after(6, 8, 3, false), 3);
-        assert_eq!(clamp_page(6, 4, 3), 3);
-        assert_eq!(clamp_page(3, 3, 3), 0);
-        assert_eq!(clamp_page(3, 0, 3), 0);
-        assert_eq!(page_after(0, 5, 1, true), 1);
+    fn overflow_evicts_oldest_unpinned_and_never_resurrects_after_removal() {
+        let mut captures: Vec<_> = (1..=6).rev().map(|id| (id, false)).collect();
+        let slots = stack_slots(&[false; 6], 5);
+        assert_eq!(
+            slots,
+            vec![Some(4), Some(3), Some(2), Some(1), Some(0), None]
+        );
+        captures = captures
+            .into_iter()
+            .zip(slots)
+            .filter_map(|(entry, slot)| slot.map(|_| entry))
+            .collect();
+        assert_eq!(
+            captures
+                .iter()
+                .rev()
+                .map(|entry| entry.0)
+                .collect::<Vec<_>>(),
+            [2, 3, 4, 5, 6]
+        );
+        captures.pop(); // Screenshot 2 times out or is manually dismissed.
+        assert_eq!(
+            captures
+                .iter()
+                .rev()
+                .map(|entry| entry.0)
+                .collect::<Vec<_>>(),
+            [3, 4, 5, 6]
+        );
+        assert_eq!(
+            stack_slots(&[false; 4], 5),
+            vec![Some(3), Some(2), Some(1), Some(0)]
+        );
+    }
+
+    #[test]
+    fn overflow_keeps_pins_and_full_pin_dock_rejects_new_preview_not_a_hidden_backlog() {
+        assert_eq!(
+            stack_slots(&[false, false, false, true, false, true], 5),
+            vec![Some(4), Some(3), Some(2), Some(1), None, Some(0)]
+        );
+        assert_eq!(
+            stack_slots(&[false, true, true], 2),
+            vec![None, Some(1), Some(0)]
+        );
+        assert!(stack_slots(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn fifo_head_is_oldest_surviving_unpinned_card_and_skips_pins() {
+        let pinned = [false, false, false, true, false, true];
+        assert_eq!(fifo_head(&pinned, &stack_slots(&pinned, 5)), Some(2));
+        assert_eq!(
+            fifo_head(&[false; 5], &stack_slots(&[false; 5], 5)),
+            Some(4)
+        );
+        assert_eq!(fifo_head(&[true; 5], &stack_slots(&[true; 5], 5)), None);
+        assert_eq!(fifo_head(&[], &[]), None);
     }
 }

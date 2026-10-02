@@ -57,6 +57,7 @@ pub struct Lifecycle {
     paused: bool,
     pinned: bool,
     auto_close: bool,
+    auto_dismiss_blocked: bool,
 }
 
 impl Lifecycle {
@@ -71,6 +72,7 @@ impl Lifecycle {
             paused: false,
             pinned: false,
             auto_close: true,
+            auto_dismiss_blocked: false,
         }
     }
 
@@ -98,7 +100,12 @@ impl Lifecycle {
                 }
                 self.checkpoint = now;
                 self.hovered = hovered;
-                if self.remaining.is_zero() && !self.paused && !self.pinned && self.auto_close {
+                if self.remaining.is_zero()
+                    && !self.paused
+                    && !self.pinned
+                    && self.auto_close
+                    && !self.auto_dismiss_blocked
+                {
                     return self.dismiss(now);
                 }
             }
@@ -111,6 +118,13 @@ impl Lifecycle {
             Phase::Closed => return Action::Close,
         }
         Action::None
+    }
+
+    /// Budgets still elapse independently, but only the oldest visible unpinned
+    /// card may auto-dismiss. Manual close/drag and exit animations stay independent.
+    pub fn set_auto_dismiss_blocked(&mut self, now: Instant, blocked: bool) -> Action {
+        self.auto_dismiss_blocked = blocked;
+        self.update(now, self.hovered)
     }
 
     pub fn set_paused(&mut self, now: Instant, paused: bool) -> Action {
@@ -194,7 +208,8 @@ impl Lifecycle {
                     && !self.dragging
                     && !self.paused
                     && !self.pinned
-                    && self.auto_close =>
+                    && self.auto_close
+                    && !self.auto_dismiss_blocked =>
             {
                 Some(self.remaining.saturating_sub(elapsed))
             }
@@ -377,6 +392,38 @@ mod tests {
         assert_eq!(life.next_wake(change), None);
         life.set_pinned(change, false);
         assert_eq!(life.next_wake(change), Some(Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn fifo_waiting_preserves_elapsed_budget_without_zero_delay_timer_polling() {
+        let now = Instant::now();
+        let timing = Timing::default();
+        let mut life = Lifecycle::new(now, timing, false);
+        life.set_auto_dismiss_blocked(now, true);
+        life.update(now + timing.appear, false);
+        assert_eq!(life.next_wake(now + timing.appear), None);
+        let expired = now + timing.appear + timing.lifetime + Duration::from_secs(10);
+        assert_eq!(life.update(expired, false), Action::None);
+        assert_eq!(life.next_wake(expired), None);
+        assert_eq!(
+            life.set_auto_dismiss_blocked(expired, false),
+            Action::BeginDismiss
+        );
+        assert_eq!(life.next_wake(expired), Some(timing.dismiss));
+        assert_eq!(life.update(expired + timing.dismiss, false), Action::Close);
+    }
+
+    #[test]
+    fn fifo_waiting_never_blocks_manual_close_or_revives_exit() {
+        let now = Instant::now();
+        let timing = Timing::default();
+        let mut life = Lifecycle::new(now, timing, false);
+        life.set_auto_dismiss_blocked(now, true);
+        assert_eq!(life.dismiss(now), Action::BeginDismiss);
+        assert_eq!(
+            life.set_auto_dismiss_blocked(now + timing.dismiss, true),
+            Action::Close
+        );
     }
 
     #[test]

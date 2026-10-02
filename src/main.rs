@@ -252,11 +252,6 @@ impl App {
         self.schedule_thumbnail_timer()
     }
 
-    fn navigate(&mut self, source: WPARAM, older: bool) -> Result<()> {
-        self.gallery.navigate(source, older)?;
-        self.schedule_thumbnail_timer()
-    }
-
     fn context_menu(&mut self, source: WPARAM) -> Result<()> {
         self.gallery.context_menu(source, self.controller)?;
         self.schedule_thumbnail_timer()
@@ -349,7 +344,6 @@ unsafe extern "system" fn controller_proc(
             | thumbnail::BEGIN_DRAG
             | thumbnail::PIN
             | thumbnail::CONTEXT_MENU
-            | thumbnail::NAVIGATE
             | tray::SET_TIMEOUT_REQUEST
             | tray::CLOSE_ALL_REQUEST
     ) || (message == WM_TIMER && wparam.0 == THUMBNAIL_TIMER)
@@ -462,7 +456,7 @@ fn run() -> Result<()> {
     println!("Esc / right-click: cancel. Ctrl + Alt + Q: quit.");
     println!("Output: %LOCALAPPDATA%\\SimpleScreenshot\\Temp\\");
     println!(
-        "Preview: drag to copy, hover for pin/close, right-click for actions, wheel to browse. Timing is provisional."
+        "Preview: drag to copy, hover for pin/close, right-click for actions. Timing is provisional."
     );
     let mut message = MSG::default();
     loop {
@@ -505,7 +499,6 @@ fn run() -> Result<()> {
                 thumbnail::BEGIN_DRAG => app.begin_drag(message.wParam),
                 thumbnail::PIN => app.pin_thumbnail(message.wParam),
                 thumbnail::CONTEXT_MENU => app.context_menu(message.wParam),
-                thumbnail::NAVIGATE => app.navigate(message.wParam, message.lParam.0 > 0),
                 tray::SET_TIMEOUT_REQUEST => app.configure_timeout(message.wParam.0),
                 tray::CLOSE_ALL_REQUEST => {
                     app.clear_thumbnail();

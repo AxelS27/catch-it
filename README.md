@@ -27,13 +27,12 @@ Implemented:
 - Rasterize the card once before composing its shadow, avoiding the Direct2D layer-reuse error reproduced with full-screen captures.
 - DirectComposition slide/fade animations, without per-frame CPU repainting.
 - No keyboard focus activation when showing, hovering, clicking, or dismissing the preview.
-- Monotonic timeout that pauses on hover and resumes the remaining time after mouse exit.
-- Event-driven timers: no recurring timer for an idle pin, hidden queue, hovered card, Never setting, or dismissed gallery.
-- Hover exposes pin and close controls. Right-click opens pin/unpin, close, older/newer page, and close-all actions. Windows client-area animation preference is respected.
-- Newest-first pending queue with up to three visible cards per monitor (fewer if space is limited). Older captures remain accessible through the context menu or mouse wheel; wheel shortcuts require Windows inactive-window scrolling.
-- Pins are independent always-on-top reference cards, outside the three-card pending limit. Pinning moves a card beside the dock; Alt+drag repositions it without stealing keyboard focus. Pins keep the fixed cover-card design for now, not a full-size resizable editor/reference window.
-- Hide all pending cards and pins before desktop capture; pause their clocks until selection cancellation or PNG publication restores them. Captures do not contain older previews.
-- Hidden queued cards release their GPU surfaces and full decoded images; retain small cached card pixels, window state, and file protection. Returning to a page reconstructs the surface from cached pixels without decoding the PNG again.
+- Monotonic timeout that pauses on hover and resumes the remaining time after mouse exit. Auto-dismiss is FIFO per visible monitor stack: oldest unpinned card exits first; newer cards wait until its exit finishes, even if their own budgets have already elapsed. Hovering the oldest holds automatic dismissal behind it. Manual close and successful file drops are not FIFO-gated.
+- Event-driven timers: no recurring timer for an idle pin, hovered card, Never setting, or dismissed gallery.
+- Hover exposes pin and close controls. Right-click opens pin/unpin, close, and close-all actions. Windows client-area animation preference is respected.
+- Bounded session-only FIFO preview queue. Each monitor's bottom-right stack fits as many fixed cards as its usable height allows (five on the validated 1080p/100% desktop), oldest at the bottom and newest at the top. Overflow permanently removes the oldest unpinned thumbnail and releases its window/resources, without deleting its PNG. For capacity five, captures 1-6 leave only 2-6, compacted downward. No hidden backlog, wheel browsing, or older/newer paging; removed thumbnails never reappear after another dismissal or capture.
+- Pins remain always on top in the same chronological stack, not a separate column. Pin/unpin does not reorder a card; removing a lower card compacts those above it without losing pin state. Pins reserve stack slots and never auto-expire or get evicted by new captures. If every slot is pinned, new PNGs are still saved but their previews cannot enter the full queue. Pins use the same fixed cover card, not a movable/resizable reference window.
+- Hide all surviving cards and pins before desktop capture; pause their clocks until selection cancellation or PNG publication restores them. Captures do not contain older previews. Capture hiding is temporary, unlike permanent overflow eviction.
 - Timer options: 5 seconds (default), 15 seconds, 30 seconds, 5 minutes, 10 minutes, and Never. A changed interval starts a fresh budget; hidden/hovered/dragged cards pause their remaining budget. Unpin starts a fresh selected interval.
 - Files survive timeout, manual dismissal, close-all, and application shutdown.
 - Native OLE file drag using Shell `IDataObject` / `CF_HDROP` and a non-agile `IDropSource` on the UI STA.
@@ -58,7 +57,7 @@ No screenshot editor, annotation tools, resize/opacity/lock controls, or setting
 
 ### Provisional UX profile
 
-The floating implementation is functional, but exact macOS or CleanShot parity is **not yet validated**. The three-card limit, paging policy, pin-card size, and timer semantics are our approved Windows design choices, not undocumented CleanShot specifications. Current development defaults are:
+The floating implementation is functional, but exact macOS or CleanShot parity is **not yet validated**. The screen-derived stack capacity, permanent FIFO eviction, pin-card size, and timer semantics are our Windows design choices, not undocumented CleanShot specifications. Current development defaults are:
 
 | Property | Provisional value |
 | --- | --- |
@@ -88,8 +87,8 @@ cargo run --release
 2. Press `Alt + Shift + S`.
 3. Drag to select a region, then release to save.
 4. The preview appears in the bottom-right corner without taking keyboard focus.
-5. Drag a card into Explorer or a compatible terminal. Hover for pin/close controls; right-click for other actions. Wheel down for older captures and up for newer captures, or use the context menu.
-6. Pin a card to keep it beyond the timer; Alt+drag moves a pin. Unpin returns it to the newest pending page with a fresh timeout. Closing cards never deletes their PNGs.
+5. Drag a card into Explorer or a compatible terminal. Hover for pin/close controls; right-click for other actions. Overflow permanently evicts the oldest unpinned thumbnail; there is no preview history.
+6. Pin a card to keep it beyond the timer, in its existing stack position. Unpin preserves capture order and starts a fresh timeout. Closing or successfully dragging an unpinned card compacts the stack without changing surviving pins. Closing cards never deletes their PNGs.
 
 Debug or redirected console diagnostics include saved file paths. Use **Auto-close** in the tray to choose a timeout or Never; **Close all screenshots** closes pending cards and pins.
 
@@ -106,7 +105,28 @@ cargo test
 cargo build --release
 ```
 
-Unit tests cover selection direction, clamping, empty regions, crop boundaries, display-rotation transforms, invalid PNG buffers, and a real WIC PNG round trip through a Unicode filename containing spaces. Thumbnail tests cover layout at 100%, 125%, 150%, and 200% scaling, negative monitor origins, extreme aspect ratios, rounded hit testing, hover/drag/hidden-queue timing, pin/unpin lifecycles, Never, interval changes, interrupted dismissal, disabled motion, distinct DPI-scaled controls, queue paging, free pin slots, and persisted settings. Drag tests check actual COM source behavior, STA affinity, unchanged premultiplied card-pixel upload, invalid drag buffers, system thresholds, and native `CF_HDROP` paths with spaces and Unicode.
+Unit tests cover selection direction, clamping, empty regions, crop boundaries, display-rotation transforms, invalid PNG buffers, and a real WIC PNG round trip through a Unicode filename containing spaces. Thumbnail tests cover layout at 100%, 125%, 150%, and 200% scaling, negative monitor origins, extreme aspect ratios, rounded hit testing, hover/drag/capture-hidden timing, pin/unpin lifecycles, Never, interval changes, interrupted dismissal, disabled motion, distinct DPI-scaled controls, permanent queue eviction/no-resurrection, chronological pin placement/compaction, screen-derived capacity, and persisted settings. Drag tests check actual COM source behavior, STA affinity, unchanged premultiplied card-pixel upload, invalid drag buffers, system thresholds, and native `CF_HDROP` paths with spaces and Unicode.
+
+### Focused gallery regression test
+
+```powershell
+cargo test gallery::tests
+cargo test thumbnail::layout::tests::stack_capacity
+cargo build --release
+./scripts/smoke-capture.ps1 -Configuration release -GalleryOnly
+```
+
+This mode runs only native capture/preview, capacity/overflow, in-place pin/unpin, removal compaction, permanent eviction/no-resurrection after close and capture cancellation, timeout, and clean shutdown checks. It uses the tray's controller action to set the timer without depending on notification-area discovery. It moves the real mouse and requires an idle interactive desktop with room for at least four cards; source files/settings are isolated under a test-only `LOCALAPPDATA`. Four focused queue regressions and this E2E mode passed on the available 1080p/100% desktop. Real Explorer/terminal drops and the complete smoke suite were not rerun for this change.
+
+### Focused FIFO timeout regression
+
+```powershell
+cargo test fifo
+cargo build --release
+./scripts/smoke-capture.ps1 -Configuration release -FifoOnly
+```
+
+Runs only three-card FIFO timeout checks, with the oldest hovered beyond five seconds, then verifies bottom-to-top disappearance and skipping a pinned bottom card. Like `-GalleryOnly`, it uses an isolated data directory and moves the actual pointer. Newer elapsed budgets are not reset while waiting; only automatic dismissal is gated, without idle polling. Overflow is permanently evicted and never blocks or returns to the surviving queue.
 
 ### Interactive end-to-end test
 
@@ -150,9 +170,9 @@ To validate the full-screen/layout regressions along with the complete flow:
 
 Layout checks capture the entire monitor corner-to-corner in both directions and verify exact PNG dimensions/pixels and successful preview rendering. Landscape, portrait, square, and tiny regions must render inside an identical fixed card, with preserved visible content colors, a centered cover crop without letterboxing, and clearance above the actual taskbar. Portrait dragging from the card edge additionally validates identical filled drag pixels, aspect ratio, and rejected-drop recovery. The validation desktop reproduced `rcWork` incorrectly covering all 1080 pixels despite a visible 52-pixel bottom taskbar; the corrected preview reserves those 52 pixels plus its normal card margin. Top/left/right taskbars, auto-hide reveal thickness, negative origins, and DPI layouts are unit-tested; physical multi-monitor and mixed-DPI validation remains pending.
 
-The **Gallery** suite captures five pending screenshots plus a pin, validates the three-card dock and older/newer paging, checks cached card colors and stable GDI resources across repeated pages, moves a pin without focus activation, verifies pin exclusion from capture, and checks staged timeout, unpin, Never, native close-all, and the saved timer preference across an actual process restart. The drag suite also verifies that a pinned reference survives an actual Explorer copy. Tests respect the system inactive-wheel setting and use context-menu paging when wheel routing is disabled.
+The **Gallery** suite captures beyond the monitor's capacity, validates bottom-to-top ordering, pins in slots 1 and 3, removal of slot 2, in-place unpin, overflow with pins retained, permanent overflow eviction with no hidden windows or resurrection after close/capture, and staged timeout. Full `-Gallery` mode additionally checks the saved Never preference across an actual process restart. The drag suite also verifies that a pinned reference survives an actual Explorer copy. Overflow checks assert that evicted native windows are destroyed, survivors compact downward, and source PNGs remain.
 
-Logs and visual artifacts (`gallery-four-visible.png`, `gallery-restored-card.png`, `overlay.png`, `thumbnail.png`, `tray-menu.png`, `fullscreen-False.png`, `fullscreen-True.png`, `thumbnail-portrait.png`, `thumbnail-taskbar.png`, `drag-portrait.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
+Logs and visual artifacts (`gallery-capacity.png`, `gallery-newest.png`, `overlay.png`, `thumbnail.png`, `tray-menu.png`, `fullscreen-False.png`, `fullscreen-True.png`, `thumbnail-portrait.png`, `thumbnail-taskbar.png`, `drag-portrait.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
 
 Initial successful release validation:
 
@@ -164,7 +184,7 @@ Floating-thumbnail release validation on the same desktop observed 7-17 ms from 
 
 Drag-and-drop E2E passed on the same desktop with actual Explorer and Windows Terminal + Windows PowerShell, including spaces and Japanese characters in the source directory. Repeated drag operations showed stable GDI handle usage (16 before and after).
 
-The queue/pin/timer milestone passed 46 unit tests, strict Clippy, release build, and the combined `-Layout -Gallery -Tray -DragDrop` E2E suite. Validation included five pending cards plus a pin, repeated native wheel/context paging, unchanged cached colors, successful pinned Explorer copy, Never across a process restart, and stable GDI handles (23 before and after).
+The previous three-card/independent-pin milestone passed 46 unit tests, strict Clippy, release build, and the combined `-Layout -Gallery -Tray -DragDrop` E2E suite. Validation included five pending cards plus a pin, repeated native wheel/context paging, unchanged cached colors, successful pinned Explorer copy, Never across a process restart, and stable GDI handles (23 before and after).
 
 These are observations on the available desktop, not cross-hardware performance guarantees or measured macOS parity. They do not include keyboard dispatch latency before the application receives the hotkey. Compositor animations are native; frame pacing still needs measured visual validation on target hardware.
 
@@ -188,7 +208,7 @@ These are observations on the available desktop, not cross-hardware performance 
 | --- | --- |
 | `src/main.rs` | Hotkeys, hidden controller, capture lifecycle, nested-loop message deferral |
 | `src/tray.rs` | Native notification icon, timer/close-all menus, Explorer recovery, and icon ownership |
-| `src/gallery.rs` | Session queue, per-monitor paging, pin placement, GPU surface visibility, context menu |
+| `src/gallery.rs` | Bounded FIFO queue, permanent per-monitor eviction, chronological stack/pin placement, GPU surface visibility, context menu |
 | `src/settings.rs` | Persisted auto-close interval and atomic preference publication |
 | `src/capture.rs` | DXGI GPU capture, staging readback, rotation, cropping |
 | `src/geometry.rs` | Physical-pixel selection bounds |

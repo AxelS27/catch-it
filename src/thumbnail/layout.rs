@@ -34,6 +34,14 @@ pub enum Control {
 }
 
 impl Layout {
+    pub fn stack_capacity(&self, area: WorkArea) -> usize {
+        (1 + area.height.saturating_sub(self.height) / self.stack_step()) as usize
+    }
+
+    pub fn stack_step(&self) -> u32 {
+        ((self.card_height + 12.0) * self.scale).round().max(1.0) as u32
+    }
+
     pub fn control_at(&self, x: f32, y: f32) -> Option<Control> {
         if self.card_width < 70.0 || self.card_height < 36.0 {
             return None;
@@ -103,6 +111,29 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stack_capacity_fills_available_height_without_clipping_at_any_dpi() -> Result<()> {
+        for dpi in [96, 120, 144, 192] {
+            for height in [60, 1040, 1440, 2160] {
+                let area = WorkArea {
+                    left: -1920,
+                    top: -200,
+                    width: 1920,
+                    height,
+                };
+                let layout = Layout::new(area, dpi, 350, 200)?;
+                let capacity = layout.stack_capacity(area);
+                let top = layout.y - (capacity - 1) as i32 * layout.stack_step() as i32;
+                assert!(capacity >= 1 && top >= area.top);
+                assert!(top - (layout.stack_step() as i32) < area.top);
+                if dpi == 96 && height == 1040 {
+                    assert_eq!(capacity, 5);
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn controls_have_distinct_dpi_scaled_targets_inside_the_card() -> Result<()> {

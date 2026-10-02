@@ -4,8 +4,12 @@ param(
     [switch]$DragDrop,
     [switch]$Tray,
     [switch]$Layout,
-    [switch]$Gallery
+    [switch]$Gallery,
+    [switch]$GalleryOnly,
+    [switch]$FifoOnly
 )
+
+$GalleryOnly = $GalleryOnly -or $FifoOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -132,6 +136,7 @@ public static class CaptureInput {
     }
     public static IntPtr SceneWindow() { return FindWindow(null, "SimpleScreenshot E2E Scene"); }
     public static IntPtr OverlayWindow() { return FindWindow("SimpleScreenshot.Selection", null); }
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
@@ -223,6 +228,10 @@ function Click-PreviewControl([IntPtr]$Window, [switch]$Pin) {
 }
 function Start-Selection([switch]$KeepPreviews) {
     if (-not $KeepPreviews) { Close-AllPreviews }
+    if($GalleryOnly){
+        [void][CaptureInput]::SetWindowPos($script:sceneWindow,[IntPtr](-1),0,0,0,0,0x13)
+        [CaptureInput]::ClickAt(($script:sceneRect.Left+450),($script:sceneRect.Top+350))
+    }
     [void][CaptureInput]::SetForegroundWindow($script:sceneWindow)
     # Keep a software-composited RDP cursor away from sampled capture pixels.
     [void][CaptureInput]::SetCursorPos($script:sceneRect.Left + 450, $script:sceneRect.Top + 350)
@@ -576,7 +585,24 @@ function Select-TrayItem([string]$Name, [switch]$Accessible) {
     Save-GalleryScreenshot 'menu-item-unavailable.png'
     throw "Native tray menu item not found: $Name. See menu-item-unavailable.png."
 }
+function Read-TimerSetting([string]$Path) {
+    # Do not lock out the app's atomic settings replacement while polling.
+    $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    $reader=[IO.StreamReader]::new($stream)
+    try{return $reader.ReadToEnd().Trim()}finally{$reader.Dispose()}
+}
 function Set-AutoClose([string]$Label, [string]$Value) {
+    if($GalleryOnly){
+        # Gallery-only testing uses the tray's controller action, not shell UI discovery.
+        $index=@('5','15','30','300','600','never').IndexOf($Value)
+        [void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(),0x800c,[IntPtr]$index,[IntPtr]::Zero)
+        $settings=Join-Path (Split-Path $output -Parent) 'settings.txt'
+        for($i=0;$i -lt 100;$i++){
+            if((Test-Path $settings) -and (Read-TimerSetting $settings) -eq "auto_close=$Value"){return}
+            Start-Sleep -Milliseconds 25
+        }
+        throw 'Gallery timer action was not applied.'
+    }
     Open-TrayMenu
     $condition=[System.Windows.Automation.AndCondition]::new(
         [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Auto-close'),
@@ -593,7 +619,7 @@ function Set-AutoClose([string]$Label, [string]$Value) {
     Select-TrayItem $Label -Accessible
     $settings=Join-Path (Split-Path $output -Parent) 'settings.txt'
     for($i=0;$i -lt 100;$i++){
-        if((Test-Path $settings) -and (Get-Content -Raw $settings).Trim() -eq "auto_close=$Value"){return}
+        if((Test-Path $settings) -and (Read-TimerSetting $settings) -eq "auto_close=$Value"){return}
         Start-Sleep -Milliseconds 25
     }
     throw "Timer setting $Label was not persisted."
@@ -614,127 +640,182 @@ function Save-GalleryScreenshot([string]$Name) {
     try{$graphics.CopyFromScreen($screen.Left,$screen.Top,0,0,$bitmap.Size);$bitmap.Save((Join-Path $artifacts $Name))}
     finally{$graphics.Dispose();$bitmap.Dispose()}
 }
-function Test-Gallery {
-    $taskbar=New-Object CaptureInput+Rect
-    [void][CaptureInput]::GetWindowRect([CaptureInput]::TaskbarWindow(),[ref]$taskbar)
+function Preview-Rect([IntPtr]$Window) {
+    $rect=New-Object CaptureInput+Rect
+    if(-not [CaptureInput]::GetWindowRect($Window,[ref]$rect)){throw "Missing preview $Window"}
+    return $rect
+}
+function Assert-Stack($Records) {
+    # Records are oldest first, matching bottom-to-top visual order.
+    $previous=$null
+    foreach($record in $Records){
+        if(-not [CaptureInput]::IsWindowVisible($record.Window)){throw 'Expected stack card is hidden.'}
+        $rect=Preview-Rect $record.Window
+        $scale=[CaptureInput]::GetDpiForWindow($record.Window)/96.0
+        # Native windows include overlapping transparent shadow/margin padding.
+        if($previous -and ($rect.Left -ne $previous.Left -or $rect.Bottom-[int][Math]::Round(18*$scale) -gt $previous.Top+[int][Math]::Round(14*$scale))){
+            Save-GalleryScreenshot 'gallery-order-failure.png'
+            throw 'Stack must be one right-aligned column, oldest below newest, without overlap.'
+        }
+        $previous=$rect
+    }
+}
+function Test-Fifo {
     Close-AllPreviews
     Set-AutoClose 'Never' 'never'
-    $pin=New-TestPreview
-    Click-PreviewControl $pin.Window -Pin
-    for($i=0;$i -lt 100 -and -not [CaptureInput]::Pinned($pin.Window);$i++){Start-Sleep -Milliseconds 25}
-    if(-not [CaptureInput]::Pinned($pin.Window)){throw 'Pin control did not create a persistent reference.'}
-    $old=New-Object CaptureInput+Rect
-    [void][CaptureInput]::GetWindowRect($pin.Window,[ref]$old)
-    [void][CaptureInput]::SetForegroundWindow($sceneWindow)
-    $focus=[CaptureInput]::GetForegroundWindow()
-    $x=[int](($old.Left+$old.Right)/2);$y=[int](($old.Top+$old.Bottom)/2)
-    [CaptureInput]::keybd_event(18,0,0,[UIntPtr]::Zero)
-    [CaptureInput]::HoldAt($x,$y)
-    Start-Sleep -Milliseconds 100
-    for($i=1;$i -le 20;$i++){[CaptureInput]::MouseAt(($x-$i*10),($y-$i*8),0);Start-Sleep -Milliseconds 15}
-    [CaptureInput]::DropAt(($x-200),($y-160))
-    [CaptureInput]::keybd_event(18,0,2,[UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 150
-    $moved=New-Object CaptureInput+Rect
-    [void][CaptureInput]::GetWindowRect($pin.Window,[ref]$moved)
-    if($moved.Left -ge $old.Left -or $moved.Top -ge $old.Top -or [CaptureInput]::GetForegroundWindow() -ne $focus){Save-GalleryScreenshot 'pin-move-failure.png';throw "Alt+drag failed: old=$($old.Left),$($old.Top), moved=$($moved.Left),$($moved.Top), focus=$focus/$([CaptureInput]::GetForegroundWindow())."}
-    Write-Host 'PASS: pin control and Alt+drag move persistent reference without stealing focus'
-
-    # Put known blue desktop pixels underneath the pin, then select through it.
-    [void][CaptureInput]::MoveWindow($sceneWindow,($moved.Left-10),($moved.Top-250),600,400,$true)
-    [void][CaptureInput]::GetWindowRect($sceneWindow,[ref]$script:sceneRect)
-    Start-Sleep -Milliseconds 150
-    $beforeWindows=[CaptureInput]::ThumbnailWindows($false)
-    $before=@(Get-Shots)
-    [void](Start-Selection -KeepPreviews)
-    Wait-GalleryCounts 0 1
-    [CaptureInput]::HoldAt(($moved.Left+60),($moved.Top+54))
-    Start-Sleep -Milliseconds 75
-    [CaptureInput]::DropAt(($moved.Left+120),($moved.Top+94))
-    [void](Wait-Overlay $false)
-    $shot=Wait-NewShot $before
-    $script:created+=$shot
-    $bitmap=[Drawing.Bitmap]::new($shot)
-    try{
-        if($bitmap.Width -ne 60 -or $bitmap.Height -ne 40 -or $bitmap.GetPixel(10,10).ToArgb() -ne [Drawing.Color]::Blue.ToArgb()){throw 'Pinned reference leaked into the source PNG.'}
-    }finally{$bitmap.Dispose()}
-    $preview=Wait-NewPreview $beforeWindows
-    Start-Sleep -Milliseconds 220
-    Click-PreviewControl $preview
-    Wait-GalleryCounts 1 1
-    [void][CaptureInput]::MoveWindow($sceneWindow,200,200,600,400,$true)
-    [void][CaptureInput]::GetWindowRect($sceneWindow,[ref]$script:sceneRect)
-    Write-Host 'PASS: pinned reference is hidden during capture, restored afterwards, and excluded from PNG'
-
     $records=@()
-    for($i=1;$i -le 5;$i++){
-        $records+=New-TestPreview -KeepPreviews
-        Wait-GalleryCounts ([Math]::Min(3,$i)+1) ($i+1)
-    }
-    Save-GalleryScreenshot 'gallery-four-visible.png'
-    foreach($window in [CaptureInput]::ThumbnailWindows()){
-        $r=New-Object CaptureInput+Rect
-        [void][CaptureInput]::GetWindowRect($window,[ref]$r)
-        $scale=[CaptureInput]::GetDpiForWindow($window)/96.0
-        $cardBottom=$r.Bottom-[int][Math]::Round(18*$scale)
-        if($cardBottom -gt $taskbar.Top-[int][Math]::Round(18*$scale)){throw 'Stack or pin overlaps taskbar clearance.'}
-    }
-    $gdiBefore=[CaptureInput]::GetGuiResources($app.Handle,0)
-    $latest=$records[4].Window
-    $r=New-Object CaptureInput+Rect
-    [void][CaptureInput]::GetWindowRect($latest,[ref]$r)
-    [CaptureInput]::ClickAt([int](($r.Left+$r.Right)/2),[int](($r.Top+$r.Bottom)/2),8,16)
-    Select-TrayItem 'Older screenshots'
-    Wait-GalleryCounts 3 6
-    if(-not [CaptureInput]::IsWindowVisible($records[0].Window) -or -not [CaptureInput]::IsWindowVisible($records[1].Window) -or [CaptureInput]::IsWindowVisible($records[4].Window)){throw 'Fourth-plus captures are not reachable through queue navigation.'}
-    [void](Assert-Preview $records[1].Window -Artifact 'gallery-restored-card.png' -ExpectedCount 3)
-    for($i=0;$i -lt 5;$i++){
-        $r=New-Object CaptureInput+Rect
-        [void][CaptureInput]::GetWindowRect($records[1].Window,[ref]$r)
-        if([CaptureInput]::InactiveWheelEnabled()){
-            [CaptureInput]::WheelAt([int](($r.Left+$r.Right)/2),[int](($r.Top+$r.Bottom)/2),120)
-        }else{
-            [CaptureInput]::ClickAt([int](($r.Left+$r.Right)/2),[int](($r.Top+$r.Bottom)/2),8,16)
-            Select-TrayItem 'Newer screenshots'
-        }
-        Wait-GalleryCounts 4 6
-        if(-not [CaptureInput]::IsWindowVisible($records[4].Window)){throw 'Navigation did not show newer page.'}
-        [void][CaptureInput]::GetWindowRect($records[4].Window,[ref]$r)
-        if([CaptureInput]::InactiveWheelEnabled()){
-            [CaptureInput]::WheelAt([int](($r.Left+$r.Right)/2),[int](($r.Top+$r.Bottom)/2),-120)
-        }else{
-            [CaptureInput]::ClickAt([int](($r.Left+$r.Right)/2),[int](($r.Top+$r.Bottom)/2),8,16)
-            Select-TrayItem 'Older screenshots'
-        }
-        Wait-GalleryCounts 3 6
-    }
-    if([CaptureInput]::GetGuiResources($app.Handle,0) -gt $gdiBefore+2){throw 'Paging leaked GDI resources.'}
-    Write-Host "PASS: five pending captures plus pin; three-card limit, native paging (inactive wheel enabled=$([CaptureInput]::InactiveWheelEnabled())), cached pixel restoration, stable GDI resources"
-
+    for($i=0;$i -lt 3;$i++){$records+=New-TestPreview -KeepPreviews}
+    Assert-Stack $records
+    $oldest=Preview-Rect $records[0].Window
+    $x=[int](($oldest.Left+$oldest.Right)/2);$y=[int](($oldest.Top+$oldest.Bottom)/2)
+    [CaptureInput]::MouseAt($x,$y,0)
+    Start-Sleep -Milliseconds 100
     Set-AutoClose '5 seconds' '5'
-    [CaptureInput]::MouseAt(($sceneRect.Left+450),($sceneRect.Top+350),0)
-    Wait-GalleryCounts 1 1 15000
-    if(-not [CaptureInput]::Pinned($pin.Window) -or -not (Test-Path $pin.Shot)){
-        Save-GalleryScreenshot 'pin-lifetime-failure.png'
-        throw "Pinned reference lost: hwnd=$($pin.Window), pinned=$([CaptureInput]::Pinned($pin.Window)), visible=$([CaptureInput]::IsWindowVisible($pin.Window)), file=$([bool](Test-Path $pin.Shot))."
+    $hold=[Diagnostics.Stopwatch]::StartNew()
+    while($hold.ElapsedMilliseconds -lt 6000){
+        [CaptureInput]::MouseAt($x,$y,0)
+        if([CaptureInput]::ThumbnailCount() -ne 3){
+            Save-GalleryScreenshot 'fifo-order-failure.png'
+            throw 'FIFO violation: newer screenshot expired while the oldest was paused on hover.'
+        }
+        Start-Sleep -Milliseconds 25
     }
-    foreach($record in $records){if(-not (Test-Path $record.Shot)){throw 'Auto-close deleted a screenshot file.'}}
-    Click-PreviewControl $pin.Window -Pin
-    Wait-GalleryCounts 0 0 7000
-    Write-Host 'PASS: configurable timer expires visible queue in stages, keeps pins/files, and unpin receives a fresh interval'
-
+    Write-Host 'PASS: hovered queue head prevents newer screenshots from disappearing first'
+    [CaptureInput]::MouseAt(($sceneRect.Left+450),($sceneRect.Top+350),0)
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    $gone=@($false,$false,$false)
+    $order=@()
+    while($clock.ElapsedMilliseconds -lt 12000){
+        for($i=0;$i -lt 3;$i++){
+            if(-not $gone[$i] -and -not [CaptureInput]::IsWindowVisible($records[$i].Window)){
+                for($older=0;$older -lt $i;$older++){
+                    if([CaptureInput]::IsWindowVisible($records[$older].Window)){
+                        Save-GalleryScreenshot 'fifo-order-failure.png'
+                        throw "FIFO violation: screenshot $($i+1) disappeared before older screenshot $($older+1)."
+                    }
+                }
+                $gone[$i]=$true
+                $order+=$i+1
+            }
+        }
+        if($order.Count -eq 3){break}
+        Start-Sleep -Milliseconds 5
+    }
+    if(($order -join ',') -ne '1,2,3'){throw "FIFO dismissal order: $order"}
+    foreach($record in $records){if(-not (Test-Path $record.Shot)){throw 'FIFO timeout deleted a PNG.'}}
+    Write-Host 'PASS: actual auto-dismiss order is FIFO: 1,2,3, oldest bottom first'
     Set-AutoClose 'Never' 'never'
-    $record=New-TestPreview
-    [void][CaptureInput]::SetForegroundWindow($sceneWindow)
-    [CaptureInput]::MouseAt(($sceneRect.Left+450),($sceneRect.Top+350),0)
-    Start-Sleep -Seconds 6
-    Wait-GalleryCounts 1 1
-    Open-TrayMenu
-    Select-TrayItem 'Close all screenshots (1)' -Accessible
-    Wait-GalleryCounts 0 0
-    if(-not (Test-Path $record.Shot)){throw 'Close all deleted source PNG.'}
-    Write-Host 'PASS: Never disables timeout; accessible tray Close all closes previews without deleting files'
+    $records=@()
+    for($i=0;$i -lt 3;$i++){$records+=New-TestPreview -KeepPreviews}
+    Click-PreviewControl $records[0].Window -Pin
+    if(-not [CaptureInput]::Pinned($records[0].Window)){throw 'FIFO pin fixture did not pin.'}
     Set-AutoClose '5 seconds' '5'
+    [CaptureInput]::MouseAt(($sceneRect.Left+450),($sceneRect.Top+350),0)
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    while($clock.ElapsedMilliseconds -lt 8000){
+        if(-not [CaptureInput]::IsWindowVisible($records[2].Window) -and [CaptureInput]::IsWindowVisible($records[1].Window)){throw 'Pinned bottom caused reverse timeout order.'}
+        if(-not [CaptureInput]::IsWindowVisible($records[0].Window)){throw 'FIFO timeout removed a pin.'}
+        if([CaptureInput]::PendingCount() -eq 1){break}
+        Start-Sleep -Milliseconds 5
+    }
+    Wait-GalleryCounts 1 1
+    Write-Host 'PASS: FIFO skips pinned bottom; screenshots 2 then 3 expire and pin 1 survives'
+    Close-AllPreviews
+    Set-AutoClose 'Never' 'never'
+}
+function Test-Gallery {
+    Close-AllPreviews
+    Set-AutoClose 'Never' 'never'
+    $records=@()
+    for($i=0;$i -lt 4;$i++){
+        $records+=New-TestPreview -KeepPreviews
+        Wait-GalleryCounts ($i+1) ($i+1)
+    }
+    Assert-Stack $records
+    Write-Host 'PASS: fourth screenshot remains visible; oldest bottom, newest top'
+    $bottom=Preview-Rect $records[0].Window
+    $second=Preview-Rect $records[1].Window
+    $step=$bottom.Top-$second.Top
+    $screen=[System.Windows.Forms.Screen]::FromHandle($records[0].Window)
+    $capacity=1+[int][Math]::Floor(($bottom.Top-$screen.WorkingArea.Top)/$step)
+    if($capacity -lt 4){throw 'Gallery fixture needs a desktop fitting at least four cards.'}
+    # Plain FIFO overflow: 1..capacity+1 becomes 2..capacity+1 permanently.
+    while($records.Count -le $capacity){$records+=New-TestPreview -KeepPreviews}
+    Wait-GalleryCounts $capacity $capacity
+    if([CaptureInput]::IsWindow($records[0].Window)){throw 'Evicted screenshot 1 still has a hidden window/backlog entry.'}
+    $newBottom=Preview-Rect $records[1].Window
+    if($newBottom.Top -ne $bottom.Top){throw 'Screenshot 2 did not drop into the vacated bottom slot.'}
+    Assert-Stack @($records | Select-Object -Skip 1)
+    Click-PreviewControl $records[1].Window
+    Wait-GalleryCounts ($capacity-1) ($capacity-1)
+    $third=Preview-Rect $records[2].Window
+    if($third.Top -ne $bottom.Top -or [CaptureInput]::IsWindow($records[0].Window)){throw 'Removal resurrected screenshot 1 or failed to compact screenshot 3.'}
+    foreach($record in $records){if(-not (Test-Path $record.Shot)){throw 'Overflow removed a source PNG.'}}
+    Write-Host 'PASS: 1 is permanently evicted; 2 drops down; closing 2 drops 3 down without resurrecting 1'
+    Close-AllPreviews
+    $records=@()
+    for($i=0;$i -lt 4;$i++){$records+=New-TestPreview -KeepPreviews}
+    $bottom=Preview-Rect $records[0].Window
+    $second=Preview-Rect $records[1].Window
+    $focus=[CaptureInput]::GetForegroundWindow()
+    foreach($index in @(0,2)){
+        $before=Preview-Rect $records[$index].Window
+        Click-PreviewControl $records[$index].Window -Pin
+        $after=Preview-Rect $records[$index].Window
+        if(-not [CaptureInput]::Pinned($records[$index].Window) -or $before.Left -ne $after.Left -or $before.Top -ne $after.Top){throw 'Pin moved the card from its stack slot.'}
+    }
+    Click-PreviewControl $records[1].Window
+    Wait-GalleryCounts 3 3
+    $shifted=Preview-Rect $records[2].Window
+    $stillBottom=Preview-Rect $records[0].Window
+    if($shifted.Top -ne $second.Top -or $stillBottom.Top -ne $bottom.Top -or -not [CaptureInput]::Pinned($records[2].Window)){throw 'Closing card 2 must compact pinned card 3 into slot 2 without unpinning.'}
+    Assert-Stack @($records[0],$records[2],$records[3])
+    Click-PreviewControl $records[2].Window -Pin
+    $unpinned=Preview-Rect $records[2].Window
+    if([CaptureInput]::Pinned($records[2].Window) -or $unpinned.Top -ne $shifted.Top){throw 'Unpin reordered the screenshot.'}
+    Click-PreviewControl $records[2].Window -Pin
+    if([CaptureInput]::GetForegroundWindow() -ne $focus){throw 'Pin/close controls stole keyboard focus.'}
+    Write-Host 'PASS: pin/unpin preserve position and focus; removal compacts pins without losing state'
+
+    # Create enough cards to overflow the actual monitor capacity by two.
+    while($records.Count-1 -lt $capacity+2){
+        $records+=New-TestPreview -KeepPreviews
+        Wait-GalleryCounts ([Math]::Min($capacity,$records.Count-1)) ([Math]::Min($capacity,$records.Count-1))
+    }
+    $latest=@($records | Select-Object -Last ($capacity-2))
+    Assert-Stack @(@($records[0],$records[2])+$latest)
+    if([CaptureInput]::IsWindow($records[3].Window)){throw 'Overflow retained the oldest unpinned card instead of destroying its window.'}
+    foreach($record in $records){if(-not (Test-Path $record.Shot)){throw 'Queue eviction removed the source PNG.'}}
+    Save-GalleryScreenshot 'gallery-capacity.png'
+    [void](Assert-Preview $latest[-1].Window -Artifact 'gallery-newest.png' -ExpectedCount $capacity)
+    Write-Host "PASS: screen-derived capacity=$capacity; overflow keeps pins and newest captures, files survive"
+
+    # Closing a survivor and cancelling a subsequent capture must not resurrect overflow.
+    Click-PreviewControl $latest[0].Window
+    Wait-GalleryCounts ($capacity-1) ($capacity-1)
+    Assert-Stack @(@($records[0],$records[2])+@($latest | Select-Object -Skip 1))
+    [void](Start-Selection -KeepPreviews)
+    Press-Key 0x1B
+    [void](Wait-Overlay $false)
+    Wait-GalleryCounts ($capacity-1) ($capacity-1)
+    if([CaptureInput]::IsWindow($records[3].Window)){throw 'Capture restoration resurrected an evicted preview.'}
+    $new=New-TestPreview -KeepPreviews
+    Wait-GalleryCounts $capacity $capacity
+    Assert-Stack @(@($records[0],$records[2])+@($latest | Select-Object -Skip 1)+@($new))
+    Write-Host 'PASS: permanent eviction survives close, capture cancellation and new capture; no hidden backlog'
+
+    Set-AutoClose '5 seconds' '5'
+    [CaptureInput]::MouseAt(($sceneRect.Left+450),($sceneRect.Top+350),0)
+    Wait-GalleryCounts 2 2 15000
+    Assert-Stack @($records[0],$records[2])
+    foreach($index in @(0,2)){if(-not [CaptureInput]::Pinned($records[$index].Window)){throw 'Timeout removed a pin.'}}
+    Click-PreviewControl $records[2].Window -Pin
+    [CaptureInput]::MouseAt(($sceneRect.Left+450),($sceneRect.Top+350),0)
+    Wait-GalleryCounts 1 1 7000
+    if(-not (Test-Path $records[2].Shot)){throw 'Unpin timeout removed the PNG.'}
+    Close-AllPreviews
+    Set-AutoClose 'Never' 'never'
+    Write-Host 'PASS: timeout drains surviving queue, pins remain, unpin gets a fresh lifetime'
 }
 function Test-Tray {
     Add-Type -AssemblyName UIAutomationClient
@@ -999,7 +1080,13 @@ try {
     Write-Host 'PASS: real app startup cleans expired files, preserves recent/unrelated/locked files'
     Start-Sleep -Milliseconds 350
     if ($Layout) { Test-Layout }
-    if ($Gallery) { Test-Gallery }
+    if ($FifoOnly) { Test-Fifo }
+    elseif ($Gallery -or $GalleryOnly) { Test-Gallery }
+    if ($GalleryOnly) {
+        [void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(), 0x8008, [IntPtr]::Zero, [IntPtr]::Zero)
+        if (-not $app.WaitForExit(5000) -or $app.ExitCode -ne 0) { throw 'Gallery-only shutdown failed.' }
+        return
+    }
     if ($Tray) { Test-Tray }
 
     foreach ($reverse in @($false, $true)) {

@@ -41,7 +41,6 @@ pub const DISMISS: u32 = WM_APP + 4;
 pub const BEGIN_DRAG: u32 = WM_APP + 5;
 pub const PIN: u32 = WM_APP + 9;
 pub const CONTEXT_MENU: u32 = WM_APP + 10;
-pub const NAVIGATE: u32 = WM_APP + 11;
 const CLASS_NAME: windows::core::PCWSTR = w!("SimpleScreenshot.Thumbnail");
 
 /// Published only after the complete PNG has been saved by the worker.
@@ -67,7 +66,6 @@ struct WindowState {
     drag_height: i32,
     pinned: bool,
     pressed_control: Option<Control>,
-    moving: Option<(Point, Point)>,
     area: WorkArea,
 }
 
@@ -85,7 +83,6 @@ pub struct Thumbnail {
     timing: Timing,
     cached_pixels: Vec<u8>,
     visible: bool,
-    pin_slot: Option<usize>,
 }
 
 impl Thumbnail {
@@ -128,7 +125,6 @@ impl Thumbnail {
             drag_height: 4,
             pinned: false,
             pressed_control: None,
-            moving: None,
             area,
         });
         unsafe {
@@ -162,7 +158,6 @@ impl Thumbnail {
                 timing,
                 cached_pixels: Vec::new(),
                 visible: false,
-                pin_slot: None,
             };
             let dpi = GetDpiForWindow(hwnd);
             thumbnail.state.drag_width = GetSystemMetricsForDpi(SM_CXDRAG, dpi).max(1);
@@ -203,19 +198,22 @@ impl Thumbnail {
     pub fn pinned(&self) -> bool {
         self.state.pinned
     }
-    pub fn pin_slot(&self) -> Option<usize> {
-        self.pin_slot
-    }
     pub fn visible(&self) -> bool {
         self.visible
     }
     pub fn capacity(&self) -> usize {
-        (1 + self.state.area.height.saturating_sub(self.base.height) / self.step()).min(3) as usize
+        self.base.stack_capacity(self.state.area)
     }
     fn step(&self) -> u32 {
-        ((self.base.card_height + 12.0) * self.base.scale)
-            .round()
-            .max(1.0) as u32
+        self.base.stack_step()
+    }
+
+    pub fn set_auto_dismiss_blocked(&mut self, blocked: bool) -> Result<()> {
+        let action = self
+            .lifecycle
+            .set_auto_dismiss_blocked(Instant::now(), blocked);
+        self.apply(action)?;
+        Ok(())
     }
 
     pub fn set_paused(&mut self, paused: bool) -> Result<()> {
@@ -240,28 +238,14 @@ impl Thumbnail {
             self.state.pinned = pinned;
         }
         let title = if self.state.pinned {
-            w!("Pinned screenshot - Alt+drag to move")
+            w!("Pinned screenshot")
         } else {
             w!("Screenshot preview")
         };
         unsafe {
             SetWindowTextW(self.hwnd, title)?;
         }
-        if !self.state.pinned {
-            self.pin_slot = None;
-        }
         self.update_controls()
-    }
-
-    pub fn place_pin(&mut self, ordinal: usize) -> Result<()> {
-        let capacity = self.capacity().max(1);
-        let column = ordinal / capacity + 1;
-        let x = self.base.x
-            - (column as i32 * (self.base.width as i32 + (12.0 * self.base.scale) as i32));
-        let y = self.base.y - ((ordinal % capacity) as i32 * self.step() as i32);
-        self.position(x, y)?;
-        self.pin_slot = Some(ordinal);
-        Ok(())
     }
 
     fn position(&mut self, x: i32, y: i32) -> Result<()> {
@@ -348,7 +332,7 @@ impl Thumbnail {
         self.update_controls()
     }
 
-    pub fn hide(&mut self, release_surface: bool) -> Result<()> {
+    pub fn hide(&mut self) -> Result<()> {
         self.set_paused(true)?;
         self.state.hovered = false;
         if self.visible {
@@ -356,9 +340,6 @@ impl Thumbnail {
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);
             }
-        }
-        if release_surface {
-            self.surface.take();
         }
         Ok(())
     }
@@ -580,24 +561,7 @@ unsafe extern "system" fn window_proc(
                         return LRESULT(0);
                     }
                     state.pressed_control = state.layout.control_at(point.x as f32, point.y as f32);
-                    if state.pressed_control.is_none()
-                        && state.pinned
-                        && GetAsyncKeyState(VK_MENU.0 as i32) < 0
-                    {
-                        let mut cursor = POINT::default();
-                        if GetCursorPos(&mut cursor).is_ok() {
-                            state.moving = Some((
-                                Point {
-                                    x: cursor.x,
-                                    y: cursor.y,
-                                },
-                                Point {
-                                    x: state.layout.x,
-                                    y: state.layout.y,
-                                },
-                            ));
-                        }
-                    } else if state.pressed_control.is_none() {
+                    if state.pressed_control.is_none() {
                         state.press = Some(point);
                         state.drag_anchor = point;
                     }
@@ -634,7 +598,6 @@ unsafe extern "system" fn window_proc(
                         );
                     }
                     state.press = None;
-                    state.moving = None;
                 }
                 if GetCapture() == hwnd {
                     let _ = ReleaseCapture();
@@ -644,38 +607,11 @@ unsafe extern "system" fn window_proc(
             WM_CAPTURECHANGED => {
                 let state = &mut *ptr;
                 state.press = None;
-                state.moving = None;
                 state.pressed_control = None;
                 LRESULT(0)
             }
             WM_MOUSEMOVE | WM_MOUSELEAVE => {
                 let state = &mut *ptr;
-                if message == WM_MOUSEMOVE
-                    && let Some((start, origin)) = state.moving
-                {
-                    let mut cursor = POINT::default();
-                    if GetCursorPos(&mut cursor).is_ok() {
-                        let area = state.area;
-                        state.layout.x = (origin.x + cursor.x - start.x).clamp(
-                            area.left,
-                            area.left + area.width as i32 - state.layout.width as i32,
-                        );
-                        state.layout.y = (origin.y + cursor.y - start.y).clamp(
-                            area.top,
-                            area.top + area.height as i32 - state.layout.height as i32,
-                        );
-                        let _ = SetWindowPos(
-                            hwnd,
-                            Some(HWND_TOPMOST),
-                            state.layout.x,
-                            state.layout.y,
-                            0,
-                            0,
-                            SWP_NOACTIVATE | SWP_NOSIZE,
-                        );
-                    }
-                    return LRESULT(0);
-                }
                 if message == WM_MOUSEMOVE
                     && wparam.0 & 1 != 0
                     && state.press.is_some_and(|start| {
@@ -716,19 +652,6 @@ unsafe extern "system" fn window_proc(
                 }
                 if message == WM_MOUSEMOVE {
                     track_leave(hwnd);
-                }
-                LRESULT(0)
-            }
-            WM_MOUSEWHEEL => {
-                let state = &*ptr;
-                let delta = ((wparam.0 >> 16) as u16 as i16) as i32;
-                if delta != 0 {
-                    let _ = PostMessageW(
-                        Some(state.controller),
-                        NAVIGATE,
-                        WPARAM(hwnd.0 as usize),
-                        LPARAM(if delta < 0 { 1 } else { -1 }),
-                    );
                 }
                 LRESULT(0)
             }
