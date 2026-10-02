@@ -21,7 +21,7 @@ use windows::{
     Win32::{
         Foundation::*,
         Graphics::{Dwm::*, Gdi::*},
-        System::{LibraryLoader::GetModuleHandleW, Registry::*},
+        System::LibraryLoader::GetModuleHandleW,
         UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
     },
     core::{BOOL, PCWSTR, w},
@@ -50,6 +50,8 @@ struct WindowState {
     hover: Option<Control>,
     focus: Option<Control>,
     pressed: Option<Control>,
+    palette_open: bool,
+    selected_color: usize,
     pan_start: Option<((f32, f32), (f32, f32))>,
     drag_start: Option<(f32, f32)>,
     error: Option<String>,
@@ -99,7 +101,9 @@ pub struct Editor {
 impl Editor {
     pub fn create(controller: HWND, source: HWND, path: &Path) -> Result<Self> {
         let protection = storage::protect_png(path)?;
-        let dark = dark_theme();
+        // The supplied markup.mp4 is a light-appearance reference. Pin the
+        // editor to that appearance rather than inheriting Windows dark mode.
+        let dark = false;
         let mut state = Box::new(WindowState {
             controller,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
@@ -112,6 +116,8 @@ impl Editor {
             hover: None,
             focus: None,
             pressed: None,
+            palette_open: false,
+            selected_color: 4,
             pan_start: None,
             drag_start: None,
             error: None,
@@ -133,11 +139,17 @@ impl Editor {
             );
             let dpi = GetDpiForWindow(source).max(96);
             let scale = dpi as f32 / 96.0;
-            let width = (960.0 * scale).round() as i32;
-            let height = (640.0 * scale).round() as i32;
             let work = info.rcWork;
-            let width = width.min(work.right - work.left);
-            let height = height.min(work.bottom - work.top);
+            // The reference editor occupies most of its 1700 x 1200 frame,
+            // rather than opening as the previous small viewer window.
+            let work_width = work.right - work.left;
+            let work_height = work.bottom - work.top;
+            let width = ((work_width as f32 * 0.84).round() as i32)
+                .max((960.0 * scale).round() as i32)
+                .min(work_width);
+            let height = ((work_height as f32 * 0.86).round() as i32)
+                .max((640.0 * scale).round() as i32)
+                .min(work_height);
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 CLASS,
@@ -241,6 +253,7 @@ impl Editor {
             return Ok(false);
         }
         self.state.cancel_gesture();
+        self.state.palette_open = false;
         unsafe {
             if GetCapture() == self.hwnd {
                 let _ = ReleaseCapture();
@@ -431,7 +444,11 @@ impl Editor {
                 .controls
                 .iter()
                 .map(|(c, _)| {
-                    let text = if c.enabled() || *c == Control::Upload {
+                    let text = if c.enabled()
+                        || matches!(
+                            c,
+                            Control::Upload | Control::Present | Control::Share | Control::Pin
+                        ) {
                         c.label().to_string()
                     } else {
                         format!("{} - not implemented yet", c.label())
@@ -485,22 +502,6 @@ impl Drop for Editor {
             let _ = DestroyWindow(self.hwnd);
         }
     }
-}
-fn dark_theme() -> bool {
-    let mut value = 1_u32;
-    let mut size = 4;
-    unsafe {
-        let _ = RegGetValueW(
-            HKEY_CURRENT_USER,
-            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
-            w!("AppsUseLightTheme"),
-            RRF_RT_REG_DWORD,
-            None,
-            Some((&mut value as *mut u32).cast()),
-            Some(&mut size),
-        );
-    }
-    value == 0
 }
 fn apply_theme(hwnd: HWND, dark: bool) {
     unsafe {

@@ -918,6 +918,7 @@ function Click-EditorAction([IntPtr]$Window,[string]$Action) {
         'Copy' {$x=$r.Right-68*$s;$y=$r.Bottom-24*$s}
         'Zoom' {$x=$r.Left+56*$s;$y=$r.Bottom-24*$s}
         'Rectangle' {$x=$r.Left+164*$s;$y=$r.Top+24*$s}
+        'Color' {$x=$r.Left+517*$s;$y=$r.Top+24*$s}
         default {throw 'Unknown editor action'}
     }
     [CaptureInput]::ClickAt([int]$x,[int]$y)
@@ -958,6 +959,17 @@ function Assert-EditorScreenColor([int]$X,[int]$Y,[string]$Color) {
     }
     Save-GalleryScreenshot 'editor-pan-failure.png';throw 'Editor pan did not transform image pixels or cancel back to the previous view.'
 }
+function Assert-EditorPalettePixel([int]$X,[int]$Y,[int]$Argb) {
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    while($clock.ElapsedMilliseconds -lt 2000){
+        $bitmap=[Drawing.Bitmap]::new(1,1);$g=[Drawing.Graphics]::FromImage($bitmap)
+        try{$g.CopyFromScreen($X,$Y,0,0,$bitmap.Size);if($bitmap.GetPixel(0,0).ToArgb() -eq $Argb){return}}
+        finally{$g.Dispose();$bitmap.Dispose()}
+        Start-Sleep -Milliseconds 25
+    }
+    Save-GalleryScreenshot 'editor-palette-failure.png'
+    throw "Palette pixel $X,$Y did not match color $Argb"
+}
 function Test-Editor {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run EditorOnly with pwsh -Sta.'}
     Add-Type -AssemblyName UIAutomationClient
@@ -977,6 +989,27 @@ function Test-Editor {
     if([CaptureInput]::EditorCount() -ne 1 -or [CaptureInput]::DragWindow() -ne [IntPtr]::Zero){throw 'Disabled drawing tool launched an unrelated action.'}
     Write-Host 'PASS: real Annotate opens one activated native editor, original full-resolution pixels, disabled drawing tools are inert'
 
+    $bounds=[CaptureInput]::ClientBounds($editor);$scale=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    Click-EditorAction $editor 'Color'
+    Assert-EditorPalettePixel ([int]($bounds.Left+517*$scale)) ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::FromArgb(249,45,58).ToArgb())
+    Save-GalleryScreenshot 'editor-palette.png'
+    [CaptureInput]::ClickAt([int]($bounds.Left+517*$scale),[int]($bounds.Top+102*$scale))
+    Assert-EditorPalettePixel ([int]($bounds.Left+513*$scale)) ([int]($bounds.Top+24*$scale)) ([Drawing.Color]::FromArgb(249,45,58).ToArgb())
+    Click-EditorAction $editor 'Color';Press-Key 0x28;Press-Key 0x0d
+    Assert-EditorPalettePixel ([int]($bounds.Left+513*$scale)) ([int]($bounds.Top+24*$scale)) ([Drawing.Color]::FromArgb(254,129,1).ToArgb())
+    Click-EditorAction $editor 'Color'
+    [CaptureInput]::ClickAt([int]($bounds.Left+517*$scale),[int]($bounds.Top+198*$scale))
+    Click-EditorAction $editor 'Color';Press-Key 27
+    Assert-EditorPalettePixel ([int]($bounds.Left+517*$scale)) ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::White.ToArgb())
+    Click-EditorAction $editor 'Color'
+    [CaptureInput]::ClickAt([int]($bounds.Left+400*$scale),[int]($bounds.Top+400*$scale))
+    Assert-EditorPalettePixel ([int]($bounds.Left+517*$scale)) ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::White.ToArgb())
+    Write-Host 'PASS: native color menu matches video swatch order; pointer/keyboard selection and Escape/outside dismissal work'
+
+    # The initial window follows the reference's large screen-relative footprint.
+    # Constrain the pan fixture viewport so its 400% image genuinely overflows.
+    [void][CaptureInput]::MoveWindow($editor,480,180,960,640,$true)
+    Assert-EditorPixels $editor $first.Shot
     Click-EditorAction $editor 'Zoom'
     for($i=0;$i -lt 100 -and [CaptureInput]::MenuWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
     if([CaptureInput]::MenuWindow() -eq [IntPtr]::Zero){throw 'Zoom menu did not open.'}

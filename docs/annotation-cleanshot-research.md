@@ -37,7 +37,7 @@ M is a 1700 x 1200, 27.6-second marketing video. B and I contain different gener
 
 The fetched changelog currently lists 5.0.1 and describes 5.0 primarily as a video Studio update. It also records a new macOS Tahoe interface in 4.8.5. Consequently, neither an older video nor a screenshot can prove the exact appearance of the current installed editor.
 
-**Working visual baseline:** use M for the main editor and P for the expanded color picker. Use B and I as behavioral references for their specialized modes, retaining M's chrome. Final exact-parity sign-off requires a versioned installed Mac reference. There was no interactive Mac/CleanShot instance available during this research.
+**Working visual baseline:** the user-provided `D:\Downloads\markup.mp4` matches M byte-for-byte (SHA-256 `DACC244F4BA3682777A27CCA4D801CC4B295EEEFEE363E0C22F7DBEE1CC0F377`). Use M for the main editor and P for the expanded color picker. Use B and I as behavioral references for their specialized modes, retaining M's chrome. Final exact-parity sign-off requires a versioned installed Mac reference. There was no interactive Mac/CleanShot instance available during this research.
 
 The official 4.8 update video is linked at https://www.youtube.com/watch?v=o5ypDElAMto. Fetching its video content was unavailable in this environment; it was not visually reviewed.
 
@@ -216,11 +216,11 @@ Do not build a generic plugin system or speculative editor framework. Use explic
 
 ## 6. Delivery sequence
 
-This sequence avoids presenting disconnected demo tools as a complete editor. Slice 1 is delivered as a foundation; slices 2-6 remain pending. Exact reference parity and real mixed-DPI/light-theme visual checks remain pending even for the shell.
+This sequence avoids presenting disconnected demo tools as a complete editor. Slice 1 is delivered as a foundation; slices 2-6 remain pending. Exact reference parity and real mixed-DPI visual checks remain pending even for the shell.
 
 | Slice | Working end-to-end outcome |
 | --- | --- |
-| 1. Editor shell (implemented) | Real Annotate button -> activated native editor -> original image decoded off-thread; reference-derived toolbar/footer, Windows light/dark preference, Fit/percentage and pointer-anchored zoom, pan/Escape rollback, source reservation/protection, close/capture recovery, original-image Copy/Save/Drag Me |
+| 1. Editor shell (implemented) | Real Annotate button -> activated native editor -> original image decoded off-thread; video-referenced light toolbar/footer, Fit/percentage and pointer-anchored zoom, pan/Escape rollback, source reservation/protection, close/capture recovery, original-image Copy/Save/Drag Me |
 | 2. Core annotation | Select, rectangle/fill/ellipse/line, four arrow styles, smoothing pencil; editable handles; undo/redo; Copy/Save/Drag Me from a shared renderer |
 | 3. Text and steps | In-place Unicode/IME text, seven equivalent text styles, sequential counters, color picker/favorites/eyedropper, transactional property changes |
 | 4. Privacy and emphasis | Smooth/secure redaction choices, randomized pixelation, spotlight, real text-aware highlighter and modifier override |
@@ -287,4 +287,11 @@ Merged baseline: `570dc0e`. Annotation research branch: `feat/annotation-cleansh
 - A capture/minimization regression was reproduced end to end and traced with LLDB to `MacGenieAnimThreadClassic` in the installed Windhawk minimize-animation hook. Capture hiding/restoring now uses visibility-only `SetWindowPos`, retaining minimized state without invoking minimize again. User Windhawk settings were not changed.
 - Source sessions/actions use monotonic IDs so an old decode or deferred action cannot target a recycled HWND. Original PNGs are unchanged; output is not based on the viewport or preview crop.
 - Explicit Windows choices: retain a visible, paused source card and reserve its stack slot; up to four editors; 256 MiB decoded-image bound; standard Windows caption/buttons/Segoe UI; output keeps the editor open. These are not claims about undocumented CleanShot preferences.
-- Local visual evidence: `.pi/capture-smoke/editor-shell.png`. Exact Mac comparison, real light-theme/mixed-DPI validation, screen-reader automation for the custom chrome, and the remaining drawing/editing tools are not signed off.
+- Local visual evidence: `.pi/capture-smoke/editor-shell.png`. Exact Mac comparison, real mixed-DPI validation, screen-reader automation for the custom chrome, and the remaining drawing/editing tools are not signed off.
+
+### User-supplied video visual pass
+
+- The exact supplied M video is light appearance, so the editor now deliberately uses light chrome regardless of the Windows theme; a dark rendering would not match this reference. Its white canvas, lavender-to-neutral header/footer, white utility/property pills, muted grouped tool strip, blue active/select state, green demonstration swatch, and five circular footer targets follow frame 0. Frame 0 is an **arrow-active** example; the editor keeps **Move** active because arrows are not implemented and must not pretend otherwise.
+- The current Windows caption remains above the toolbar, not inline macOS traffic lights. Background blur/material transparency, authentic text and vector glyph metrics, expanded custom picker, active arrow mode, and image/example content have not reached pixel parity. The extra footer buttons are visual disabled placeholders, not working Share/Pin/Presentation features. The initial editor now scales to 84% of the work-area width and 86% of its height, bounded by monitor size and a minimum viewer size. While active it floats above topmost source previews, and drops back when deactivated so it does not cover other apps.
+- The supplied M frame at 1.2 seconds confirms a vertical preset popup below the color pill: black, red, orange, yellow, green, turquoise, blue, purple, pink, white, and a custom-picker entry. Their center RGB values were sampled from the encoded video; the 10 presets are now selectable by pointer and Up/Down/Enter. The rainbow entry is a nonfunctional visual placeholder until the expanded picker is implemented. Swatch state does **not** change image pixels or exports. Keyboard/menu/selection behavior is our interim UI, not verified CleanShot behavior.
+- Desktop `-EditorOnly -DragDrop` and `-ActionsOnly` passed after the initial styling change. The enlarged-window and palette pass re-ran `-EditorOnly -DragDrop` with sampled real desktop menu pixels and mouse/keyboard selection. 63 unit tests, clippy, and release build passed. Side-by-side source frame: `.pi/reference/annotation/current-frame-0.png`; color menu reference: `.pi/reference/annotation/user-palette-12.png`; captured editor: `.pi/capture-smoke/editor-shell.png` and `.pi/capture-smoke/editor-palette.png`.

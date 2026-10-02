@@ -35,6 +35,9 @@ pub enum Control {
     Save,
     Zoom,
     Drag,
+    Present,
+    Share,
+    Pin,
     Copy,
     Upload,
 }
@@ -42,7 +45,7 @@ impl Control {
     pub fn enabled(self) -> bool {
         matches!(
             self,
-            Self::Move | Self::Save | Self::Zoom | Self::Drag | Self::Copy
+            Self::Move | Self::Color | Self::Save | Self::Zoom | Self::Drag | Self::Copy
         )
     }
     pub fn label(self) -> &'static str {
@@ -62,12 +65,15 @@ impl Control {
             Self::Counter => "Counter",
             Self::Pencil => "Pencil",
             Self::Highlighter => "Smart highlighter",
-            Self::Color => "Color",
+            Self::Color => "Color presets (custom picker not available yet)",
             Self::Stroke => "Stroke size",
             Self::Style => "Tool style",
             Self::Save => "Save as... (Ctrl+S)",
             Self::Zoom => "Zoom",
             Self::Drag => "Drag Me",
+            Self::Present => "Presentation - not available yet",
+            Self::Share => "Share - not available yet",
+            Self::Pin => "Pin - not available yet",
             Self::Copy => "Copy image (Ctrl+Shift+C)",
             Self::Upload => "Cloud upload (not available)",
         }
@@ -77,7 +83,11 @@ impl Control {
 pub const TOP: f32 = 48.0;
 pub const BOTTOM: f32 = 48.0;
 pub const MIN_WIDTH: f32 = 760.0;
-pub const MIN_HEIGHT: f32 = 300.0;
+pub const MIN_HEIGHT: f32 = 460.0;
+pub const PRESET_COLORS: [u32; 10] = [
+    0x000000, 0xf92d3a, 0xfe8101, 0xffde00, 0x37d147, 0x28c8bb, 0x006dfd, 0x7f47ff, 0xfd265f,
+    0xffffff,
+];
 
 pub struct Layout {
     pub width: f32,
@@ -95,10 +105,10 @@ impl Layout {
             controls.push((
                 control,
                 Rect {
-                    x: 12.0 + i as f32 * 34.0,
-                    y: 10.0,
-                    w: 28.0,
-                    h: 28.0,
+                    x: 12.0 + i as f32 * 38.0,
+                    y: 8.0,
+                    w: 32.0,
+                    h: 32.0,
                 },
             ));
         }
@@ -122,10 +132,10 @@ impl Layout {
             controls.push((
                 control,
                 Rect {
-                    x: 122.0 + i as f32 * 29.0,
-                    y: 10.0,
-                    w: 27.0,
-                    h: 28.0,
+                    x: 136.0 + i as f32 * 29.0,
+                    y: 8.0,
+                    w: 28.0,
+                    h: 32.0,
                 },
             ));
         }
@@ -136,10 +146,10 @@ impl Layout {
             controls.push((
                 control,
                 Rect {
-                    x: 478.0 + i as f32 * 36.0,
-                    y: 10.0,
-                    w: 30.0,
-                    h: 28.0,
+                    x: 498.0 + i as f32 * 42.0,
+                    y: 8.0,
+                    w: 38.0,
+                    h: 32.0,
                 },
             ));
         }
@@ -147,9 +157,9 @@ impl Layout {
             Control::Save,
             Rect {
                 x: width - 108.0,
-                y: 10.0,
+                y: 8.0,
                 w: 96.0,
-                h: 28.0,
+                h: 32.0,
             },
         ));
         let y = height - BOTTOM + 10.0;
@@ -173,9 +183,36 @@ impl Layout {
                 },
             ),
             (
+                Control::Present,
+                Rect {
+                    x: width - 170.0,
+                    y,
+                    w: 28.0,
+                    h: 28.0,
+                },
+            ),
+            (
+                Control::Share,
+                Rect {
+                    x: width - 138.0,
+                    y,
+                    w: 28.0,
+                    h: 28.0,
+                },
+            ),
+            (
+                Control::Pin,
+                Rect {
+                    x: width - 106.0,
+                    y,
+                    w: 28.0,
+                    h: 28.0,
+                },
+            ),
+            (
                 Control::Copy,
                 Rect {
-                    x: width - 82.0,
+                    x: width - 74.0,
                     y,
                     w: 28.0,
                     h: 28.0,
@@ -198,7 +235,14 @@ impl Layout {
             controls.retain(|(c, _)| {
                 matches!(
                     c,
-                    Control::Save | Control::Zoom | Control::Drag | Control::Copy | Control::Upload
+                    Control::Save
+                        | Control::Zoom
+                        | Control::Drag
+                        | Control::Present
+                        | Control::Share
+                        | Control::Pin
+                        | Control::Copy
+                        | Control::Upload
                 )
             });
         }
@@ -213,6 +257,25 @@ impl Layout {
             },
             controls,
         }
+    }
+    pub fn palette_rect(&self) -> Option<Rect> {
+        let color = self.rect(Control::Color)?;
+        Some(Rect {
+            x: (color.x + color.w / 2.0 - 24.0)
+                .min(self.width - 48.0)
+                .max(0.0),
+            y: TOP + 2.0,
+            w: 48.0,
+            h: 360.0,
+        })
+    }
+    pub fn palette_hit(&self, x: f32, y: f32) -> Option<usize> {
+        let r = self.palette_rect()?;
+        if !r.contains(x, y) {
+            return None;
+        }
+        let row = ((y - r.y - 4.0) / 32.0).floor() as isize;
+        (0..=10).contains(&row).then_some(row as usize)
     }
     pub fn hit(&self, x: f32, y: f32) -> Option<Control> {
         self.controls
@@ -320,6 +383,22 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+    #[test]
+    fn palette_geometry_and_hit_testing_stay_in_client_at_minimum_size() {
+        for width in [MIN_WIDTH, 960.0, 1600.0] {
+            let l = Layout::new(width, MIN_HEIGHT);
+            let p = l.palette_rect().unwrap();
+            assert!(p.x >= 0.0 && p.x + p.w <= width);
+            assert!(p.y + p.h <= MIN_HEIGHT - BOTTOM);
+            for i in 0..=10 {
+                assert_eq!(
+                    l.palette_hit(p.x + 24.0, p.y + 20.0 + i as f32 * 32.0),
+                    Some(i)
+                );
+            }
+            assert_eq!(l.palette_hit(p.x - 1.0, p.y + 20.0), None);
         }
     }
     #[test]

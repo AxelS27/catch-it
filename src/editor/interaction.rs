@@ -20,6 +20,22 @@ pub(super) unsafe extern "system" fn window_proc(
         }
         match message {
             WM_ERASEBKGND => LRESULT(1),
+            WM_ACTIVATE => {
+                // Preview cards are topmost. Float only while this editor is
+                // active, so a source card cannot cover the large editor footer
+                // and the editor won't obscure unrelated apps after focus leaves.
+                let active = wparam.0 as u16 != WA_INACTIVE as u16;
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(if active { HWND_TOPMOST } else { HWND_NOTOPMOST }),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+                DefWindowProcW(hwnd, message, wparam, lparam)
+            }
             WM_CLOSE => {
                 (&*ptr).cancel_drag.set(true);
                 (&*ptr).request(hwnd, CLOSE);
@@ -45,9 +61,13 @@ pub(super) unsafe extern "system" fn window_proc(
                                 &s.layout,
                                 &s.view,
                                 s.image.as_ref(),
-                                s.dark,
-                                s.hover,
-                                s.focus,
+                                render::ChromeState {
+                                    dark: s.dark,
+                                    hovered: s.hover,
+                                    focused: s.focus,
+                                    palette_open: s.palette_open,
+                                    selected_color: s.selected_color,
+                                },
                             )
                     })
                 };
@@ -71,6 +91,7 @@ pub(super) unsafe extern "system" fn window_proc(
                 if wparam.0 != SIZE_MINIMIZED as usize {
                     let s = &mut *ptr;
                     s.cancel_gesture();
+                    s.palette_open = false;
                     if let Err(error) = resize_state(
                         hwnd,
                         s,
@@ -111,6 +132,7 @@ pub(super) unsafe extern "system" fn window_proc(
                 {
                     let s = &mut *ptr;
                     s.cancel_gesture();
+                    s.palette_open = false;
                     s.dpi = wparam.0 as u16 as u32;
                 }
                 if GetCapture() == hwnd {
@@ -128,15 +150,9 @@ pub(super) unsafe extern "system" fn window_proc(
                 );
                 LRESULT(0)
             }
-            WM_SETTINGCHANGE => {
-                let dark = dark_theme();
-                (&mut *ptr).dark = dark;
-                apply_theme(hwnd, dark);
-                let _ = InvalidateRect(Some(hwnd), None, false);
-                DefWindowProcW(hwnd, message, wparam, lparam)
-            }
             WM_KILLFOCUS | WM_CANCELMODE => {
                 (&mut *ptr).cancel_gesture();
+                (&mut *ptr).palette_open = false;
                 (&mut *ptr).focus = None;
                 (&*ptr).cancel_drag.set(true);
                 if GetCapture() == hwnd {
@@ -154,6 +170,21 @@ pub(super) unsafe extern "system" fn window_proc(
                 let s = &mut *ptr;
                 let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
                 let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+                if s.palette_open {
+                    match wparam.0 as u16 {
+                        0x1b | 0x0d => s.palette_open = false,
+                        0x26 => {
+                            s.selected_color = (s.selected_color + layout::PRESET_COLORS.len() - 1)
+                                % layout::PRESET_COLORS.len()
+                        }
+                        0x28 => {
+                            s.selected_color = (s.selected_color + 1) % layout::PRESET_COLORS.len()
+                        }
+                        _ => {}
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
+                }
                 match wparam.0 as u16 {
                     0x1b => {
                         s.cancel_gesture();
@@ -228,6 +259,10 @@ pub(super) unsafe extern "system" fn window_proc(
                 let (capture, move_window) = {
                     let s = &mut *ptr;
                     let p = s.point(lparam);
+                    if s.palette_open {
+                        SetCapture(hwnd);
+                        return LRESULT(0);
+                    }
                     s.focus = None;
                     s.pressed = s.layout.hit(p.0, p.1).filter(|c| c.enabled() && s.ready());
                     if s.pressed == Some(Control::Drag) {
@@ -259,7 +294,11 @@ pub(super) unsafe extern "system" fn window_proc(
                 {
                     let s = &mut *ptr;
                     let p = s.point(lparam);
-                    let hit = s.layout.hit(p.0, p.1);
+                    let hit = if s.palette_open {
+                        None
+                    } else {
+                        s.layout.hit(p.0, p.1)
+                    };
                     if s.hover != hit {
                         s.hover = hit;
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -302,6 +341,21 @@ pub(super) unsafe extern "system" fn window_proc(
                     let p = s.point(lparam);
                     s.pan_start = None;
                     s.drag_start = None;
+                    if s.palette_open {
+                        if let Some(index) = s.layout.palette_hit(p.0, p.1) {
+                            if index < layout::PRESET_COLORS.len() {
+                                s.selected_color = index;
+                                s.palette_open = false;
+                            }
+                        } else {
+                            s.palette_open = false;
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        if GetCapture() == hwnd {
+                            let _ = ReleaseCapture();
+                        }
+                        return LRESULT(0);
+                    }
                     if let Some(c) = s.pressed.take()
                         && s.layout.hit(p.0, p.1) == Some(c)
                         && c != Control::Drag
@@ -343,7 +397,9 @@ pub(super) unsafe extern "system" fn window_proc(
             }
             WM_SETCURSOR if lparam.0 as u16 as u32 == HTCLIENT => {
                 let s = &*ptr;
-                let cursor = if s.pan_start.is_some() {
+                let cursor = if s.palette_open {
+                    IDC_HAND
+                } else if s.pan_start.is_some() {
                     IDC_SIZEALL
                 } else if s.hover.is_some_and(|c| c.enabled() && s.ready()) {
                     IDC_HAND
@@ -359,11 +415,12 @@ pub(super) unsafe extern "system" fn window_proc(
         }
     }
 }
-fn invoke(state: &WindowState, hwnd: HWND, control: Control) {
+fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
     match control {
         Control::Save => state.request(hwnd, SAVE),
         Control::Copy => state.request(hwnd, COPY),
         Control::Zoom => state.request(hwnd, ZOOM_MENU),
+        Control::Color => state.palette_open = !state.palette_open,
         _ => {}
     }
 }
