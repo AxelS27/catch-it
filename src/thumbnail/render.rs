@@ -12,14 +12,19 @@ use windows::{
             Direct3D::D3D_DRIVER_TYPE_HARDWARE,
             Direct3D11::*,
             DirectComposition::*,
+            DirectWrite::*,
             Dxgi::{Common::*, *},
         },
     },
-    core::Interface,
+    core::{Interface, w},
 };
 use windows_numerics::{Matrix3x2, Vector2};
 
-use super::{SavedScreenshot, layout::Layout, lifecycle::Timing};
+use super::{
+    SavedScreenshot,
+    layout::{Control, Layout},
+    lifecycle::Timing,
+};
 
 /// UI-thread-owned, shared native rendering resources. No software animation loop.
 pub struct Compositor {
@@ -28,6 +33,7 @@ pub struct Compositor {
     context: ID2D1DeviceContext,
     dxgi_factory: IDXGIFactory2,
     composition: IDCompositionDevice,
+    text_format: IDWriteTextFormat,
 }
 
 impl Compositor {
@@ -54,12 +60,25 @@ impl Compositor {
                 .CreateDevice(&dxgi)?
                 .CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
             let composition = DCompositionCreateDevice(&dxgi)?;
+            let write: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            let text_format = write.CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                12.0,
+                w!("en-US"),
+            )?;
+            text_format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+            text_format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
             Ok(Rc::new(Self {
                 device,
                 factory,
                 context,
                 dxgi_factory,
                 composition,
+                text_format,
             }))
         }
     }
@@ -182,7 +201,7 @@ fn compose(
             D2D1_INTERPOLATION_MODE_LINEAR,
             D2D1_COMPOSITE_MODE_SOURCE_OVER,
         );
-        let controls_result = draw_controls(context, layout, hovered, pinned);
+        let controls_result = draw_controls(compositor, layout, hovered, pinned);
         let draw_result = context.EndDraw(None, None);
         context.SetTarget(None);
         controls_result?;
@@ -193,32 +212,40 @@ fn compose(
 }
 
 fn draw_controls(
-    context: &ID2D1DeviceContext,
+    compositor: &Compositor,
     layout: Layout,
     hovered: bool,
     pinned: bool,
 ) -> Result<()> {
-    if (!hovered && !pinned) || layout.card_width < 70.0 || layout.card_height < 36.0 {
+    if (!hovered && !pinned) || layout.control_rect(Control::Copy).is_none() {
         return Ok(());
     }
     unsafe {
-        let left = layout.card_left + layout.card_width - 66.0;
-        let top = layout.card_top + 6.0;
+        let context = &compositor.context;
         let background = context.CreateSolidColorBrush(
             &D2D1_COLOR_F {
-                r: 0.05,
-                g: 0.05,
-                b: 0.06,
-                a: 0.88,
+                r: 0.9,
+                g: 0.9,
+                b: 0.91,
+                a: 0.96,
             },
             None,
         )?;
-        let white = context.CreateSolidColorBrush(
+        let ink = context.CreateSolidColorBrush(
             &D2D1_COLOR_F {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
+                r: 0.09,
+                g: 0.09,
+                b: 0.1,
                 a: 1.0,
+            },
+            None,
+        )?;
+        let disabled = context.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 0.09,
+                g: 0.09,
+                b: 0.1,
+                a: 0.32,
             },
             None,
         )?;
@@ -231,57 +258,172 @@ fn draw_controls(
             },
             None,
         )?;
-        context.FillRoundedRectangle(
-            &D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left,
-                    top,
-                    right: left + 60.0,
-                    bottom: top + 24.0,
-                },
-                radiusX: 7.0,
-                radiusY: 7.0,
+        let white = context.CreateSolidColorBrush(
+            &D2D1_COLOR_F {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+                a: 1.0,
             },
-            &background,
-        );
-        if pinned {
+            None,
+        )?;
+        if hovered {
+            let dim = context.CreateSolidColorBrush(
+                &D2D1_COLOR_F {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.48,
+                },
+                None,
+            )?;
             context.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
-                        left: left + 2.0,
-                        top: top + 2.0,
-                        right: left + 28.0,
-                        bottom: top + 22.0,
+                        left: layout.card_left,
+                        top: layout.card_top,
+                        right: layout.card_left + layout.card_width,
+                        bottom: layout.card_top + layout.card_height,
                     },
-                    radiusX: 5.0,
-                    radiusY: 5.0,
+                    radiusX: layout.radius,
+                    radiusY: layout.radius,
                 },
-                &blue,
+                &dim,
             );
         }
-        let pin_x = left + 15.0;
-        let pin_y = top + 7.0;
-        for (a, b) in [
-            ((pin_x - 3.0, pin_y), (pin_x + 3.0, pin_y)),
-            ((pin_x - 2.0, pin_y), (pin_x - 2.0, pin_y + 5.0)),
-            ((pin_x + 2.0, pin_y), (pin_x + 2.0, pin_y + 5.0)),
-            ((pin_x - 4.0, pin_y + 6.0), (pin_x + 4.0, pin_y + 6.0)),
-            ((pin_x, pin_y + 6.0), (pin_x, pin_y + 11.0)),
-            ((left + 41.0, top + 8.0), (left + 49.0, top + 16.0)),
-            ((left + 49.0, top + 8.0), (left + 41.0, top + 16.0)),
-        ] {
-            context.DrawLine(
-                Vector2 { X: a.0, Y: a.1 },
-                Vector2 { X: b.0, Y: b.1 },
-                &white,
-                1.5,
-                None,
+        for control in Control::ALL {
+            if !hovered && control != Control::Pin {
+                continue;
+            }
+            let bounds = layout.control_rect(control).expect("controls fit the card");
+            let rect = D2D_RECT_F {
+                left: bounds.left,
+                top: bounds.top,
+                right: bounds.left + bounds.width,
+                bottom: bounds.top + bounds.height,
+            };
+            let active_pin = control == Control::Pin && pinned;
+            let brush = if active_pin {
+                &white
+            } else if control.enabled() {
+                &ink
+            } else {
+                &disabled
+            };
+            context.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect,
+                    radiusX: bounds.radius,
+                    radiusY: bounds.radius,
+                },
+                if active_pin { &blue } else { &background },
             );
+            let (x, y) = (
+                bounds.left + bounds.width / 2.0,
+                bounds.top + bounds.height / 2.0,
+            );
+            let line = |a: (f32, f32), b: (f32, f32)| {
+                context.DrawLine(
+                    Vector2 {
+                        X: x + a.0,
+                        Y: y + a.1,
+                    },
+                    Vector2 {
+                        X: x + b.0,
+                        Y: y + b.1,
+                    },
+                    brush,
+                    1.5,
+                    None,
+                );
+            };
+            match control {
+                Control::Copy | Control::Save => {
+                    let text: Vec<u16> = if control == Control::Copy {
+                        "Copy"
+                    } else {
+                        "Save"
+                    }
+                    .encode_utf16()
+                    .collect();
+                    context.DrawText(
+                        &text,
+                        &compositor.text_format,
+                        &rect,
+                        brush,
+                        D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                        DWRITE_MEASURING_MODE_NATURAL,
+                    );
+                }
+                Control::Close => {
+                    line((-3.0, -3.0), (3.0, 3.0));
+                    line((3.0, -3.0), (-3.0, 3.0));
+                }
+                Control::Pin => {
+                    for (a, b) in [
+                        ((0.0, -5.0), (5.0, 0.0)),
+                        ((1.0, -4.0), (-2.0, -1.0)),
+                        ((4.0, -1.0), (1.0, 2.0)),
+                        ((-3.0, -2.0), (2.0, 3.0)),
+                        ((-0.5, 0.5), (-4.0, 4.0)),
+                    ] {
+                        line(a, b);
+                    }
+                }
+                Control::Annotate => {
+                    for (a, b) in [
+                        ((-4.0, 2.0), (2.0, -4.0)),
+                        ((-2.0, 4.0), (4.0, -2.0)),
+                        ((2.0, -4.0), (4.0, -2.0)),
+                        ((-4.0, 2.0), (-5.0, 5.0)),
+                        ((-5.0, 5.0), (-2.0, 4.0)),
+                        ((0.5, -2.5), (2.5, -0.5)),
+                    ] {
+                        line(a, b);
+                    }
+                }
+                Control::Upload => {
+                    let geometry = compositor.factory.CreatePathGeometry()?;
+                    let sink = geometry.Open()?;
+                    sink.BeginFigure(
+                        Vector2 {
+                            X: x - 4.0,
+                            Y: y + 3.0,
+                        },
+                        D2D1_FIGURE_BEGIN_HOLLOW,
+                    );
+                    for (p1, p2, p3) in [
+                        ((-9.0, 3.0), (-8.0, -3.0), (-4.0, -3.0)),
+                        ((-3.0, -9.0), (5.0, -8.0), (5.0, -3.0)),
+                        ((9.0, -3.0), (9.0, 3.0), (4.0, 3.0)),
+                    ] {
+                        sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+                            point1: Vector2 {
+                                X: x + p1.0,
+                                Y: y + p1.1,
+                            },
+                            point2: Vector2 {
+                                X: x + p2.0,
+                                Y: y + p2.1,
+                            },
+                            point3: Vector2 {
+                                X: x + p3.0,
+                                Y: y + p3.1,
+                            },
+                        });
+                    }
+                    sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                    sink.Close()?;
+                    context.DrawGeometry(&geometry, brush, 1.5, None);
+                    line((0.0, 6.0), (0.0, -1.0));
+                    line((0.0, -1.0), (-2.5, 1.5));
+                    line((0.0, -1.0), (2.5, 1.5));
+                }
+            }
         }
     }
     Ok(())
 }
-
 impl Surface {
     pub fn new(
         compositor: Rc<Compositor>,

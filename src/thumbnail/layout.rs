@@ -27,10 +27,47 @@ pub struct Layout {
     pub radius: f32,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Control {
-    Pin,
     Close,
+    Pin,
+    Copy,
+    Save,
+    Annotate,
+    Upload,
+}
+impl Control {
+    pub const ALL: [Self; 6] = [
+        Self::Close,
+        Self::Pin,
+        Self::Copy,
+        Self::Save,
+        Self::Annotate,
+        Self::Upload,
+    ];
+    pub fn enabled(self) -> bool {
+        !matches!(self, Self::Annotate | Self::Upload)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct ControlRect {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+    pub radius: f32,
+}
+impl ControlRect {
+    fn contains(self, x: f32, y: f32) -> bool {
+        let (x, y) = (x - self.left, y - self.top);
+        if x < 0.0 || y < 0.0 || x >= self.width || y >= self.height {
+            return false;
+        }
+        let near_x = x.clamp(self.radius, self.width - self.radius);
+        let near_y = y.clamp(self.radius, self.height - self.radius);
+        (x - near_x).powi(2) + (y - near_y).powi(2) <= self.radius.powi(2)
+    }
 }
 
 impl Layout {
@@ -42,22 +79,43 @@ impl Layout {
         ((self.card_height + 12.0) * self.scale).round().max(1.0) as u32
     }
 
+    /// Relative arrangement from CleanShot's official quick-access demo:
+    /// Close/Pin top corners, Copy above Save centrally, Annotate/Upload bottom.
+    pub fn control_rect(&self, control: Control) -> Option<ControlRect> {
+        if self.card_width < 110.0 || self.card_height < 110.0 {
+            return None;
+        }
+        let (x, y, width, height) = match control {
+            Control::Close => (6.0, 6.0, 24.0, 24.0),
+            Control::Pin => (self.card_width - 30.0, 6.0, 24.0, 24.0),
+            Control::Annotate => (6.0, self.card_height - 30.0, 24.0, 24.0),
+            Control::Upload => (self.card_width - 30.0, self.card_height - 30.0, 24.0, 24.0),
+            Control::Copy => (
+                self.card_width / 2.0 - 30.0,
+                self.card_height / 2.0 - 34.0,
+                60.0,
+                28.0,
+            ),
+            Control::Save => (
+                self.card_width / 2.0 - 30.0,
+                self.card_height / 2.0 + 6.0,
+                60.0,
+                28.0,
+            ),
+        };
+        Some(ControlRect {
+            left: self.card_left + x,
+            top: self.card_top + y,
+            width,
+            height,
+            radius: height / 2.0,
+        })
+    }
     pub fn control_at(&self, x: f32, y: f32) -> Option<Control> {
-        if self.card_width < 70.0 || self.card_height < 36.0 {
-            return None;
-        }
-        let x = x / self.scale - (self.card_left + self.card_width - 66.0);
-        let y = y / self.scale - (self.card_top + 6.0);
-        if !(0.0..24.0).contains(&y) {
-            return None;
-        }
-        if (0.0..28.0).contains(&x) {
-            Some(Control::Pin)
-        } else if (30.0..60.0).contains(&x) {
-            Some(Control::Close)
-        } else {
-            None
-        }
+        Control::ALL.into_iter().find(|&control| {
+            self.control_rect(control)
+                .is_some_and(|rect| rect.contains(x / self.scale, y / self.scale))
+        })
     }
 
     pub fn new(area: WorkArea, dpi: u32, image_width: u32, image_height: u32) -> Result<Self> {
@@ -136,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn controls_have_distinct_dpi_scaled_targets_inside_the_card() -> Result<()> {
+    fn controls_have_distinct_dpi_scaled_targets_in_reference_positions() -> Result<()> {
         let area = WorkArea {
             left: 0,
             top: 0,
@@ -145,29 +203,39 @@ mod tests {
         };
         for dpi in [96, 120, 144, 192] {
             let layout = Layout::new(area, dpi, 350, 200)?;
-            let left = layout.card_left + layout.card_width - 66.0;
-            let top = layout.card_top + 6.0;
-            for (x, expected) in [
-                (14.0, Some(Control::Pin)),
-                (45.0, Some(Control::Close)),
-                (29.0, None),
-                (61.0, None),
-            ] {
-                assert!(
-                    layout.control_at((left + x) * layout.scale, (top + 12.0) * layout.scale)
-                        == expected
+            for control in Control::ALL {
+                let rect = layout.control_rect(control).unwrap();
+                assert_eq!(
+                    layout.control_at(
+                        (rect.left + rect.width / 2.0) * layout.scale,
+                        (rect.top + rect.height / 2.0) * layout.scale
+                    ),
+                    Some(control)
                 );
+                assert_ne!(
+                    layout.control_at(rect.left * layout.scale, rect.top * layout.scale),
+                    Some(control)
+                );
+                assert!(layout.contains(
+                    (rect.left + rect.width / 2.0) * layout.scale,
+                    (rect.top + rect.height / 2.0) * layout.scale
+                ));
             }
+            let close = layout.control_rect(Control::Close).unwrap();
+            let pin = layout.control_rect(Control::Pin).unwrap();
+            let copy = layout.control_rect(Control::Copy).unwrap();
+            let save = layout.control_rect(Control::Save).unwrap();
+            let annotate = layout.control_rect(Control::Annotate).unwrap();
+            let upload = layout.control_rect(Control::Upload).unwrap();
+            assert!(close.left < pin.left && close.top == pin.top);
+            assert!(copy.left == save.left && copy.top + copy.height < save.top);
             assert!(
-                layout
-                    .control_at(left * layout.scale, (top - 1.0) * layout.scale)
-                    .is_none()
+                annotate.left == close.left
+                    && upload.left == pin.left
+                    && annotate.top == upload.top
             );
-            assert!(
-                layout
-                    .control_at(left * layout.scale, (top + 24.0) * layout.scale)
-                    .is_none()
-            );
+            assert!(!Control::Annotate.enabled() && !Control::Upload.enabled());
+            assert!(Control::Save.enabled() && Control::Copy.enabled());
         }
         Ok(())
     }

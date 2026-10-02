@@ -2,7 +2,9 @@
 
 mod capture;
 mod cleanup;
+mod clipboard;
 mod drag_drop;
+mod export;
 mod gallery;
 mod geometry;
 mod overlay;
@@ -38,6 +40,7 @@ const CAPTURE_HOTKEY: i32 = 1;
 const QUIT_HOTKEY: i32 = 2;
 const WORK_READY: u32 = WM_APP + 1;
 const THUMBNAIL_TIMER: usize = 1;
+const CLIPBOARD_TIMER: usize = 2;
 
 thread_local! {
     static EXIT_REQUESTED: Cell<bool> = const { Cell::new(false) };
@@ -54,6 +57,11 @@ enum WorkResult {
     Saved(Result<thumbnail::SavedScreenshot>),
 }
 
+struct PendingClipboard {
+    image: clipboard::Image,
+    expires: Instant,
+}
+
 struct App {
     controller: HWND,
     tray: Option<Box<tray::Tray>>,
@@ -64,6 +72,7 @@ struct App {
     gallery: gallery::Gallery,
     compositor: Rc<thumbnail::Compositor>,
     started: Instant,
+    clipboard: Option<PendingClipboard>,
 }
 
 impl App {
@@ -130,6 +139,11 @@ impl App {
                     self.started.elapsed().as_millis(),
                     image.path.display()
                 );
+                // Publish even if preview rendering later fails. A clipboard
+                // error must not prevent the saved PNG's thumbnail from appearing.
+                let clipboard =
+                    clipboard::Image::new(&image.path, &image.pixels, image.width, image.height)
+                        .and_then(|image| self.queue_clipboard(image));
                 let preview = thumbnail::Thumbnail::create(
                     self.controller,
                     Rc::clone(&self.compositor),
@@ -139,6 +153,7 @@ impl App {
                 self.gallery.insert(preview)?;
                 self.schedule_thumbnail_timer()?;
                 println!("Preview ready in {} ms", self.started.elapsed().as_millis());
+                clipboard?;
             }
         }
         Ok(())
@@ -206,6 +221,76 @@ impl App {
         self.gallery.reflow()?;
         self.schedule_thumbnail_timer()?;
         result.map(|_| ())
+    }
+
+    fn save_thumbnail(&mut self, source: WPARAM) -> Result<()> {
+        let Some((index, mut thumbnail)) = self.gallery.take(source) else {
+            return Ok(());
+        };
+        self.gallery.pause_all()?;
+        thumbnail.set_paused(true)?;
+        unsafe {
+            let _ = KillTimer(Some(self.controller), THUMBNAIL_TIMER);
+        }
+        let previous = unsafe { GetForegroundWindow() };
+        let result = export::save_as(self.controller, thumbnail.path());
+        unsafe {
+            if GetForegroundWindow() == self.controller {
+                let _ = SetForegroundWindow(previous);
+            }
+        }
+        if EXIT_REQUESTED.get() {
+            return Ok(());
+        }
+        if matches!(result, Ok(Some(_))) && !thumbnail.pinned() {
+            thumbnail.dismiss()?;
+        }
+        self.gallery.restore(index, thumbnail);
+        self.gallery.reflow()?;
+        self.schedule_thumbnail_timer()?;
+        if let Ok(Some(path)) = &result {
+            println!("Exported: {}", path.display());
+        }
+        result.map(|_| ())
+    }
+
+    fn copy_thumbnail(&mut self, source: WPARAM) -> Result<()> {
+        let Some(item) = self.gallery.get(source) else {
+            return Ok(());
+        };
+        let image = clipboard::Image::from_png(item.path())?;
+        self.queue_clipboard(image)
+    }
+
+    fn queue_clipboard(&mut self, image: clipboard::Image) -> Result<()> {
+        self.clipboard = Some(PendingClipboard {
+            image,
+            expires: Instant::now() + std::time::Duration::from_secs(2),
+        });
+        self.publish_clipboard()
+    }
+
+    fn publish_clipboard(&mut self) -> Result<()> {
+        unsafe {
+            let _ = KillTimer(Some(self.controller), CLIPBOARD_TIMER);
+        }
+        let Some(mut pending) = self.clipboard.take() else {
+            return Ok(());
+        };
+        if pending.image.publish(self.controller)? {
+            println!("Clipboard: original PNG and native image copied");
+        } else {
+            anyhow::ensure!(
+                Instant::now() < pending.expires,
+                "Clipboard is busy. Screenshot is saved; use Copy to retry."
+            );
+            self.clipboard = Some(pending);
+            if unsafe { SetTimer(Some(self.controller), CLIPBOARD_TIMER, 50, None) } == 0 {
+                self.clipboard.take();
+                anyhow::bail!("Cannot schedule clipboard retry");
+            }
+        }
+        Ok(())
     }
 
     fn clear_thumbnail(&mut self) -> bool {
@@ -284,6 +369,10 @@ impl App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.controller), CLIPBOARD_TIMER);
+        }
+        self.clipboard.take();
         self.overlay.take();
         self.clear_thumbnail();
         self.worker.shutdown();
@@ -319,6 +408,7 @@ unsafe extern "system" fn controller_proc(
         // DoDragDrop dispatches directly to this callback rather than our outer
         // loop. IDropSource observes this flag and cancels safely before exit.
         EXIT_REQUESTED.set(true);
+        export::cancel_dialog();
         // Also unwind a tray popup's nested loop. OLE observes the same flag.
         unsafe {
             let _ = EndMenu();
@@ -344,9 +434,11 @@ unsafe extern "system" fn controller_proc(
             | thumbnail::BEGIN_DRAG
             | thumbnail::PIN
             | thumbnail::CONTEXT_MENU
+            | thumbnail::SAVE
+            | thumbnail::COPY
             | tray::SET_TIMEOUT_REQUEST
             | tray::CLOSE_ALL_REQUEST
-    ) || (message == WM_TIMER && wparam.0 == THUMBNAIL_TIMER)
+    ) || (message == WM_TIMER && matches!(wparam.0, THUMBNAIL_TIMER | CLIPBOARD_TIMER))
     {
         // Modal Windows loops dispatch messages directly, bypassing run(). Keep
         // worker completions and lifecycle changes for the outer App loop.
@@ -433,6 +525,7 @@ fn run() -> Result<()> {
         gallery: gallery::Gallery::new(settings::AutoClose::load()),
         compositor,
         started: Instant::now(),
+        clipboard: None,
     };
     unsafe {
         RegisterHotKey(
@@ -456,7 +549,7 @@ fn run() -> Result<()> {
     println!("Esc / right-click: cancel. Ctrl + Alt + Q: quit.");
     println!("Output: %LOCALAPPDATA%\\SimpleScreenshot\\Temp\\");
     println!(
-        "Preview: drag to copy, hover for pin/close, right-click for actions. Timing is provisional."
+        "Preview: auto-copy image, hover for Copy/Save/pin/close, drag to copy file. Timing is provisional."
     );
     let mut message = MSG::default();
     loop {
@@ -499,6 +592,9 @@ fn run() -> Result<()> {
                 thumbnail::BEGIN_DRAG => app.begin_drag(message.wParam),
                 thumbnail::PIN => app.pin_thumbnail(message.wParam),
                 thumbnail::CONTEXT_MENU => app.context_menu(message.wParam),
+                thumbnail::SAVE => app.save_thumbnail(message.wParam),
+                thumbnail::COPY => app.copy_thumbnail(message.wParam),
+                WM_TIMER if message.wParam.0 == CLIPBOARD_TIMER => app.publish_clipboard(),
                 tray::SET_TIMEOUT_REQUEST => app.configure_timeout(message.wParam.0),
                 tray::CLOSE_ALL_REQUEST => {
                     app.clear_thumbnail();

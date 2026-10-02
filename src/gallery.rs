@@ -57,6 +57,9 @@ impl Gallery {
         }
         Ok(())
     }
+    pub fn get(&self, source: WPARAM) -> Option<&Thumbnail> {
+        self.items.iter().find(|item| item.matches(source))
+    }
     pub fn take(&mut self, source: WPARAM) -> Option<(usize, Thumbnail)> {
         let index = self.items.iter().position(|item| item.matches(source))?;
         Some((index, self.items.remove(index)))

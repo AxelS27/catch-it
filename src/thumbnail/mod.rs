@@ -41,6 +41,8 @@ pub const DISMISS: u32 = WM_APP + 4;
 pub const BEGIN_DRAG: u32 = WM_APP + 5;
 pub const PIN: u32 = WM_APP + 9;
 pub const CONTEXT_MENU: u32 = WM_APP + 10;
+pub const SAVE: u32 = WM_APP + 14;
+pub const COPY: u32 = WM_APP + 15;
 const CLASS_NAME: windows::core::PCWSTR = w!("SimpleScreenshot.Thumbnail");
 
 /// Published only after the complete PNG has been saved by the worker.
@@ -187,6 +189,10 @@ impl Thumbnail {
             thumbnail.lifecycle.set_paused(Instant::now(), true);
             Ok(thumbnail)
         }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     pub fn closed(&self) -> bool {
@@ -543,6 +549,22 @@ unsafe extern "system" fn window_proc(
         }
         match message {
             WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
+            WM_SETCURSOR if lparam.0 as u16 as u32 == HTCLIENT => {
+                let state = &*ptr;
+                let mut point = POINT::default();
+                let hand = GetCursorPos(&mut point).is_ok()
+                    && state
+                        .layout
+                        .control_at(
+                            (point.x - state.layout.x) as f32,
+                            (point.y - state.layout.y) as f32,
+                        )
+                        .is_some_and(Control::enabled);
+                if let Ok(cursor) = LoadCursorW(None, if hand { IDC_HAND } else { IDC_ARROW }) {
+                    SetCursor(Some(cursor));
+                }
+                LRESULT(1)
+            }
             WM_NCHITTEST => {
                 let state = &*ptr;
                 let x = lparam.0 as u16 as i16 as i32 - state.layout.x;
@@ -585,17 +607,21 @@ unsafe extern "system" fn window_proc(
                     if let Some(control) = state.pressed_control.take()
                         && state.layout.control_at(point.x as f32, point.y as f32) == Some(control)
                     {
-                        let message = if control == Control::Pin {
-                            PIN
-                        } else {
-                            DISMISS
+                        let message = match control {
+                            Control::Pin => Some(PIN),
+                            Control::Close => Some(DISMISS),
+                            Control::Save => Some(SAVE),
+                            Control::Copy => Some(COPY),
+                            Control::Annotate | Control::Upload => None,
                         };
-                        let _ = PostMessageW(
-                            Some(state.controller),
-                            message,
-                            WPARAM(hwnd.0 as usize),
-                            LPARAM(0),
-                        );
+                        if let Some(message) = message {
+                            let _ = PostMessageW(
+                                Some(state.controller),
+                                message,
+                                WPARAM(hwnd.0 as usize),
+                                LPARAM(0),
+                            );
+                        }
                     }
                     state.press = None;
                 }

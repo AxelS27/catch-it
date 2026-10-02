@@ -2,7 +2,7 @@
 
 A lightweight Windows screenshot utility with floating capture previews, file drag/drop, a pending queue, and persistent reference cards. The initial macOS-inspired flow and approved CleanShot-inspired extension are described in [PRD.md](PRD.md). Exact reference parity is not claimed.
 
-## Current milestone: multi-thumbnail queue, pin, and configurable timer
+## Current milestone: thumbnail actions, Save As, and automatic image clipboard
 
 Implemented:
 
@@ -26,10 +26,13 @@ Implemented:
 - Fixed 220 x 160 logical-pixel rounded card with a subtle shadow; screenshot content fills the card using a centered cover crop, preserving aspect ratio without stretching or letterboxing. Preview cropping never changes the saved PNG. Only DPI or a very small available work area changes the card size.
 - Rasterize the card once before composing its shadow, avoiding the Direct2D layer-reuse error reproduced with full-screen captures.
 - DirectComposition slide/fade animations, without per-frame CPU repainting.
-- No keyboard focus activation when showing, hovering, clicking, or dismissing the preview.
+- No keyboard focus activation when showing, hovering, copying, pinning, or dismissing the preview. Save intentionally opens a normal native dialog with keyboard focus.
 - Monotonic timeout that pauses on hover and resumes the remaining time after mouse exit. Auto-dismiss is FIFO per visible monitor stack: oldest unpinned card exits first; newer cards wait until its exit finishes, even if their own budgets have already elapsed. Hovering the oldest holds automatic dismissal behind it. Manual close and successful file drops are not FIFO-gated.
 - Event-driven timers: no recurring timer for an idle pin, hovered card, Never setting, or dismissed gallery.
-- Hover exposes pin and close controls. Right-click opens pin/unpin, close, and close-all actions. Windows client-area animation preference is respected.
+- Hover actions follow the relative arrangement in CleanShot's [official quick-access demo](https://cleanshot.com/video/home/quickaccess.mp4): Close top-left, Pin top-right, central Copy above Save, Annotate bottom-left, Upload bottom-right. Copy and Save are active; Annotate and Upload are visibly disabled placeholders that never initiate a drag. Small cards without enough room hide controls rather than overlapping targets. Relative positions are reference-based; exact macOS pixel parity and blur are not claimed.
+- Copy the original screenshot automatically after each successful capture/save, including when the preview queue is full of pins. Publish both the original registered `PNG` bytes and a full-resolution native `CF_DIBV5` image, never a preview crop or file path. Copy can recopy any surviving older screenshot without dismissing it or taking focus. A busy clipboard retries on a 50 ms event timer for up to two seconds, then reports failure with the source PNG and preview intact; Copy allows retry. No recurring clipboard timer after success or failure.
+- Save opens Windows' native PNG Save As dialog. Cancel preserves the card; success dismisses an unpinned card and keeps a pin in place. All card clocks pause during the dialog. Unicode/spaced paths and native overwrite confirmation are supported. Export copies the exact original PNG bytes to a private file in the chosen folder, then atomically publishes it; failure preserves the existing target and source PNG. Quit safely cancels an active dialog.
+- Right-click opens pin/unpin, close, and close-all actions. Windows client-area animation preference is respected.
 - Bounded session-only FIFO preview queue. Each monitor's bottom-right stack fits as many fixed cards as its usable height allows (five on the validated 1080p/100% desktop), oldest at the bottom and newest at the top. Overflow permanently removes the oldest unpinned thumbnail and releases its window/resources, without deleting its PNG. For capacity five, captures 1-6 leave only 2-6, compacted downward. No hidden backlog, wheel browsing, or older/newer paging; removed thumbnails never reappear after another dismissal or capture.
 - Pins remain always on top in the same chronological stack, not a separate column. Pin/unpin does not reorder a card; removing a lower card compacts those above it without losing pin state. Pins reserve stack slots and never auto-expire or get evicted by new captures. If every slot is pinned, new PNGs are still saved but their previews cannot enter the full queue. Pins use the same fixed cover card, not a movable/resizable reference window.
 - Hide all surviving cards and pins before desktop capture; pause their clocks until selection cancellation or PNG publication restores them. Captures do not contain older previews. Capture hiding is temporary, unlike permanent overflow eviction.
@@ -87,7 +90,7 @@ cargo run --release
 2. Press `Alt + Shift + S`.
 3. Drag to select a region, then release to save.
 4. The preview appears in the bottom-right corner without taking keyboard focus.
-5. Drag a card into Explorer or a compatible terminal. Hover for pin/close controls; right-click for other actions. Overflow permanently evicts the oldest unpinned thumbnail; there is no preview history.
+5. Every new screenshot automatically copies its original image to the clipboard. Hover for Copy, Save, pin, and close; Copy restores an older image, and Save chooses a PNG destination. Annotate and Upload are disabled for now. Drag a card's background into Explorer or a compatible terminal to copy its file. Overflow permanently evicts the oldest unpinned thumbnail; there is no preview history.
 6. Pin a card to keep it beyond the timer, in its existing stack position. Unpin preserves capture order and starts a fresh timeout. Closing or successfully dragging an unpinned card compacts the stack without changing surviving pins. Closing cards never deletes their PNGs.
 
 Debug or redirected console diagnostics include saved file paths. Use **Auto-close** in the tray to choose a timeout or Never; **Close all screenshots** closes pending cards and pins.
@@ -106,6 +109,18 @@ cargo build --release
 ```
 
 Unit tests cover selection direction, clamping, empty regions, crop boundaries, display-rotation transforms, invalid PNG buffers, and a real WIC PNG round trip through a Unicode filename containing spaces. Thumbnail tests cover layout at 100%, 125%, 150%, and 200% scaling, negative monitor origins, extreme aspect ratios, rounded hit testing, hover/drag/capture-hidden timing, pin/unpin lifecycles, Never, interval changes, interrupted dismissal, disabled motion, distinct DPI-scaled controls, permanent queue eviction/no-resurrection, chronological pin placement/compaction, screen-derived capacity, and persisted settings. Drag tests check actual COM source behavior, STA affinity, unchanged premultiplied card-pixel upload, invalid drag buffers, system thresholds, and native `CF_HDROP` paths with spaces and Unicode.
+
+### Focused Save As / clipboard test
+
+```powershell
+cargo test clipboard::tests
+cargo test export::tests
+cargo test thumbnail::layout::tests::controls
+cargo build --release
+pwsh -NoProfile -Sta -File ./scripts/smoke-capture.ps1 -Configuration release -ActionsOnly
+```
+
+This mode runs only capture/image clipboard and thumbnail actions, not the complete suite. It checks original PNG bytes and native image pixels/dimensions, automatic replacement on the next capture, clipboard-lock retry, manual recopy of an older capture, disabled placeholders/focus, Save As cancellation beyond the idle budget, Unicode/spaced export, unpinned dismissal, unchanged pin placement, real overwrite confirmation, quit during Save As, and clipboard persistence after shutdown. Five focused unit tests cover clipboard buffers, atomic success/failure and unchanged targets, and all six control targets at four DPI scales. The real desktop, mouse, keyboard and clipboard are used; do not interact while it runs. The native save dialog must expose English Save/Cancel labels. File/settings fixtures are isolated under `.pi/capture-smoke/`.
 
 ### Focused gallery regression test
 
@@ -172,7 +187,7 @@ Layout checks capture the entire monitor corner-to-corner in both directions and
 
 The **Gallery** suite captures beyond the monitor's capacity, validates bottom-to-top ordering, pins in slots 1 and 3, removal of slot 2, in-place unpin, overflow with pins retained, permanent overflow eviction with no hidden windows or resurrection after close/capture, and staged timeout. Full `-Gallery` mode additionally checks the saved Never preference across an actual process restart. The drag suite also verifies that a pinned reference survives an actual Explorer copy. Overflow checks assert that evicted native windows are destroyed, survivors compact downward, and source PNGs remain.
 
-Logs and visual artifacts (`gallery-capacity.png`, `gallery-newest.png`, `overlay.png`, `thumbnail.png`, `tray-menu.png`, `fullscreen-False.png`, `fullscreen-True.png`, `thumbnail-portrait.png`, `thumbnail-taskbar.png`, `drag-portrait.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
+Logs and visual artifacts (`thumbnail-actions-hover.png`, `save-as-dialog.png`, `gallery-capacity.png`, `gallery-newest.png`, `overlay.png`, `thumbnail.png`, `tray-menu.png`, `fullscreen-False.png`, `fullscreen-True.png`, `thumbnail-portrait.png`, `thumbnail-taskbar.png`, `drag-portrait.png`, `drag-unsupported.png`, `drag-explorer.png`) are saved to `.pi/capture-smoke/`, which is ignored by Git.
 
 Initial successful release validation:
 
@@ -215,6 +230,8 @@ These are observations on the available desktop, not cross-hardware performance 
 | `src/drag_drop.rs` | OLE STA, Shell file object, copy-only source, cached layered drag visual |
 | `src/overlay.rs` | Win32 selection window, input, Direct2D rendering |
 | `src/storage.rs` | WIC PNG encoding, atomic file publication, and active-file protection |
+| `src/clipboard.rs` | Original PNG + native DIBV5 clipboard payloads, memory ownership, lossless recopy |
+| `src/export.rs` | Native PNG Save As, modal cancellation, atomic lossless export |
 | `src/cleanup.rs` | Conservative 24-hour temp retention and sleeping cleanup worker |
 | `src/worker.rs` | Reusable GPU session and background work queue |
 | `src/thumbnail/mod.rs` | Non-activating card/pin windows, controls, visibility, cached surfaces, drag interactions |

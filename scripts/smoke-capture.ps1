@@ -6,10 +6,11 @@ param(
     [switch]$Layout,
     [switch]$Gallery,
     [switch]$GalleryOnly,
-    [switch]$FifoOnly
+    [switch]$FifoOnly,
+    [switch]$ActionsOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -31,7 +32,41 @@ public static class CaptureInput {
     [StructLayout(LayoutKind.Sequential)] struct MouseInput {
         public int X, Y; public uint Data, Flags, Time; public UIntPtr Extra;
     }
-    [StructLayout(LayoutKind.Sequential)] struct Input { public uint Type; public MouseInput Mouse; }
+    [StructLayout(LayoutKind.Sequential)] struct KeyboardInput { public ushort Key, Scan; public uint Flags, Time; public UIntPtr Extra; }
+    [StructLayout(LayoutKind.Explicit)] struct InputData {
+        [FieldOffset(0)] public MouseInput Mouse;
+        [FieldOffset(0)] public KeyboardInput Keyboard;
+    }
+    [StructLayout(LayoutKind.Sequential)] struct Input {
+        public uint Type; public InputData Data;
+        public MouseInput Mouse { get { return Data.Mouse; } set { Data.Mouse=value; } }
+        public KeyboardInput Keyboard { get { return Data.Keyboard; } set { Data.Keyboard=value; } }
+    }
+    public static void TypeText(string text) {
+        var inputs=new System.Collections.Generic.List<Input>();
+        foreach(char ch in text) {
+            inputs.Add(new Input { Type=1, Keyboard=new KeyboardInput { Scan=ch, Flags=4 } });
+            inputs.Add(new Input { Type=1, Keyboard=new KeyboardInput { Scan=ch, Flags=6 } });
+        }
+        if(SendInput((uint)inputs.Count,inputs.ToArray(),Marshal.SizeOf(typeof(Input))) != inputs.Count) { throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
+    }
+    [DllImport("user32.dll")] public static extern bool OpenClipboard(IntPtr owner);
+    [DllImport("user32.dll")] public static extern bool CloseClipboard();
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern uint RegisterClipboardFormat(string name);
+    [DllImport("user32.dll")] static extern IntPtr GetClipboardData(uint format);
+    [DllImport("kernel32.dll")] static extern IntPtr GlobalLock(IntPtr memory);
+    [DllImport("kernel32.dll")] static extern bool GlobalUnlock(IntPtr memory);
+    [DllImport("kernel32.dll")] static extern UIntPtr GlobalSize(IntPtr memory);
+    public static byte[] ClipboardPng(int length) {
+        if(!OpenClipboard(IntPtr.Zero)) return null;
+        try {
+            IntPtr memory=GetClipboardData(RegisterClipboardFormat("PNG"));
+            if(memory==IntPtr.Zero || GlobalSize(memory).ToUInt64() < (ulong)length) return null;
+            IntPtr pointer=GlobalLock(memory); if(pointer==IntPtr.Zero) return null;
+            try { byte[] bytes=new byte[length]; Marshal.Copy(pointer,bytes,0,length); return bytes; }
+            finally { GlobalUnlock(memory); }
+        } finally { CloseClipboard(); }
+    }
     [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint count, Input[] inputs, int size);
     public static void ClickAt(int x, int y, uint down = 2, uint up = 4) {
         int dx = (int)(((long)(x - GetSystemMetrics(76)) * 65536 + 32768) / GetSystemMetrics(78));
@@ -65,11 +100,12 @@ public static class CaptureInput {
     delegate bool WindowCallback(IntPtr window, IntPtr data);
     [DllImport("user32.dll")] static extern bool EnumWindows(WindowCallback callback, IntPtr data);
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr window, System.Text.StringBuilder text, int max);
-    public static IntPtr TaggedWindow(string tag) {
+    public static IntPtr TaggedWindow(string tag, uint process = 0) {
         IntPtr result = IntPtr.Zero;
         EnumWindows((window, data) => {
             var title = new System.Text.StringBuilder(512); GetWindowText(window, title, 512);
-            if (IsWindowVisible(window) && title.ToString().Contains(tag)) { result = window; return false; }
+            uint pid; GetWindowThreadProcessId(window,out pid);
+            if ((process==0 || process==pid) && IsWindowVisible(window) && title.ToString().Contains(tag)) { result = window; return false; }
             return true;
         }, IntPtr.Zero);
         return result;
@@ -218,9 +254,8 @@ function Click-PreviewControl([IntPtr]$Window, [switch]$Pin) {
     $rect=New-Object CaptureInput+Rect
     [void][CaptureInput]::GetWindowRect($Window,[ref]$rect)
     $scale=[CaptureInput]::GetDpiForWindow($Window)/96.0
-    $offset=if($Pin){51}else{21}
-    $x=[int]($rect.Right-(18+$offset)*$scale)
-    $y=[int]($rect.Top+(14+18)*$scale)
+    $x=if($Pin){[int]($rect.Right-36*$scale)}else{[int]($rect.Left+32*$scale)}
+    $y=[int]($rect.Top+32*$scale)
     [CaptureInput]::MouseAt($x,$y,0)
     Start-Sleep -Milliseconds 100
     [CaptureInput]::ClickAt($x,$y)
@@ -660,6 +695,169 @@ function Assert-Stack($Records) {
         $previous=$rect
     }
 }
+function Click-PreviewAction([IntPtr]$Window,[string]$Action) {
+    $rect=Preview-Rect $Window
+    $scale=[CaptureInput]::GetDpiForWindow($Window)/96.0
+    $x=[int]($rect.Left+124*$scale)
+    $y=[int]($rect.Top+$(if($Action -eq 'Copy'){74}else{114})*$scale)
+    if($Action -eq 'Annotate'){$x=[int]($rect.Left+32*$scale);$y=[int]($rect.Top+156*$scale)}
+    if($Action -eq 'Upload'){$x=[int]($rect.Right-36*$scale);$y=[int]($rect.Top+156*$scale)}
+    [CaptureInput]::MouseAt($x,$y,0)
+    Start-Sleep -Milliseconds 100
+    [CaptureInput]::ClickAt($x,$y)
+}
+function Wait-SaveDialog([bool]$Visible) {
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    while($clock.ElapsedMilliseconds -lt 5000){
+        $dialog=[CaptureInput]::TaggedWindow('Save screenshot',[uint32]$app.Id)
+        if(-not $Visible -and $dialog -eq [IntPtr]::Zero){return $dialog}
+        if($Visible -and $dialog -ne [IntPtr]::Zero){
+            $root=[System.Windows.Automation.AutomationElement]::FromHandle($dialog)
+            $cancel=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Cancel'))
+            if($cancel -and $cancel.Current.IsEnabled){return $dialog}
+        }
+        Start-Sleep -Milliseconds 25
+    }
+    Save-GalleryScreenshot 'save-dialog-failure.png'
+    throw "Save As dialog visibility did not become $Visible."
+}
+function Enter-SavePath([string]$Path,[switch]$Overwrite) {
+    $dialog=Wait-SaveDialog $true
+    [void][CaptureInput]::SetForegroundWindow($dialog)
+    [CaptureInput]::keybd_event(18,0,0,[UIntPtr]::Zero);Press-Key 0x4E;[CaptureInput]::keybd_event(18,0,2,[UIntPtr]::Zero)
+    [CaptureInput]::keybd_event(17,0,0,[UIntPtr]::Zero);Press-Key 0x41;[CaptureInput]::keybd_event(17,0,2,[UIntPtr]::Zero)
+    [CaptureInput]::TypeText($Path)
+    Press-Key 13
+    if($Overwrite){
+        for($i=0;$i -lt 100 -and [CaptureInput]::TaggedWindow('Confirm Save As',[uint32]$app.Id) -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+        if([CaptureInput]::TaggedWindow('Confirm Save As',[uint32]$app.Id) -eq [IntPtr]::Zero){throw 'Native overwrite confirmation missing.'}
+        [CaptureInput]::keybd_event(18,0,0,[UIntPtr]::Zero);Press-Key 0x59;[CaptureInput]::keybd_event(18,0,2,[UIntPtr]::Zero)
+    }
+    [void](Wait-SaveDialog $false)
+    for($i=0;$i -lt 100 -and -not (Test-Path $Path);$i++){Start-Sleep -Milliseconds 25}
+    if(-not (Test-Path $Path)){throw 'Save As did not create the selected file.'}
+}
+function Assert-SavedCopy([string]$Destination,[string]$Source) {
+    $expected=[Convert]::ToBase64String([IO.File]::ReadAllBytes($Source))
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    while($clock.ElapsedMilliseconds -lt 5000){
+        if(Test-Path $Destination){
+            # The shell dialog can close before publication. Poll bytes without
+            # denying FILE_SHARE_DELETE to the app's atomic rename.
+            $file=[IO.File]::Open($Destination,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            $memory=[IO.MemoryStream]::new()
+            try{$file.CopyTo($memory);$actual=[Convert]::ToBase64String($memory.ToArray())}
+            finally{$file.Dispose();$memory.Dispose()}
+            if($actual -eq $expected){return}
+        }
+        Start-Sleep -Milliseconds 25
+    }
+    Save-GalleryScreenshot 'saved-copy-failure.png'
+    throw 'Export did not publish the original PNG bytes.'
+}
+function Assert-ClipboardImage([string]$Path) {
+    $expected=[IO.File]::ReadAllBytes($Path)
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    $match=$false
+    while($clock.ElapsedMilliseconds -lt 3000){
+        $actual=[CaptureInput]::ClipboardPng($expected.Length)
+        if($actual -and [Convert]::ToBase64String($actual) -eq [Convert]::ToBase64String($expected)){$match=$true;break}
+        Start-Sleep -Milliseconds 25
+    }
+    if(-not $match){throw 'Clipboard PNG does not match the original full source file.'}
+    $source=[Drawing.Bitmap]::new($Path)
+    $image=[System.Windows.Forms.Clipboard]::GetImage()
+    try{
+        if(-not $image -or $image.Width -ne $source.Width -or $image.Height -ne $source.Height){throw 'Native clipboard image paste is missing or cropped to thumbnail dimensions.'}
+        $samples=@(@(0,0),@(($source.Width-1),($source.Height-1)))
+        if($source.Width -eq 350){$samples=@(@(5,170),@(30,30),@(200,30))}
+        foreach($point in $samples){if($image.GetPixel($point[0],$point[1]).ToArgb() -ne $source.GetPixel($point[0],$point[1]).ToArgb()){throw 'Native clipboard image pixels changed.'}}
+    }finally{$source.Dispose();if($image){$image.Dispose()}}
+}
+function Test-Actions {
+    if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run ActionsOnly with pwsh -Sta.'}
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+    Close-AllPreviews
+    Set-AutoClose 'Never' 'never'
+    $first=New-TestPreview
+    Assert-ClipboardImage $first.Shot
+    Write-Host 'PASS: native hotkey capture automatically copies exact PNG bytes and original image pixels'
+    if(-not [CaptureInput]::OpenClipboard([IntPtr]::Zero)){throw 'Could not hold clipboard for busy-lock fixture.'}
+    try{
+        $beforeWindows=[CaptureInput]::ThumbnailWindows($false)
+        $before=@(Get-Shots)
+        [void](Start-Selection -KeepPreviews)
+        [CaptureInput]::HoldAt(($sceneRect.Left+350),($sceneRect.Top+230))
+        Start-Sleep -Milliseconds 75
+        [CaptureInput]::DropAt(($sceneRect.Left+410),($sceneRect.Top+270))
+        [void](Wait-Overlay $false)
+        $shot=Wait-NewShot $before
+        $script:created+=$shot
+        $second=@{Shot=$shot;Window=(Wait-NewPreview $beforeWindows)}
+        Start-Sleep -Milliseconds 200
+    }finally{[void][CaptureInput]::CloseClipboard()}
+    Assert-ClipboardImage $second.Shot
+    Wait-GalleryCounts 2 2
+    Write-Host 'PASS: next capture replaces clipboard; temporary clipboard contention retries without blocking capture'
+
+    [void][CaptureInput]::SetForegroundWindow($sceneWindow)
+    $focus=[CaptureInput]::GetForegroundWindow()
+    Click-PreviewAction $first.Window 'Copy'
+    Assert-ClipboardImage $first.Shot
+    Wait-GalleryCounts 2 2
+    if([CaptureInput]::GetForegroundWindow() -ne $focus){throw 'Copy stole keyboard focus.'}
+    foreach($action in @('Annotate','Upload')){Click-PreviewAction $first.Window $action}
+    Wait-GalleryCounts 2 2
+    if([CaptureInput]::GetForegroundWindow() -ne $focus -or [CaptureInput]::DragWindow() -ne [IntPtr]::Zero){throw 'Disabled placeholder triggered an action or drag.'}
+    Save-GalleryScreenshot 'thumbnail-actions-hover.png'
+    Write-Host 'PASS: Copy restores older original image, placeholders do nothing, preview actions preserve focus'
+
+    Set-AutoClose '5 seconds' '5'
+    Click-PreviewAction $first.Window 'Save'
+    [void](Wait-SaveDialog $true)
+    Start-Sleep -Seconds 6
+    Wait-GalleryCounts 2 2
+    Save-GalleryScreenshot 'save-as-dialog.png'
+    $dialog=Wait-SaveDialog $true
+    $root=[System.Windows.Automation.AutomationElement]::FromHandle($dialog)
+    $cancel=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Cancel'))
+    $bounds=$cancel.Current.BoundingRectangle
+    [CaptureInput]::ClickAt([int]($bounds.X+$bounds.Width/2),[int]($bounds.Y+$bounds.Height/2))
+    [void](Wait-SaveDialog $false)
+    Set-AutoClose 'Never' 'never'
+    Wait-GalleryCounts 2 2
+    if(-not (Test-Path $first.Shot)){throw 'Cancelling Save As removed original PNG.'}
+    Write-Host 'PASS: native Save As pauses all clocks; cancel preserves both thumbnails and source file'
+
+    $destination=Join-Path $artifacts ('Saved image 日本 '+[Guid]::NewGuid().ToString('N')+'.png')
+    $script:created+=$destination
+    Click-PreviewAction $first.Window 'Save'
+    Enter-SavePath $destination
+    Wait-GalleryCounts 1 1
+    Assert-SavedCopy $destination $first.Shot
+    if([CaptureInput]::IsWindow($first.Window)){throw 'Successful unpinned Save As did not dismiss its preview.'}
+    $beforePin=Preview-Rect $second.Window
+    Click-PreviewControl $second.Window -Pin
+    if(-not [CaptureInput]::Pinned($second.Window)){throw 'Save fixture did not pin.'}
+    [IO.File]::WriteAllText($destination,'previous contents')
+    Click-PreviewAction $second.Window 'Save'
+    Enter-SavePath $destination -Overwrite
+    Wait-GalleryCounts 1 1
+    $afterPin=Preview-Rect $second.Window
+    if($afterPin.Left -ne $beforePin.Left -or $afterPin.Top -ne $beforePin.Top -or -not [CaptureInput]::Pinned($second.Window)){throw 'Pinned Save As moved, dismissed or unpinned the card.'}
+    Assert-SavedCopy $destination $second.Shot
+    Write-Host 'PASS: real Save As exports losslessly to Unicode/spaced path, dismisses unpinned, preserves pin and confirms overwrite'
+
+    Click-PreviewAction $second.Window 'Save'
+    [void](Wait-SaveDialog $true)
+    [void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(),0x8008,[IntPtr]::Zero,[IntPtr]::Zero)
+    if(-not $app.WaitForExit(5000) -or $app.ExitCode -ne 0){Save-GalleryScreenshot 'save-quit-failure.png';throw 'Quit did not cancel the active Save As modal dialog.'}
+    [void](Wait-SaveDialog $false)
+    if([CaptureInput]::PendingCount() -ne 0 -or -not (Test-Path $second.Shot)){throw 'Save As shutdown left windows or deleted source PNG.'}
+    Assert-ClipboardImage $first.Shot
+    Write-Host 'PASS: quit safely cancels the native Save As dialog; source files and pasted clipboard image survive shutdown'
+}
 function Test-Fifo {
     Close-AllPreviews
     Set-AutoClose 'Never' 'never'
@@ -1080,10 +1278,11 @@ try {
     Write-Host 'PASS: real app startup cleans expired files, preserves recent/unrelated/locked files'
     Start-Sleep -Milliseconds 350
     if ($Layout) { Test-Layout }
-    if ($FifoOnly) { Test-Fifo }
+    if ($ActionsOnly) { Test-Actions }
+    elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }
     if ($GalleryOnly) {
-        [void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(), 0x8008, [IntPtr]::Zero, [IntPtr]::Zero)
+        if(-not $app.HasExited){[void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(), 0x8008, [IntPtr]::Zero, [IntPtr]::Zero)}
         if (-not $app.WaitForExit(5000) -or $app.ExitCode -ne 0) { throw 'Gallery-only shutdown failed.' }
         return
     }
@@ -1283,6 +1482,7 @@ try {
 } finally {
     if ($cleanupLock) { $cleanupLock.Dispose() }
     # Release synthetic input even when a test fails.
+    if($ActionsOnly){[void][CaptureInput]::CloseClipboard()}
     [CaptureInput]::mouse_event(4 -bor 16, 0, 0, 0, [UIntPtr]::Zero)
     foreach ($key in @(0x10, 0x11, 0x12)) { [CaptureInput]::keybd_event($key, 0, 2, [UIntPtr]::Zero) }
     if ($app -and -not $app.HasExited) { Stop-Process -Id $app.Id -Force }
