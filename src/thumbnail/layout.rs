@@ -124,17 +124,17 @@ impl Layout {
             "Invalid thumbnail dimensions or monitor work area"
         );
         let scale = dpi as f32 / 96.0;
-        // The supplied 1360 x 960 demo places the 260 x 184 card at x=50,
-        // with its bottom 68 pixels above the desktop edge. Anchor to the
-        // capture monitor's work area so the Windows taskbar is never covered.
-        let left_margin = (50.0 * scale).round().min(area.width as f32 / 4.0) as u32;
+        // The default dock is bottom-right. Keep the physical inset relative
+        // to the capture monitor's usable work area, clear of the taskbar.
+        // Placement and per-edge offsets can become settings in a later slice.
+        let right_margin = (50.0 * scale).round().min(area.width as f32 / 4.0) as u32;
         let bottom_margin = (68.0 * scale).round().min(area.height as f32 / 4.0) as u32;
         let padding = (14.0 * scale)
             .round()
-            .min(left_margin.min(bottom_margin) as f32) as u32;
+            .min(right_margin.min(bottom_margin) as f32) as u32;
         let card_width = (260.0 * scale)
             .round()
-            .min(area.width.saturating_sub(left_margin + padding).max(1) as f32)
+            .min(area.width.saturating_sub(right_margin + padding).max(1) as f32)
             as u32;
         let card_height = (184.0 * scale)
             .round()
@@ -145,7 +145,7 @@ impl Layout {
         let width = (card_width + padding * 2).min(area.width);
         let height = (card_height + padding * 2).min(area.height);
         Ok(Self {
-            x: area.left + left_margin.saturating_sub(padding) as i32,
+            x: area.left + (area.width - right_margin - card_width - padding) as i32,
             y: area.top + (area.height - bottom_margin - card_height - padding) as i32,
             width,
             height,
@@ -269,10 +269,15 @@ mod tests {
                     (reference.x, reference.y, reference.width, reference.height)
                 );
                 assert_eq!((layout.card_width, layout.card_height), (260.0, 184.0));
-                let left = layout.x as f32 + layout.card_left * layout.scale;
+                let right = layout.x as f32 + (layout.card_left + layout.card_width) * layout.scale;
                 let bottom =
                     layout.y as f32 + (layout.card_top + layout.card_height) * layout.scale;
-                assert!((left - (area.left as f32 + (50.0 * layout.scale).round())).abs() < 0.01);
+                assert!(
+                    (right
+                        - (area.left as f32 + area.width as f32 - (50.0 * layout.scale).round()))
+                    .abs()
+                        < 0.01
+                );
                 assert!(
                     (bottom
                         - (area.top as f32 + area.height as f32 - (68.0 * layout.scale).round()))

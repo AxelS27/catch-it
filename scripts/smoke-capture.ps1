@@ -360,7 +360,7 @@ function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeig
             if ($rect.Bottom -gt $reservedTop) { throw 'Thumbnail/shadow collides with the actual taskbar (including auto-hide reveal area).' }
         }
     }
-    if ($rect.Left+$padding -ne $work.Left+[int][Math]::Round(50*$scale) -or $rect.Bottom-$padding -ne $effectiveBottom-[int][Math]::Round(68*$scale)) { throw "Quick Access inset differs: card=$($rect.Left+$padding),$($rect.Bottom-$padding) effectiveWork=$($work.Left),$effectiveBottom dpi=$scale." }
+    if ($rect.Right-$padding -ne $work.Right-[int][Math]::Round(50*$scale) -or $rect.Bottom-$padding -ne $effectiveBottom-[int][Math]::Round(68*$scale)) { throw "Quick Access inset differs: cardRight=$($rect.Right-$padding),cardBottom=$($rect.Bottom-$padding) effectiveWorkRight=$($work.Right),effectiveWorkBottom=$effectiveBottom dpi=$scale." }
     $cover = [Math]::Max($cardWidth/$ImageWidth, $cardHeight/$ImageHeight)
     $cropLeft = ($ImageWidth-$cardWidth/$cover)/2
     $cropTop = ($ImageHeight-$cardHeight/$cover)/2
@@ -746,7 +746,7 @@ function Assert-Stack($Records) {
         # Native windows include overlapping transparent shadow/margin padding.
         if($previous -and ($rect.Left -ne $previous.Left -or $rect.Bottom-[int][Math]::Round(14*$scale) -gt $previous.Top+[int][Math]::Round(14*$scale))){
             Save-GalleryScreenshot 'gallery-order-failure.png'
-            throw 'Stack must be one left-aligned column, oldest below newest, without overlap.'
+            throw 'Stack must be one right-aligned column, oldest below newest, without overlap.'
         }
         $previous=$rect
     }

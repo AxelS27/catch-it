@@ -521,7 +521,7 @@ impl Surface {
             visual.SetEffect(&opacity)?;
             // Commit a transparent initial state before showing the popup.
             opacity.SetOpacity2(0.0)?;
-            visual.SetOffsetX2(-24.0 * layout.scale)?;
+            visual.SetOffsetX2(24.0 * layout.scale)?;
             target.SetRoot(&visual)?;
             compositor.composition.Commit()?;
             Ok(Self {
@@ -578,15 +578,15 @@ impl Surface {
 
     pub fn appear(&mut self) -> Result<()> {
         self.started = Some(Instant::now());
-        self.animate(-24.0 * self.layout.scale, 0.0, 0.0, 1.0, self.timing.appear)
+        self.animate(24.0 * self.layout.scale, 0.0, 0.0, 1.0, self.timing.appear)
     }
 
     pub fn dismiss_after_drag(&self) -> Result<()> {
         // The original remains at 45% throughout OLE's modal loop, then
-        // exits toward the left without flashing back to full opacity.
+        // exits toward the right without flashing back to full opacity.
         self.animate(
             0.0,
-            -(self.layout.width as f32),
+            self.layout.width as f32,
             0.45,
             0.0,
             self.timing.dismiss,
@@ -602,8 +602,8 @@ impl Surface {
             1.0 - (1.0 - t).powi(3)
         });
         self.animate(
-            -24.0 * self.layout.scale * (1.0 - progress),
-            -(self.layout.width as f32),
+            24.0 * self.layout.scale * (1.0 - progress),
+            self.layout.width as f32,
             progress,
             0.0,
             self.timing.dismiss,
