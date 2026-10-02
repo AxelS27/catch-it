@@ -4,17 +4,19 @@
 
 A very lightweight Windows screenshot utility that reproduces the native macOS floating screenshot experience as closely as the Windows platform allows.
 
-Native macOS is the behavioral and visual reference, not merely aesthetic inspiration. Floating thumbnail geometry, animation, timeout, hover, dismissal, and drag interactions must be validated against an observed macOS reference. This does not expand the scope to include the macOS screenshot editor.
+Native macOS is the behavioral and visual reference, not merely aesthetic inspiration. Floating thumbnail geometry, animation, timeout, hover, dismissal, and drag interactions must be validated against an observed macOS reference. The initial baseline excluded editing; the newly approved annotation milestone uses CleanShot X's image Annotate editor as its UI/UX reference.
 
 The application has one primary purpose:
 
 > Take a screenshot, show it temporarily as a floating thumbnail in the bottom-right corner, and allow the user to drag and drop that screenshot anywhere.
 
-No screenshot editor, library, annotation tools, account system, or complex UI.
+The capture baseline has no screenshot editor or annotation tools implemented. A library, account system, and unrelated complex UI remain excluded.
 
 **Approved follow-up milestone:** add a CleanShot-inspired pending thumbnail queue, persistent pinned reference cards, and a configurable auto-close timer through the native tray. This is a limited Windows extension, not a complete CleanShot clone. Our screen-derived stack capacity and timer defaults are design choices; CleanShot's exact overflow layout, default lifetime, and hover semantics are not yet verified.
 
 ---
+
+**New approved annotation milestone:** implement a native image editor matching CleanShot X Annotate's UI and interactions, not merely its tool list. Research, observed references, implementation slices, and exact-parity validation gaps are recorded in [docs/annotation-cleanshot-research.md](docs/annotation-cleanshot-research.md). This includes editable annotations, privacy/emphasis tools, crop/resize/rotate/flip, backgrounds, multi-image composition, and an own-format editable project. Annotation remains unimplemented; cloud, accounts, recording, and a screenshot library remain excluded. Exact parity cannot be claimed from marketing videos alone.
 
 ## 2. Core User Flow
 
@@ -316,7 +318,7 @@ The initial baseline contains:
 8. Automatic thumbnail dismissal
 9. Temporary file cleanup
 
-The approved follow-up adds a session-only multi-thumbnail queue, pinned reference cards, native timer choices, and close-all as specified in section 5.3. An editor or screenshot library is still excluded.
+The approved capture follow-up adds a session-only multi-thumbnail queue, pinned reference cards, native timer choices, and close-all as specified in section 5.3. The separately approved annotation follow-up is specified in [docs/annotation-cleanshot-research.md](docs/annotation-cleanshot-research.md); it does not add a screenshot library.
 
 ---
 
@@ -324,15 +326,10 @@ The approved follow-up adds a session-only multi-thumbnail queue, pinned referen
 
 Do **NOT** implement:
 
-- Screenshot editor
-- Drawing
-- Arrows
-- Text annotations
-- Cropping after capture
 - Screenshot history UI
 - Cloud sync
 - Login/account
-- OCR
+- Standalone OCR/text-recognition feature (internal text detection for the approved Smart Highlighter is allowed)
 - AI features
 - Recording
 - GIF capture

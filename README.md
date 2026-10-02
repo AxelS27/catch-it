@@ -2,7 +2,11 @@
 
 A lightweight Windows screenshot utility with floating capture previews, file drag/drop, a pending queue, and persistent reference cards. The initial macOS-inspired flow and approved CleanShot-inspired extension are described in [PRD.md](PRD.md). Exact reference parity is not claimed.
 
-## Current milestone: thumbnail actions, Save As, and automatic image clipboard
+## Next milestone: CleanShot X-style annotation
+
+The native image editor is now approved. Its UI/UX research, official video references, tool behavior, delivery slices, and remaining exact-parity measurements are in [docs/annotation-cleanshot-research.md](docs/annotation-cleanshot-research.md). Research is complete enough to begin implementation, but no editor runtime has been added yet; Annotate remains disabled. Exact installed-version parity is still unvalidated.
+
+## Current implemented milestone: thumbnail actions, Save As, and automatic image clipboard
 
 Implemented:
 
