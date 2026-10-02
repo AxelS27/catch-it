@@ -25,18 +25,18 @@ fn dark_from_value(value: Option<u32>) -> bool {
     value == Some(0)
 }
 
-/// High-contrast neutral outline; blue remains an action accent, not a frame.
+/// Match the Windows app appearance: dark frame in dark mode, light in light mode.
 pub fn border_rgb(dark: bool) -> u32 {
-    if dark { 0xffffff } else { 0x000000 }
+    if dark { 0x000000 } else { 0xffffff }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn border_contrasts_with_both_windows_appearances() {
-        assert_eq!(border_rgb(true), 0xffffff);
-        assert_eq!(border_rgb(false), 0x000000);
+    fn border_matches_both_windows_appearances() {
+        assert_eq!(border_rgb(true), 0x000000);
+        assert_eq!(border_rgb(false), 0xffffff);
         assert!(dark_from_value(Some(0)));
         assert!(!dark_from_value(Some(1)));
         assert!(!dark_from_value(None));

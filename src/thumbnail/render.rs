@@ -202,7 +202,7 @@ fn compose(
             D2D1_COMPOSITE_MODE_SOURCE_OVER,
         );
         let controls_result = (|| {
-            let neutral = if dark { 1.0 } else { 0.0 };
+            let neutral = if dark { 0.0 } else { 1.0 };
             let border = context.CreateSolidColorBrush(
                 &D2D1_COLOR_F {
                     r: neutral,

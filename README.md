@@ -33,7 +33,7 @@ Implemented:
 - Floating preview in the capture monitor's bottom-left usable area, above the actual shell taskbar even when Windows reports an incorrect work area. Reserve taskbar thickness for auto-hide reveal too.
 - Fixed 260 x 184 logical-pixel rounded card with a subtle shadow; screenshot content fills the card using a centered cover crop, preserving aspect ratio without stretching or letterboxing. Preview cropping never changes the saved PNG. Only DPI or a very small available work area changes the card size.
 - Rasterize the card once before composing its shadow, avoiding the Direct2D layer-reuse error reproduced with full-screen captures.
-- DirectComposition slide/fade animations, without per-frame CPU repainting. The card outline is white in Windows dark app mode and black in light app mode; custom colors/gradients are not implemented yet.
+- DirectComposition slide/fade animations, without per-frame CPU repainting. The card outline is black in Windows dark app mode and white in light app mode; custom colors/gradients are not implemented yet.
 - No keyboard focus activation when showing, hovering, copying, pinning, or dismissing the preview. Save intentionally opens a normal native dialog with keyboard focus.
 - Monotonic timeout that pauses on hover and resumes the remaining time after mouse exit. Auto-dismiss is FIFO per visible monitor stack: oldest unpinned card exits first; newer cards wait until its exit finishes, even if their own budgets have already elapsed. Hovering the oldest holds automatic dismissal behind it. Manual close and successful file drops are not FIFO-gated.
 - Event-driven timers: no recurring timer for an idle pin, hovered card, Never setting, or dismissed gallery.

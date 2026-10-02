@@ -397,7 +397,7 @@ function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeig
         # All fixtures here inspect the newly created (highlighted) card.
         $light = (Get-ItemPropertyValue 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' 'AppsUseLightTheme' -ErrorAction SilentlyContinue) -ne 0
         $border = $bitmap.GetPixel(($padding+[int]($cardWidth/2)), ($padding+1))
-        if (($light -and $border.R -gt 35) -or (-not $light -and $border.R -lt 220)) { throw "Quick Access border must be $(if($light){'black'}else{'white'}) in this Windows app theme, got $border." }
+        if (($light -and ($border.R -lt 220 -or $border.G -lt 220 -or $border.B -lt 220)) -or (-not $light -and ($border.R -gt 35 -or $border.G -gt 35 -or $border.B -gt 35))) { throw "Quick Access border must be $(if($light){'white'}else{'black'}) in this Windows app theme, got $border." }
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
     if ($ExpectedCount -gt 0 -and [CaptureInput]::ThumbnailCount() -ne $ExpectedCount) { throw "Expected $ExpectedCount visible previews." }
     return $rect
