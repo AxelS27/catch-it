@@ -325,11 +325,8 @@ pub(super) unsafe extern "system" fn window_proc(
                     if s.pressed == Some(Control::Drag) {
                         s.drag_start = Some(p);
                     }
-                    if s.layout.canvas.contains(p.0, p.1) && s.ready() {
-                        s.pan_start = Some((p, s.view.pan));
-                    }
                     (
-                        s.pressed.is_some() || s.pan_start.is_some(),
+                        s.pressed.is_some(),
                         p.1 >= s.layout.height - layout::BOTTOM && s.layout.hit(p.0, p.1).is_none(),
                     )
                 };
@@ -344,6 +341,32 @@ pub(super) unsafe extern "system" fn window_proc(
                         Some(WPARAM(HTCAPTION as usize)),
                         Some(LPARAM(0)),
                     );
+                }
+                LRESULT(0)
+            }
+            WM_MBUTTONDOWN => {
+                let s = &mut *ptr;
+                let p = s.point(lparam);
+                if !s.palette_open
+                    && s.pressed.is_none()
+                    && s.drag_start.is_none()
+                    && s.layout.canvas.contains(p.0, p.1)
+                    && s.ready()
+                {
+                    s.pan_start = Some((p, s.view.pan));
+                    let _ = SetFocus(Some(hwnd));
+                    SetCapture(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_MBUTTONUP => {
+                let s = &mut *ptr;
+                if s.pan_start.take().is_some()
+                    && GetCapture() == hwnd
+                    && s.pressed.is_none()
+                    && s.drag_start.is_none()
+                {
+                    let _ = ReleaseCapture();
                 }
                 LRESULT(0)
             }
@@ -396,7 +419,6 @@ pub(super) unsafe extern "system" fn window_proc(
                 {
                     let s = &mut *ptr;
                     let p = s.point(lparam);
-                    s.pan_start = None;
                     s.drag_start = None;
                     if s.palette_open {
                         if let Some(index) = s.layout.palette_hit(p.0, p.1) {
@@ -408,7 +430,7 @@ pub(super) unsafe extern "system" fn window_proc(
                             s.palette_open = false;
                         }
                         let _ = InvalidateRect(Some(hwnd), None, false);
-                        if GetCapture() == hwnd {
+                        if GetCapture() == hwnd && s.pan_start.is_none() {
                             let _ = ReleaseCapture();
                         }
                         return LRESULT(0);
@@ -420,7 +442,7 @@ pub(super) unsafe extern "system" fn window_proc(
                         invoke(s, hwnd, c);
                     }
                 }
-                if GetCapture() == hwnd {
+                if GetCapture() == hwnd && (&*ptr).pan_start.is_none() {
                     let _ = ReleaseCapture();
                 }
                 LRESULT(0)

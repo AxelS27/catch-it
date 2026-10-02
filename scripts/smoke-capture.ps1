@@ -87,6 +87,8 @@ public static class CaptureInput {
         if (SendInput(2, inputs, Marshal.SizeOf(typeof(Input))) != 2) { throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
     }
     public static void HoldAt(int x, int y) { ClickAt(x, y, 2, 0); }
+    public static void HoldMiddleAt(int x, int y) { ClickAt(x, y, 0x20, 0); }
+    public static void DropMiddleAt(int x, int y) { ClickAt(x, y, 0, 0x40); }
     public static void DropAt(int x, int y) {
         int dx = (int)(((long)(x - GetSystemMetrics(76)) * 65536 + 32768) / GetSystemMetrics(78));
         int dy = (int)(((long)(y - GetSystemMetrics(77)) * 65536 + 32768) / GetSystemMetrics(79));
@@ -1064,15 +1066,17 @@ function Test-Editor {
     $cx=[int](($bounds.Left+$bounds.Right)/2);$cy=[int](($bounds.Top+$bounds.Bottom)/2)
     [CaptureInput]::MouseAt(100,100,0);Assert-EditorScreenColor ([int]($cx+20*$s)) $cy 'Lime'
     [CaptureInput]::HoldAt($cx,$cy);[CaptureInput]::MouseAt(([int]($cx+60*$s)),$cy,0);[CaptureInput]::DropAt(([int]($cx+60*$s)),$cy)
+    [CaptureInput]::MouseAt(100,100,0);Assert-EditorScreenColor ([int]($cx+20*$s)) $cy 'Lime'
+    [CaptureInput]::HoldMiddleAt($cx,$cy);[CaptureInput]::MouseAt(([int]($cx+60*$s)),$cy,0);[CaptureInput]::DropMiddleAt(([int]($cx+60*$s)),$cy)
     [CaptureInput]::MouseAt(100,100,0);Assert-EditorScreenColor ([int]($cx+20*$s)) $cy 'Red'
-    [CaptureInput]::HoldAt($cx,$cy);[CaptureInput]::MouseAt(([int]($cx-60*$s)),$cy,0);Start-Sleep -Milliseconds 100
-    Press-Key 27;[CaptureInput]::DropAt(([int]($cx-60*$s)),$cy);[CaptureInput]::MouseAt(100,100,0)
+    [CaptureInput]::HoldMiddleAt($cx,$cy);[CaptureInput]::MouseAt(([int]($cx-60*$s)),$cy,0);Start-Sleep -Milliseconds 100
+    Press-Key 27;[CaptureInput]::DropMiddleAt(([int]($cx-60*$s)),$cy);[CaptureInput]::MouseAt(100,100,0)
     Assert-EditorScreenColor ([int]($cx+20*$s)) $cy 'Red'
     Press-EditorChord 0x30
     Assert-EditorPixels $editor $first.Shot
     [void][CaptureInput]::MoveWindow($editor,450,180,800,520,$true)
     Assert-EditorPixels $editor $first.Shot
-    Write-Host 'PASS: native zoom menu, actual pan/Escape rollback, Fit and resize share correct geometry; Copy exports original pixels, not viewport'
+    Write-Host 'PASS: left drag leaves viewport unchanged; middle-button pan/Escape rollback, Fit and resize share correct geometry; Copy exports original pixels, not viewport'
 
     Click-EditorAction $editor 'Save';[void](Wait-SaveDialog $true)
     Press-Key 27;[void](Wait-SaveDialog $false)
@@ -1801,7 +1805,7 @@ try {
     if ($cleanupLock) { $cleanupLock.Dispose() }
     # Release synthetic input even when a test fails.
     if($ActionsOnly){[void][CaptureInput]::CloseClipboard()}
-    [CaptureInput]::mouse_event(4 -bor 16, 0, 0, 0, [UIntPtr]::Zero)
+    [CaptureInput]::mouse_event(4 -bor 16 -bor 64, 0, 0, 0, [UIntPtr]::Zero)
     foreach ($key in @(0x10, 0x11, 0x12)) { [CaptureInput]::keybd_event($key, 0, 2, [UIntPtr]::Zero) }
     if ($app -and -not $app.HasExited) { Stop-Process -Id $app.Id -Force }
     if ($sceneProcess -and -not $sceneProcess.HasExited) { Stop-Process -Id $sceneProcess.Id -Force }

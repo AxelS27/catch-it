@@ -64,7 +64,7 @@ impl Control {
             Self::Crop => "Crop",
             Self::AddImage => "Add image",
             Self::Background => "Background",
-            Self::Move => "Move / pan",
+            Self::Move => "Move / pan (hold middle mouse button)",
             Self::Rectangle => "Rectangle",
             Self::Fill => "Filled rectangle",
             Self::Ellipse => "Ellipse",
