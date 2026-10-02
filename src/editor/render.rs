@@ -523,18 +523,11 @@ impl Renderer {
             self.soft_chrome(0.0, layout.width, 48.0);
             self.soft_chrome(layout.height - 48.0, layout.width, 48.0);
         }
-        if layout.width >= super::layout::MIN_WIDTH {
-            self.pill(
-                Rect {
-                    x: 132.0,
-                    y: 8.0,
-                    w: 352.0,
-                    h: 32.0,
-                },
-                group,
-                16.0,
-            );
-            for x in [164.5, 222.5, 280.5, 367.5, 425.5] {
+        if let Some(strip) = layout.tool_strip_rect() {
+            self.pill(strip, group, 16.0);
+            let first = strip.x + 4.0;
+            for offset in [28.5, 86.5, 144.5, 231.5, 289.5] {
+                let x = first + offset;
                 self.line(
                     (x, 17.0),
                     (x, 31.0),

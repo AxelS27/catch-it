@@ -912,8 +912,15 @@ function Wait-Editor([bool]$Visible=$true) {
     Save-GalleryScreenshot 'editor-failure.png'
     throw "Editor visibility did not become $Visible."
 }
+function Editor-ToolOrigin([IntPtr]$Window) {
+    $r=[CaptureInput]::ClientBounds($Window);$s=[CaptureInput]::GetDpiForWindow($Window)/96.0
+    $width=($r.Right-$r.Left)/$s
+    $span=if($width -ge 870){484.0}else{348.0}
+    return [Math]::Min([Math]::Max(($width-$span)/2,132.0),$width-242.0-$span)
+}
 function Click-EditorAction([IntPtr]$Window,[string]$Action) {
     $r=[CaptureInput]::ClientBounds($Window);$s=[CaptureInput]::GetDpiForWindow($Window)/96.0
+    $origin=Editor-ToolOrigin $Window
     switch($Action){
         'Save' {$x=$r.Right-186*$s;$y=$r.Top+24*$s}
         'Minimize' {$x=$r.Right-105*$s;$y=$r.Top+24*$s}
@@ -921,8 +928,8 @@ function Click-EditorAction([IntPtr]$Window,[string]$Action) {
         'Close' {$x=$r.Right-21*$s;$y=$r.Top+24*$s}
         'Copy' {$x=$r.Right-68*$s;$y=$r.Bottom-24*$s}
         'Zoom' {$x=$r.Left+56*$s;$y=$r.Bottom-24*$s}
-        'Rectangle' {$x=$r.Left+164*$s;$y=$r.Top+24*$s}
-        'Color' {$x=$r.Left+517*$s;$y=$r.Top+24*$s}
+        'Rectangle' {$x=$r.Left+($origin+43)*$s;$y=$r.Top+24*$s}
+        'Color' {$x=$r.Left+($origin+381)*$s;$y=$r.Top+24*$s}
         default {throw 'Unknown editor action'}
     }
     [CaptureInput]::ClickAt([int]$x,[int]$y)
@@ -997,20 +1004,22 @@ function Test-Editor {
     Write-Host 'PASS: real Annotate opens one activated native editor, original full-resolution pixels, disabled drawing tools are inert'
 
     $bounds=[CaptureInput]::ClientBounds($editor);$scale=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $colorX=[int]($bounds.Left+((Editor-ToolOrigin $editor)+381)*$scale)
+    $swatchX=[int]($colorX-4*$scale)
     Click-EditorAction $editor 'Color'
-    Assert-EditorPalettePixel ([int]($bounds.Left+517*$scale)) ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::FromArgb(249,45,58).ToArgb())
+    Assert-EditorPalettePixel $colorX ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::FromArgb(249,45,58).ToArgb())
     Save-GalleryScreenshot 'editor-palette.png'
-    [CaptureInput]::ClickAt([int]($bounds.Left+517*$scale),[int]($bounds.Top+102*$scale))
-    Assert-EditorPalettePixel ([int]($bounds.Left+513*$scale)) ([int]($bounds.Top+24*$scale)) ([Drawing.Color]::FromArgb(249,45,58).ToArgb())
+    [CaptureInput]::ClickAt($colorX,[int]($bounds.Top+102*$scale))
+    Assert-EditorPalettePixel $swatchX ([int]($bounds.Top+24*$scale)) ([Drawing.Color]::FromArgb(249,45,58).ToArgb())
     Click-EditorAction $editor 'Color';Press-Key 0x28;Press-Key 0x0d
-    Assert-EditorPalettePixel ([int]($bounds.Left+513*$scale)) ([int]($bounds.Top+24*$scale)) ([Drawing.Color]::FromArgb(254,129,1).ToArgb())
+    Assert-EditorPalettePixel $swatchX ([int]($bounds.Top+24*$scale)) ([Drawing.Color]::FromArgb(254,129,1).ToArgb())
     Click-EditorAction $editor 'Color'
-    [CaptureInput]::ClickAt([int]($bounds.Left+517*$scale),[int]($bounds.Top+198*$scale))
+    [CaptureInput]::ClickAt($colorX,[int]($bounds.Top+198*$scale))
     Click-EditorAction $editor 'Color';Press-Key 27
-    Assert-EditorPalettePixel ([int]($bounds.Left+517*$scale)) ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::White.ToArgb())
+    Assert-EditorPalettePixel $colorX ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::White.ToArgb())
     Click-EditorAction $editor 'Color'
     [CaptureInput]::ClickAt([int]($bounds.Left+400*$scale),[int]($bounds.Top+400*$scale))
-    Assert-EditorPalettePixel ([int]($bounds.Left+517*$scale)) ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::White.ToArgb())
+    Assert-EditorPalettePixel $colorX ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::White.ToArgb())
     Write-Host 'PASS: native color menu matches video swatch order; pointer/keyboard selection and Escape/outside dismissal work'
 
     Click-EditorAction $editor 'Maximize'
@@ -1024,7 +1033,7 @@ function Test-Editor {
     if(-not [CaptureInput]::IsIconic($editor)){throw 'Custom minimize button failed.'}
     [void][CaptureInput]::ShowWindow($editor,9)
     $before=Preview-Rect $editor;$client=[CaptureInput]::ClientBounds($editor);$dpi=[CaptureInput]::GetDpiForWindow($editor)/96.0
-    $startX=[int]($client.Left+700*$dpi);$startY=[int]($client.Top+24*$dpi)
+    $startX=[int]($client.Left+180*$dpi);$startY=[int]($client.Top+24*$dpi)
     [CaptureInput]::HoldAt($startX,$startY)
     [CaptureInput]::MouseAt(($startX+60),($startY+20),0)
     [CaptureInput]::DropAt(($startX+60),($startY+20))

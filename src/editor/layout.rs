@@ -110,8 +110,26 @@ pub struct Layout {
     pub controls: Vec<(Control, Rect)>,
 }
 impl Layout {
+    fn tool_origin(width: f32) -> f32 {
+        // Center the drawing strip together with its contextual properties,
+        // as seen in markup.mp4. Reserve utilities at left and Save/window
+        // controls at right. Narrow windows omit the properties instead.
+        let span = if width >= 870.0 { 484.0 } else { 348.0 };
+        ((width - span) / 2.0).max(132.0).min(width - 242.0 - span)
+    }
+    pub fn tool_strip_rect(&self) -> Option<Rect> {
+        let first = self.rect(Control::Move)?;
+        let last = self.rect(Control::Highlighter)?;
+        Some(Rect {
+            x: first.x - 4.0,
+            y: first.y,
+            w: last.x + last.w + 4.0 - (first.x - 4.0),
+            h: first.h,
+        })
+    }
     pub fn new(width: f32, height: f32) -> Self {
         let mut controls = Vec::new();
+        let tool_origin = Self::tool_origin(width);
         for (i, control) in [Control::Crop, Control::AddImage, Control::Background]
             .into_iter()
             .enumerate()
@@ -146,7 +164,7 @@ impl Layout {
             controls.push((
                 control,
                 Rect {
-                    x: 136.0 + i as f32 * 29.0,
+                    x: tool_origin + i as f32 * 29.0,
                     y: 8.0,
                     w: 28.0,
                     h: 32.0,
@@ -160,7 +178,7 @@ impl Layout {
             controls.push((
                 control,
                 Rect {
-                    x: 498.0 + i as f32 * 42.0,
+                    x: tool_origin + 362.0 + i as f32 * 42.0,
                     y: 8.0,
                     w: 38.0,
                     h: 32.0,
@@ -419,6 +437,26 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+    #[test]
+    fn drawing_tools_and_properties_are_centered_when_space_allows() {
+        for width in [1040.0, 1200.0, 1400.0] {
+            let l = Layout::new(width, 700.0);
+            let first = l.rect(Control::Move).unwrap();
+            let last = l.rect(Control::Style).unwrap();
+            assert!(((first.x + last.x + last.w) / 2.0 - width / 2.0).abs() < 0.01);
+            assert!(first.x >= l.rect(Control::Background).unwrap().x + 44.0);
+            assert!(last.x + last.w + 8.0 <= l.rect(Control::Save).unwrap().x);
+        }
+        for width in [MIN_WIDTH, 800.0, 870.0, 960.0] {
+            let l = Layout::new(width, 700.0);
+            let last = l
+                .rect(Control::Style)
+                .or_else(|| l.rect(Control::Highlighter))
+                .unwrap();
+            assert!(last.x + last.w + 8.0 <= l.rect(Control::Save).unwrap().x);
+            assert!(l.rect(Control::Move).unwrap().x >= 132.0);
         }
     }
     #[test]
