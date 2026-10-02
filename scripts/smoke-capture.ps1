@@ -8,10 +8,11 @@ param(
     [switch]$GalleryOnly,
     [switch]$FifoOnly,
     [switch]$ActionsOnly,
+    [switch]$QuickAccessOnly,
     [switch]$EditorOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $EditorOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $EditorOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -343,10 +344,10 @@ function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeig
     $work = [System.Windows.Forms.Screen]::FromHandle($Window).WorkingArea
     if ($rect.Right -gt $work.Right -or $rect.Bottom -gt $work.Bottom -or $rect.Left -lt $work.Left -or $rect.Top -lt $work.Top) { throw 'Preview is outside the monitor work area.' }
     $padding = [int][Math]::Round(14 * $scale, [MidpointRounding]::AwayFromZero)
-    $margin = [int][Math]::Round(18 * $scale, [MidpointRounding]::AwayFromZero)
-    $cardWidth = $rect.Right - $rect.Left - $padding - $margin
-    $cardHeight = $rect.Bottom - $rect.Top - $padding - $margin
-    if ($cardWidth -ne [int][Math]::Round(220*$scale) -or $cardHeight -ne [int][Math]::Round(160*$scale)) { throw 'Thumbnail card is not fixed at 220x160 logical pixels.' }
+    $cardWidth = $rect.Right - $rect.Left - 2*$padding
+    $cardHeight = $rect.Bottom - $rect.Top - 2*$padding
+    if ($cardWidth -ne [int][Math]::Round(260*$scale) -or $cardHeight -ne [int][Math]::Round(184*$scale)) { throw 'Quick Access card is not 260x184 logical pixels.' }
+    $effectiveBottom = $work.Bottom
     $taskbar = [CaptureInput]::TaskbarWindow()
     if ($taskbar -ne [IntPtr]::Zero) {
         $bar = New-Object CaptureInput+Rect
@@ -354,9 +355,11 @@ function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeig
         $bounds = [System.Windows.Forms.Screen]::FromHandle($Window).Bounds
         if ($bar.Right -gt $bounds.Left -and $bar.Left -lt $bounds.Right -and $bar.Top -gt $bounds.Top + $bounds.Height/2 -and $bar.Bottom-$bar.Top -lt $bar.Right-$bar.Left) {
             $reservedTop = $bounds.Bottom - ($bar.Bottom-$bar.Top)
-            if ($rect.Bottom -gt $reservedTop -or $rect.Bottom-$margin -gt $reservedTop-$margin) { throw 'Thumbnail/shadow collides with the actual taskbar (including auto-hide reveal area).' }
+            $effectiveBottom = [Math]::Min($effectiveBottom, $reservedTop)
+            if ($rect.Bottom -gt $reservedTop) { throw 'Thumbnail/shadow collides with the actual taskbar (including auto-hide reveal area).' }
         }
     }
+    if ($rect.Left+$padding -ne $work.Left+[int][Math]::Round(50*$scale) -or $rect.Bottom-$padding -ne $effectiveBottom-[int][Math]::Round(68*$scale)) { throw "Quick Access inset differs: card=$($rect.Left+$padding),$($rect.Bottom-$padding) effectiveWork=$($work.Left),$effectiveBottom dpi=$scale." }
     $cover = [Math]::Max($cardWidth/$ImageWidth, $cardHeight/$ImageHeight)
     $cropLeft = ($ImageWidth-$cardWidth/$cover)/2
     $cropTop = ($ImageHeight-$cardHeight/$cover)/2
@@ -464,13 +467,22 @@ function Begin-PreviewDrag([IntPtr]$Window, [int]$TargetX, [int]$TargetY, [switc
     }
 }
 function Save-DragVisual([string]$Name, [int]$X, [int]$Y) {
-    $bitmap = New-Object System.Drawing.Bitmap 320, 240
+    $window = [CaptureInput]::DragWindow()
+    if ($window -eq [IntPtr]::Zero) { throw 'Native drag preview did not appear.' }
+    $rect = New-Object CaptureInput+Rect
+    [void][CaptureInput]::GetWindowRect($window, [ref]$rect)
+    $scale = [CaptureInput]::GetDpiForWindow($window)/96.0
+    $width = $rect.Right-$rect.Left; $height = $rect.Bottom-$rect.Top
+    if ($width -ne [int][Math]::Round(260*$scale*.615) -or $height -ne [int][Math]::Round(184*$scale*.615)) { throw "Drag preview dimensions differ: ${width}x${height}." }
+    if ($rect.Right -ne $X+[int][Math]::Round(8*$scale) -or $rect.Bottom -ne $Y+[int][Math]::Round(20*$scale)) { throw 'Drag image does not follow the pointer at its reference corner.' }
+    $bitmap = New-Object System.Drawing.Bitmap $width, $height
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
     try {
-        $graphics.CopyFromScreen($X-160, $Y-120, 0, 0, $bitmap.Size)
+        $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
         $bitmap.Save((Join-Path $artifacts $Name), [System.Drawing.Imaging.ImageFormat]::Png)
-        foreach ($sample in @(@(80,80,[Drawing.Color]::Red), @(200,80,[Drawing.Color]::Lime), @(80,160,[Drawing.Color]::Blue))) {
-            if ($bitmap.GetPixel($sample[0], $sample[1]).ToArgb() -ne $sample[2].ToArgb()) { throw 'Drag image is missing, moved away from the pointer, or has incorrect colors.' }
+        foreach ($sample in @(@(.20,.27,[Drawing.Color]::Red), @(.76,.27,[Drawing.Color]::Lime), @(.25,.80,[Drawing.Color]::Blue))) {
+            $actual = $bitmap.GetPixel([int]($sample[0]*$width), [int]($sample[1]*$height))
+            if ($actual.ToArgb() -ne $sample[2].ToArgb()) { throw "Drag image is missing or incorrectly cropped: $actual instead of $($sample[2])." }
         }
     } finally { $graphics.Dispose(); $bitmap.Dispose() }
 }
@@ -727,9 +739,9 @@ function Assert-Stack($Records) {
         $rect=Preview-Rect $record.Window
         $scale=[CaptureInput]::GetDpiForWindow($record.Window)/96.0
         # Native windows include overlapping transparent shadow/margin padding.
-        if($previous -and ($rect.Left -ne $previous.Left -or $rect.Bottom-[int][Math]::Round(18*$scale) -gt $previous.Top+[int][Math]::Round(14*$scale))){
+        if($previous -and ($rect.Left -ne $previous.Left -or $rect.Bottom-[int][Math]::Round(14*$scale) -gt $previous.Top+[int][Math]::Round(14*$scale))){
             Save-GalleryScreenshot 'gallery-order-failure.png'
-            throw 'Stack must be one right-aligned column, oldest below newest, without overlap.'
+            throw 'Stack must be one left-aligned column, oldest below newest, without overlap.'
         }
         $previous=$rect
     }
@@ -737,10 +749,10 @@ function Assert-Stack($Records) {
 function Click-PreviewAction([IntPtr]$Window,[string]$Action) {
     $rect=Preview-Rect $Window
     $scale=[CaptureInput]::GetDpiForWindow($Window)/96.0
-    $x=[int]($rect.Left+124*$scale)
-    $y=[int]($rect.Top+$(if($Action -eq 'Copy'){74}else{114})*$scale)
-    if($Action -eq 'Annotate'){$x=[int]($rect.Left+32*$scale);$y=[int]($rect.Top+156*$scale)}
-    if($Action -eq 'Upload'){$x=[int]($rect.Right-36*$scale);$y=[int]($rect.Top+156*$scale)}
+    $x=[int]($rect.Left+144*$scale)
+    $y=[int]($rect.Top+$(if($Action -eq 'Copy'){84}else{132})*$scale)
+    if($Action -eq 'Annotate'){$x=[int]($rect.Left+35*$scale);$y=[int]($rect.Top+177*$scale)}
+    if($Action -eq 'Upload'){$x=[int]($rect.Right-35*$scale);$y=[int]($rect.Top+177*$scale)}
     [CaptureInput]::MouseAt($x,$y,0)
     Start-Sleep -Milliseconds 100
     [CaptureInput]::ClickAt($x,$y)
@@ -1414,7 +1426,7 @@ function Test-Tray {
     [void](Wait-Overlay $false)
     Write-Host 'PASS: capture hotkey closes an open tray menu and starts selection without reentering App'
 }
-function Test-DragDrop {
+function Test-DragDrop([switch]$PreviewOnly) {
     $targetX = $sceneRect.Left + 400
     $targetY = $sceneRect.Top + 250
     $record = New-TestPreview
@@ -1422,6 +1434,8 @@ function Test-DragDrop {
     Wait-DragLog 'Drag started:'
     [CaptureInput]::MouseAt($targetX, $targetY, 0)
     Start-Sleep -Milliseconds 150
+    if (-not [CaptureInput]::IsWindowVisible($record.Window)) { throw 'Source card disappeared instead of dimming behind drag.' }
+    Save-GalleryScreenshot 'quickaccess-drag-desktop.png'
     Save-DragVisual 'drag-unsupported.png' $targetX $targetY
     if ([CaptureInput]::GetForegroundWindow() -ne $record.Foreground) { throw 'Dragging stole keyboard focus.' }
     $hold = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1481,6 +1495,7 @@ function Test-DragDrop {
     if ((Get-FileHash -LiteralPath $copy).Hash -ne $hash) { throw 'Explorer copy has incorrect bytes.' }
     Write-Host 'PASS: real Explorer drop copies identical PNG bytes and keeps the source'
     Remove-Item -LiteralPath $copy
+    if ($PreviewOnly) { return }
 
     $record=New-TestPreview
     Click-PreviewControl $record.Window -Pin
@@ -1599,7 +1614,8 @@ try {
     Write-Host 'PASS: real app startup cleans expired files, preserves recent/unrelated/locked files'
     Start-Sleep -Milliseconds 350
     if ($Layout) { Test-Layout }
-    if ($EditorOnly) { Test-Editor }
+    if ($QuickAccessOnly) { Test-DragDrop -PreviewOnly }
+    elseif ($EditorOnly) { Test-Editor }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }

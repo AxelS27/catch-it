@@ -28,7 +28,7 @@ use windows::{
 
 use crate::settings::AutoClose;
 use crate::{
-    drag_drop::{Outcome, PreparedDrag},
+    drag_drop::{Outcome, PreparedDrag, preview_pixels},
     geometry::Point,
 };
 use layout::{Control, Layout, WorkArea};
@@ -61,7 +61,6 @@ struct WindowState {
     layout: Layout,
     hovered: bool,
     press: Option<Point>,
-    drag_anchor: Point,
     drag_pending: bool,
     dragging: bool,
     cancel_drag: Rc<Cell<bool>>,
@@ -87,6 +86,7 @@ pub struct Thumbnail {
     cached_pixels: Vec<u8>,
     visible: bool,
     editing: bool,
+    highlighted: bool,
 }
 
 impl Thumbnail {
@@ -121,7 +121,6 @@ impl Thumbnail {
             layout: Layout::new(area, 96, image.width, image.height)?,
             hovered: false,
             press: None,
-            drag_anchor: Point::default(),
             drag_pending: false,
             dragging: false,
             cancel_drag: Rc::new(Cell::new(false)),
@@ -163,6 +162,7 @@ impl Thumbnail {
                 cached_pixels: Vec::new(),
                 visible: false,
                 editing: false,
+                highlighted: false,
             };
             let dpi = GetDpiForWindow(hwnd);
             thumbnail.state.drag_width = GetSystemMetricsForDpi(SM_CXDRAG, dpi).max(1);
@@ -366,9 +366,14 @@ impl Thumbnail {
 
     fn update_controls(&mut self) -> Result<()> {
         if let Some(surface) = &mut self.surface {
-            surface.set_controls(self.state.hovered, self.state.pinned)?;
+            surface.set_controls(self.state.hovered, self.state.pinned, self.highlighted)?;
         }
         Ok(())
+    }
+
+    pub fn set_highlight(&mut self, highlighted: bool) -> Result<()> {
+        self.highlighted = highlighted;
+        self.update_controls()
     }
 
     pub fn matches(&self, source: WPARAM) -> bool {
@@ -423,24 +428,28 @@ impl Thumbnail {
         self.state.dragging = true;
         self.state.cancel_drag.set(false);
         let layout = self.state.layout;
-        let width = (layout.card_width * layout.scale).round() as u32;
-        let height = (layout.card_height * layout.scale).round() as u32;
-        let anchor = self.state.drag_anchor;
+        // The reference carries a ~160 x 113 miniature at the pointer's
+        // bottom-right corner, rather than moving the full-size card.
+        let card_width = (layout.card_width * layout.scale).round() as u32;
+        let card_height = (layout.card_height * layout.scale).round() as u32;
+        let (pixels, width, height) = preview_pixels(
+            self.surface
+                .as_ref()
+                .context("Thumbnail surface unavailable")?
+                .drag_pixels(),
+            card_width,
+            card_height,
+        )?;
         let offset = POINT {
-            x: (anchor.x - (layout.card_left * layout.scale).round() as i32)
-                .clamp(0, width as i32 - 1),
-            y: (anchor.y - (layout.card_top * layout.scale).round() as i32)
-                .clamp(0, height as i32 - 1),
+            x: width.saturating_sub(8) as i32,
+            y: height.saturating_sub(20) as i32,
         };
         let result = (|| {
             let drag = PreparedDrag::new(
                 &self.path,
                 width,
                 height,
-                self.surface
-                    .as_ref()
-                    .context("Thumbnail surface unavailable")?
-                    .drag_pixels(),
+                &pixels,
                 offset,
                 Rc::clone(&self.state.cancel_drag),
             )?;
@@ -448,15 +457,34 @@ impl Thumbnail {
             if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
                 return Ok(Outcome::Canceled);
             }
+            if let Some(surface) = &mut self.surface {
+                surface.set_controls(false, false, false)?;
+                surface.set_dragging(true)?;
+            }
+            // A disabled popup stays visible in the stack, but Windows routes
+            // the native OLE drop to the window underneath it.
             unsafe {
-                let _ = ShowWindow(self.hwnd, SW_HIDE);
+                let _ = EnableWindow(self.hwnd, false);
             }
             println!("Drag started: {}", self.path.display());
             drag.run()
         })();
+        unsafe {
+            let _ = EnableWindow(self.hwnd, true);
+        }
         self.state.dragging = false;
-        if (matches!(result, Ok(Outcome::Copied)) && !self.pinned()) || crate::exit_requested() {
+        if crate::exit_requested() {
             return result;
+        }
+        if matches!(result, Ok(Outcome::Copied)) && !self.pinned() {
+            let _ = self.lifecycle.dismiss(Instant::now());
+            if let Some(surface) = &self.surface {
+                surface.dismiss_after_drag()?;
+            }
+            return result;
+        }
+        if let Some(surface) = &mut self.surface {
+            surface.set_dragging(false)?;
         }
         let mut hovered = false;
         if !self.state.cancel_drag.get() {
@@ -599,7 +627,6 @@ unsafe extern "system" fn window_proc(
                     state.pressed_control = state.layout.control_at(point.x as f32, point.y as f32);
                     if state.pressed_control.is_none() {
                         state.press = Some(point);
-                        state.drag_anchor = point;
                     }
                     if !state.hovered {
                         state.hovered = true;

@@ -40,7 +40,13 @@ impl Gallery {
         self.items.clear();
         self.capturing = false;
     }
-    pub fn insert(&mut self, thumbnail: Thumbnail) -> Result<()> {
+    pub fn insert(&mut self, mut thumbnail: Thumbnail) -> Result<()> {
+        for item in &mut self.items {
+            if item.monitor() == thumbnail.monitor() {
+                item.set_highlight(false)?;
+            }
+        }
+        thumbnail.set_highlight(true)?;
         self.items.insert(0, thumbnail);
         self.capturing = false;
         self.reflow()

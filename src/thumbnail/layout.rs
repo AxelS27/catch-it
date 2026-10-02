@@ -72,7 +72,7 @@ impl ControlRect {
 
 impl Layout {
     pub fn stack_capacity(&self, area: WorkArea) -> usize {
-        (1 + area.height.saturating_sub(self.height) / self.stack_step()) as usize
+        (1 + (self.y - area.top).max(0) as u32 / self.stack_step()) as usize
     }
 
     pub fn stack_step(&self) -> u32 {
@@ -86,21 +86,21 @@ impl Layout {
             return None;
         }
         let (x, y, width, height) = match control {
-            Control::Close => (6.0, 6.0, 24.0, 24.0),
-            Control::Pin => (self.card_width - 30.0, 6.0, 24.0, 24.0),
-            Control::Annotate => (6.0, self.card_height - 30.0, 24.0, 24.0),
-            Control::Upload => (self.card_width - 30.0, self.card_height - 30.0, 24.0, 24.0),
+            Control::Close => (7.0, 7.0, 28.0, 28.0),
+            Control::Pin => (self.card_width - 35.0, 7.0, 28.0, 28.0),
+            Control::Annotate => (7.0, self.card_height - 35.0, 28.0, 28.0),
+            Control::Upload => (self.card_width - 35.0, self.card_height - 35.0, 28.0, 28.0),
             Control::Copy => (
-                self.card_width / 2.0 - 30.0,
-                self.card_height / 2.0 - 34.0,
-                60.0,
-                28.0,
+                self.card_width / 2.0 - 32.0,
+                self.card_height / 2.0 - 38.0,
+                64.0,
+                32.0,
             ),
             Control::Save => (
-                self.card_width / 2.0 - 30.0,
-                self.card_height / 2.0 + 6.0,
-                60.0,
-                28.0,
+                self.card_width / 2.0 - 32.0,
+                self.card_height / 2.0 + 10.0,
+                64.0,
+                32.0,
             ),
         };
         Some(ControlRect {
@@ -124,24 +124,29 @@ impl Layout {
             "Invalid thumbnail dimensions or monitor work area"
         );
         let scale = dpi as f32 / 96.0;
-        let margin = (18.0 * scale)
+        // The supplied 1360 x 960 demo places the 260 x 184 card at x=50,
+        // with its bottom 68 pixels above the desktop edge. Anchor to the
+        // capture monitor's work area so the Windows taskbar is never covered.
+        let left_margin = (50.0 * scale).round().min(area.width as f32 / 4.0) as u32;
+        let bottom_margin = (68.0 * scale).round().min(area.height as f32 / 4.0) as u32;
+        let padding = (14.0 * scale)
             .round()
-            .min(area.width.min(area.height) as f32 / 4.0)
-            .floor() as u32;
-        let padding = (14.0 * scale).round().min(margin as f32) as u32;
-        let card_width = (220.0 * scale)
+            .min(left_margin.min(bottom_margin) as f32) as u32;
+        let card_width = (260.0 * scale)
             .round()
-            .min((area.width - margin * 2).max(1) as f32) as u32;
-        let card_height = (160.0 * scale)
+            .min(area.width.saturating_sub(left_margin + padding).max(1) as f32)
+            as u32;
+        let card_height = (184.0 * scale)
             .round()
-            .min((area.height - margin * 2).max(1) as f32) as u32;
+            .min(area.height.saturating_sub(bottom_margin + padding).max(1) as f32)
+            as u32;
         let crop = aspect_fill(image_width, image_height, card_width, card_height)
             .context("Cannot fill thumbnail card")?;
-        let width = card_width + padding + margin;
-        let height = card_height + padding + margin;
+        let width = (card_width + padding * 2).min(area.width);
+        let height = (card_height + padding * 2).min(area.height);
         Ok(Self {
-            x: area.left + (area.width - width) as i32,
-            y: area.top + (area.height - height) as i32,
+            x: area.left + left_margin.saturating_sub(padding) as i32,
+            y: area.top + (area.height - bottom_margin - card_height - padding) as i32,
             width,
             height,
             scale,
@@ -150,7 +155,7 @@ impl Layout {
             card_width: card_width as f32 / scale,
             card_height: card_height as f32 / scale,
             crop,
-            radius: 6.0_f32.min(card_width.min(card_height) as f32 / (scale * 2.0)),
+            radius: 16.0_f32.min(card_width.min(card_height) as f32 / (scale * 2.0)),
         })
     }
 
@@ -186,7 +191,7 @@ mod tests {
                 assert!(capacity >= 1 && top >= area.top);
                 assert!(top - (layout.stack_step() as i32) < area.top);
                 if dpi == 96 && height == 1040 {
-                    assert_eq!(capacity, 5);
+                    assert_eq!(capacity, 4);
                 }
             }
         }
@@ -263,13 +268,17 @@ mod tests {
                     (layout.x, layout.y, layout.width, layout.height),
                     (reference.x, reference.y, reference.width, reference.height)
                 );
-                assert_eq!((layout.card_width, layout.card_height), (220.0, 160.0));
-                let right = layout.x as f32 + (layout.card_left + layout.card_width) * layout.scale;
+                assert_eq!((layout.card_width, layout.card_height), (260.0, 184.0));
+                let left = layout.x as f32 + layout.card_left * layout.scale;
                 let bottom =
                     layout.y as f32 + (layout.card_top + layout.card_height) * layout.scale;
-                let margin = (18.0 * layout.scale).round();
-                assert!((right - (area.left as f32 + area.width as f32 - margin)).abs() < 0.01);
-                assert!((bottom - (area.top as f32 + area.height as f32 - margin)).abs() < 0.01);
+                assert!((left - (area.left as f32 + (50.0 * layout.scale).round())).abs() < 0.01);
+                assert!(
+                    (bottom
+                        - (area.top as f32 + area.height as f32 - (68.0 * layout.scale).round()))
+                    .abs()
+                        < 0.01
+                );
                 assert!(
                     (layout.crop.width / layout.crop.height
                         - layout.card_width / layout.card_height)

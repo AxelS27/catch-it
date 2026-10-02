@@ -96,7 +96,7 @@ pub struct Surface {
     started: Option<Instant>,
     drag_pixels: Vec<u8>,
     card: ID2D1Bitmap1,
-    controls: (bool, bool),
+    controls: (bool, bool, bool),
 }
 
 enum Image<'a> {
@@ -148,6 +148,7 @@ fn compose(
     card: &ID2D1Bitmap1,
     hovered: bool,
     pinned: bool,
+    highlighted: bool,
 ) -> Result<()> {
     unsafe {
         let context = &compositor.context;
@@ -201,7 +202,36 @@ fn compose(
             D2D1_INTERPOLATION_MODE_LINEAR,
             D2D1_COMPOSITE_MODE_SOURCE_OVER,
         );
-        let controls_result = draw_controls(compositor, layout, hovered, pinned);
+        let controls_result = (|| {
+            if highlighted {
+                let blue = context.CreateSolidColorBrush(
+                    &D2D1_COLOR_F {
+                        r: 0.08,
+                        g: 0.42,
+                        b: 0.92,
+                        a: 1.0,
+                    },
+                    None,
+                )?;
+                let inset = 1.5;
+                context.DrawRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: layout.card_left + inset,
+                            top: layout.card_top + inset,
+                            right: layout.card_left + layout.card_width - inset,
+                            bottom: layout.card_top + layout.card_height - inset,
+                        },
+                        radiusX: layout.radius - inset,
+                        radiusY: layout.radius - inset,
+                    },
+                    &blue,
+                    3.0,
+                    None,
+                );
+            }
+            draw_controls(compositor, layout, hovered, pinned)
+        })();
         let draw_result = context.EndDraw(None, None);
         context.SetTarget(None);
         controls_result?;
@@ -478,7 +508,7 @@ impl Surface {
                     (pixels.to_vec(), cached_card(&compositor, layout, pixels)?)
                 }
             };
-            compose(&compositor, &swap_chain, layout, &card, false, false)?;
+            compose(&compositor, &swap_chain, layout, &card, false, false, false)?;
             let target = compositor.composition.CreateTargetForHwnd(hwnd, true)?;
             let visual = compositor.composition.CreateVisual()?;
             let opacity = compositor.composition.CreateEffectGroup()?;
@@ -486,7 +516,7 @@ impl Surface {
             visual.SetEffect(&opacity)?;
             // Commit a transparent initial state before showing the popup.
             opacity.SetOpacity2(0.0)?;
-            visual.SetOffsetX2(24.0 * layout.scale)?;
+            visual.SetOffsetX2(-24.0 * layout.scale)?;
             target.SetRoot(&visual)?;
             compositor.composition.Commit()?;
             Ok(Self {
@@ -500,7 +530,7 @@ impl Surface {
                 started: None,
                 drag_pixels,
                 card,
-                controls: (false, false),
+                controls: (false, false, false),
             })
         }
     }
@@ -510,8 +540,8 @@ impl Surface {
         &self.drag_pixels
     }
 
-    pub fn set_controls(&mut self, hovered: bool, pinned: bool) -> Result<()> {
-        if self.controls != (hovered, pinned) {
+    pub fn set_controls(&mut self, hovered: bool, pinned: bool, highlighted: bool) -> Result<()> {
+        if self.controls != (hovered, pinned, highlighted) {
             compose(
                 &self.compositor,
                 &self._swap_chain,
@@ -519,15 +549,39 @@ impl Surface {
                 &self.card,
                 hovered,
                 pinned,
+                highlighted,
             )?;
-            self.controls = (hovered, pinned);
+            self.controls = (hovered, pinned, highlighted);
+        }
+        Ok(())
+    }
+
+    pub fn set_dragging(&mut self, dragging: bool) -> Result<()> {
+        // Keep the source in place but subdued behind the pointer-following
+        // miniature, as in the supplied video.
+        unsafe {
+            self.opacity
+                .SetOpacity2(if dragging { 0.45 } else { 1.0 })?;
+            self.compositor.composition.Commit()?;
         }
         Ok(())
     }
 
     pub fn appear(&mut self) -> Result<()> {
         self.started = Some(Instant::now());
-        self.animate(24.0 * self.layout.scale, 0.0, 0.0, 1.0, self.timing.appear)
+        self.animate(-24.0 * self.layout.scale, 0.0, 0.0, 1.0, self.timing.appear)
+    }
+
+    pub fn dismiss_after_drag(&self) -> Result<()> {
+        // The original remains at 45% throughout OLE's modal loop, then
+        // exits toward the left without flashing back to full opacity.
+        self.animate(
+            0.0,
+            -(self.layout.width as f32),
+            0.45,
+            0.0,
+            self.timing.dismiss,
+        )
     }
 
     pub fn dismiss(&self) -> Result<()> {
@@ -539,8 +593,8 @@ impl Surface {
             1.0 - (1.0 - t).powi(3)
         });
         self.animate(
-            24.0 * self.layout.scale * (1.0 - progress),
-            self.layout.width as f32,
+            -24.0 * self.layout.scale * (1.0 - progress),
+            -(self.layout.width as f32),
             progress,
             0.0,
             self.timing.dismiss,

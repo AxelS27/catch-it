@@ -268,9 +268,9 @@ impl App {
             Ok(drag_drop::Outcome::Canceled) => println!("Drag result: canceled or rejected"),
             Err(_) => (),
         }
-        if thumbnail.pinned() || !matches!(result, Ok(drag_drop::Outcome::Copied)) {
-            self.gallery.restore(index, thumbnail);
-        }
+        // A copied Quick Access card stays in the gallery just long enough
+        // for its leftward exit animation; the lifecycle timer removes it.
+        self.gallery.restore(index, thumbnail);
         self.gallery.reflow()?;
         self.schedule_thumbnail_timer()?;
         result.map(|_| ())

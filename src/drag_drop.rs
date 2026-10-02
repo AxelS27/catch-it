@@ -85,6 +85,46 @@ pub fn file_data_object(path: &Path) -> Result<IDataObject> {
     }
 }
 
+/// Downsample premultiplied BGRA without introducing transparent-edge halos.
+/// Only the floating Quick Access preview uses this; editor drag keeps its size.
+pub fn preview_pixels(pixels: &[u8], width: u32, height: u32) -> Result<(Vec<u8>, u32, u32)> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|count| count.checked_mul(4))
+        .context("Drag preview is too large")?;
+    anyhow::ensure!(
+        width > 0 && height > 0 && pixels.len() == expected,
+        "Invalid preview pixels"
+    );
+    let output_width = ((width as f32 * 0.615).round() as u32).max(1);
+    let output_height = ((height as f32 * 0.615).round() as u32).max(1);
+    let mut output = vec![0; output_width as usize * output_height as usize * 4];
+    for y in 0..output_height {
+        let source_y = ((y as f32 + 0.5) * height as f32 / output_height as f32 - 0.5)
+            .clamp(0.0, (height - 1) as f32);
+        let y0 = source_y.floor() as u32;
+        let y1 = (y0 + 1).min(height - 1);
+        let fy = source_y - y0 as f32;
+        for x in 0..output_width {
+            let source_x = ((x as f32 + 0.5) * width as f32 / output_width as f32 - 0.5)
+                .clamp(0.0, (width - 1) as f32);
+            let x0 = source_x.floor() as u32;
+            let x1 = (x0 + 1).min(width - 1);
+            let fx = source_x - x0 as f32;
+            let index = |sx: u32, sy: u32| ((sy * width + sx) * 4) as usize;
+            let dest = ((y * output_width + x) * 4) as usize;
+            for channel in 0..4 {
+                let top = pixels[index(x0, y0) + channel] as f32 * (1.0 - fx)
+                    + pixels[index(x1, y0) + channel] as f32 * fx;
+                let bottom = pixels[index(x0, y1) + channel] as f32 * (1.0 - fx)
+                    + pixels[index(x1, y1) + channel] as f32 * fx;
+                output[dest + channel] = (top * (1.0 - fy) + bottom * fy).round() as u8;
+            }
+        }
+    }
+    Ok((output, output_width, output_height))
+}
+
 pub struct PreparedDrag {
     data: IDataObject,
     source: IDropSource,
@@ -353,6 +393,23 @@ mod tests {
                 DRAGDROP_S_CANCEL
             );
         }
+    }
+
+    #[test]
+    fn quick_access_preview_preserves_premultiplied_edges_and_aspect() -> Result<()> {
+        assert!(preview_pixels(&[], 260, 184).is_err());
+        let mut pixels = vec![0; 260 * 184 * 4];
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[40, 80, 120, 160]);
+        }
+        let (small, width, height) = preview_pixels(&pixels, 260, 184)?;
+        assert_eq!((width, height), (160, 113));
+        assert!(
+            small
+                .chunks_exact(4)
+                .all(|pixel| pixel == [40, 80, 120, 160])
+        );
+        Ok(())
     }
 
     #[test]
