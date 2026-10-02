@@ -128,7 +128,9 @@ impl Layout {
         // to the capture monitor's usable work area, clear of the taskbar.
         // Placement and per-edge offsets can become settings in a later slice.
         let right_margin = (50.0 * scale).round().min(area.width as f32 / 4.0) as u32;
-        let bottom_margin = (68.0 * scale).round().min(area.height as f32 / 4.0) as u32;
+        // Twenty DIPs leaves room for the 14-DIP shadow surface while keeping
+        // the card visually close to the taskbar.
+        let bottom_margin = (20.0 * scale).round().min(area.height as f32 / 4.0) as u32;
         let padding = (14.0 * scale)
             .round()
             .min(right_margin.min(bottom_margin) as f32) as u32;
@@ -191,7 +193,7 @@ mod tests {
                 assert!(capacity >= 1 && top >= area.top);
                 assert!(top - (layout.stack_step() as i32) < area.top);
                 if dpi == 96 && height == 1040 {
-                    assert_eq!(capacity, 4);
+                    assert_eq!(capacity, 5);
                 }
             }
         }
@@ -280,7 +282,7 @@ mod tests {
                 );
                 assert!(
                     (bottom
-                        - (area.top as f32 + area.height as f32 - (68.0 * layout.scale).round()))
+                        - (area.top as f32 + area.height as f32 - (20.0 * layout.scale).round()))
                     .abs()
                         < 0.01
                 );

@@ -360,7 +360,7 @@ function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeig
             if ($rect.Bottom -gt $reservedTop) { throw 'Thumbnail/shadow collides with the actual taskbar (including auto-hide reveal area).' }
         }
     }
-    if ($rect.Right-$padding -ne $work.Right-[int][Math]::Round(50*$scale) -or $rect.Bottom-$padding -ne $effectiveBottom-[int][Math]::Round(68*$scale)) { throw "Quick Access inset differs: cardRight=$($rect.Right-$padding),cardBottom=$($rect.Bottom-$padding) effectiveWorkRight=$($work.Right),effectiveWorkBottom=$effectiveBottom dpi=$scale." }
+    if ($rect.Right-$padding -ne $work.Right-[int][Math]::Round(50*$scale) -or $rect.Bottom-$padding -ne $effectiveBottom-[int][Math]::Round(20*$scale)) { throw "Quick Access inset differs: cardRight=$($rect.Right-$padding),cardBottom=$($rect.Bottom-$padding) effectiveWorkRight=$($work.Right),effectiveWorkBottom=$effectiveBottom dpi=$scale." }
     $cover = [Math]::Max($cardWidth/$ImageWidth, $cardHeight/$ImageHeight)
     $cropLeft = ($ImageWidth-$cardWidth/$cover)/2
     $cropTop = ($ImageHeight-$cardHeight/$cover)/2
