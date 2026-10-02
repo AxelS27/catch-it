@@ -140,20 +140,18 @@ impl Editor {
             let dpi = GetDpiForWindow(source).max(96);
             let scale = dpi as f32 / 96.0;
             let work = info.rcWork;
-            // The reference editor occupies most of its 1700 x 1200 frame,
-            // rather than opening as the previous small viewer window.
+            // Comfortable viewer size without taking over the desktop.
             let work_width = work.right - work.left;
             let work_height = work.bottom - work.top;
-            let width = ((work_width as f32 * 0.84).round() as i32)
-                .max((960.0 * scale).round() as i32)
-                .min(work_width);
-            let height = ((work_height as f32 * 0.86).round() as i32)
-                .max((640.0 * scale).round() as i32)
-                .min(work_height);
+            let width = (1040.0 * scale).round() as i32;
+            let height = (700.0 * scale).round() as i32;
+            let width = width.min(work_width);
+            let height = height.min(work_height);
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 CLASS,
-                w!("Annotate - Simple Screenshot"),
+                // Retain an accessible window name; custom chrome never draws it.
+                w!("Simple Screenshot editor"),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                 work.left + (work.right - work.left - width) / 2,
                 work.top + (work.bottom - work.top - height) / 2,
@@ -511,6 +509,13 @@ fn apply_theme(hwnd: HWND, dark: bool) {
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             (&value as *const BOOL).cast(),
             std::mem::size_of::<BOOL>() as u32,
+        );
+        let corners = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&corners as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
         );
     }
 }

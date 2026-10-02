@@ -188,6 +188,7 @@ public static class CaptureInput {
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd,out Rect rect);
     [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hwnd,ref Point point);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd,int command);
     public static Rect ClientBounds(IntPtr hwnd) { Rect rect; GetClientRect(hwnd,out rect); Point p=new Point(); ClientToScreen(hwnd,ref p); return new Rect { Left=p.X,Top=p.Y,Right=p.X+rect.Right,Bottom=p.Y+rect.Bottom }; }
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hwnd);
@@ -914,7 +915,10 @@ function Wait-Editor([bool]$Visible=$true) {
 function Click-EditorAction([IntPtr]$Window,[string]$Action) {
     $r=[CaptureInput]::ClientBounds($Window);$s=[CaptureInput]::GetDpiForWindow($Window)/96.0
     switch($Action){
-        'Save' {$x=$r.Right-60*$s;$y=$r.Top+24*$s}
+        'Save' {$x=$r.Right-186*$s;$y=$r.Top+24*$s}
+        'Minimize' {$x=$r.Right-105*$s;$y=$r.Top+24*$s}
+        'Maximize' {$x=$r.Right-63*$s;$y=$r.Top+24*$s}
+        'Close' {$x=$r.Right-21*$s;$y=$r.Top+24*$s}
         'Copy' {$x=$r.Right-68*$s;$y=$r.Bottom-24*$s}
         'Zoom' {$x=$r.Left+56*$s;$y=$r.Bottom-24*$s}
         'Rectangle' {$x=$r.Left+164*$s;$y=$r.Top+24*$s}
@@ -981,7 +985,10 @@ function Test-Editor {
     $editor=Wait-Editor
     if([CaptureInput]::GetForegroundWindow() -ne $editor){throw 'Annotate did not intentionally activate the editor.'}
     Assert-EditorPixels $editor $first.Shot
-    if([CaptureInput]::TaggedWindow('Annotate - Simple Screenshot',[uint32]$app.Id) -ne $editor){throw 'Native editor caption is missing.'}
+    if([CaptureInput]::TaggedWindow('Simple Screenshot editor',[uint32]$app.Id) -ne $editor){throw 'Editor accessible window name is missing.'}
+    $frame=Preview-Rect $editor;$client=[CaptureInput]::ClientBounds($editor)
+    if($client.Top -ne $frame.Top -or $client.Left -ne $frame.Left){Save-GalleryScreenshot 'editor-caption-failure.png';throw "Caption offsets: window $($frame.Left),$($frame.Top); client $($client.Left),$($client.Top)."}
+    if($frame.Right-$frame.Left -gt 1200*[CaptureInput]::GetDpiForWindow($editor)/96.0){throw 'Editor opens too large by default.'}
     Save-GalleryScreenshot 'editor-shell.png'
     Click-PreviewAction $first.Window 'Annotate'
     if([CaptureInput]::EditorCount() -ne 1){throw 'Repeated Annotate created duplicate sessions.'}
@@ -1006,7 +1013,29 @@ function Test-Editor {
     Assert-EditorPalettePixel ([int]($bounds.Left+517*$scale)) ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::White.ToArgb())
     Write-Host 'PASS: native color menu matches video swatch order; pointer/keyboard selection and Escape/outside dismissal work'
 
-    # The initial window follows the reference's large screen-relative footprint.
+    Click-EditorAction $editor 'Maximize'
+    for($i=0;$i -lt 50 -and -not [CaptureInput]::IsZoomed($editor);$i++){Start-Sleep -Milliseconds 25}
+    if(-not [CaptureInput]::IsZoomed($editor)){throw 'Custom maximize button failed.'}
+    Click-EditorAction $editor 'Maximize'
+    for($i=0;$i -lt 50 -and [CaptureInput]::IsZoomed($editor);$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::IsZoomed($editor)){throw 'Custom restore button failed.'}
+    Click-EditorAction $editor 'Minimize'
+    for($i=0;$i -lt 50 -and -not [CaptureInput]::IsIconic($editor);$i++){Start-Sleep -Milliseconds 25}
+    if(-not [CaptureInput]::IsIconic($editor)){throw 'Custom minimize button failed.'}
+    [void][CaptureInput]::ShowWindow($editor,9)
+    $before=Preview-Rect $editor;$client=[CaptureInput]::ClientBounds($editor);$dpi=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $startX=[int]($client.Left+700*$dpi);$startY=[int]($client.Top+24*$dpi)
+    [CaptureInput]::HoldAt($startX,$startY)
+    [CaptureInput]::MouseAt(($startX+60),($startY+20),0)
+    [CaptureInput]::DropAt(($startX+60),($startY+20))
+    for($i=0;$i -lt 40;$i++){
+        $after=Preview-Rect $editor
+        if($after.Left -gt $before.Left+10){break}
+        Start-Sleep -Milliseconds 25
+    }
+    if($after.Left -le $before.Left+10){Save-GalleryScreenshot 'editor-title-drag-failure.png';throw "Title drag did not move window: before=$($before.Left),$($before.Top) after=$($after.Left),$($after.Top) pointer=$startX,$startY."}
+    Write-Host 'PASS: single-row custom title bar, compact default size, Windows minimize/maximize/restore, and native window drag'
+
     # Constrain the pan fixture viewport so its 400% image genuinely overflows.
     [void][CaptureInput]::MoveWindow($editor,480,180,960,640,$true)
     Assert-EditorPixels $editor $first.Shot
@@ -1118,7 +1147,7 @@ function Test-Editor {
     }
     if([CaptureInput]::EditorCount() -ne 2){throw 'Opening another capture did not create an independent editor.'}
     if($other -eq [IntPtr]::Zero){throw 'Second editor was not activated.'}
-    [void][CaptureInput]::PostMessage($other,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)
+    Click-EditorAction $other 'Close'
     for($i=0;$i -lt 100 -and [CaptureInput]::EditorCount() -ne 1;$i++){Start-Sleep -Milliseconds 25}
     if([CaptureInput]::EditorCount() -ne 1 -or -not [CaptureInput]::IsWindow($editor)){throw 'Closing second editor affected first session.'}
     [void][CaptureInput]::SetForegroundWindow($editor)

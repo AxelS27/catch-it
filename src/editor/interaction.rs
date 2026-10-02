@@ -11,7 +11,7 @@ pub(super) unsafe extern "system" fn window_proc(
         if message == WM_NCCREATE {
             let create = &*(lparam.0 as *const CREATESTRUCTW);
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
-            // Let the native nonclient initialization retain the window title.
+            // Keep native frame semantics, but render the entire title bar in D2D.
             return DefWindowProcW(hwnd, message, wparam, lparam);
         }
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
@@ -19,6 +19,68 @@ pub(super) unsafe extern "system" fn window_proc(
             return DefWindowProcW(hwnd, message, wparam, lparam);
         }
         match message {
+            WM_NCCALCSIZE => {
+                // Both forms begin with the proposed client RECT. Creation uses
+                // wParam=0, frame changes use wParam=1. Handle both to avoid a
+                // second native title row on the initial window.
+                let rect = &mut *(lparam.0 as *mut RECT);
+                if IsZoomed(hwnd).as_bool() {
+                    let dpi = GetDpiForWindow(hwnd).max(96);
+                    let pad = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                    let dx = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + pad;
+                    let dy = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + pad;
+                    rect.left += dx;
+                    rect.right -= dx;
+                    rect.top += dy;
+                    rect.bottom -= dy;
+                }
+                LRESULT(0)
+            }
+            WM_NCHITTEST => {
+                let mut window = RECT::default();
+                if GetWindowRect(hwnd, &mut window).is_err() {
+                    return DefWindowProcW(hwnd, message, wparam, lparam);
+                }
+                let x = lparam.0 as u16 as i16 as i32 - window.left;
+                let y = (lparam.0 >> 16) as u16 as i16 as i32 - window.top;
+                let dpi = GetDpiForWindow(hwnd).max(96);
+                if !IsZoomed(hwnd).as_bool() {
+                    let pad = GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                    let edge_x = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) + pad;
+                    let edge_y = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) + pad;
+                    let left = x < edge_x;
+                    let right = x >= window.right - window.left - edge_x;
+                    let top = y < edge_y;
+                    let bottom = y >= window.bottom - window.top - edge_y;
+                    let hit = match (left, right, top, bottom) {
+                        (true, _, true, _) => Some(HTTOPLEFT),
+                        (_, true, true, _) => Some(HTTOPRIGHT),
+                        (true, _, _, true) => Some(HTBOTTOMLEFT),
+                        (_, true, _, true) => Some(HTBOTTOMRIGHT),
+                        (true, _, _, _) => Some(HTLEFT),
+                        (_, true, _, _) => Some(HTRIGHT),
+                        (_, _, true, _) => Some(HTTOP),
+                        (_, _, _, true) => Some(HTBOTTOM),
+                        _ => None,
+                    };
+                    if let Some(hit) = hit {
+                        return LRESULT(hit as isize);
+                    }
+                }
+                let s = &*ptr;
+                let mut point = POINT {
+                    x: lparam.0 as u16 as i16 as i32,
+                    y: (lparam.0 >> 16) as u16 as i16 as i32,
+                };
+                let _ = ScreenToClient(hwnd, &mut point);
+                let px = point.x as f32 * 96.0 / dpi as f32;
+                let py = point.y as f32 * 96.0 / dpi as f32;
+                if (0.0..layout::TOP).contains(&py) && s.layout.hit(px, py).is_none() {
+                    LRESULT(HTCAPTION as isize)
+                } else {
+                    LRESULT(HTCLIENT as isize)
+                }
+            }
             WM_ERASEBKGND => LRESULT(1),
             WM_ACTIVATE => {
                 // Preview cards are topmost. Float only while this editor is
@@ -67,6 +129,7 @@ pub(super) unsafe extern "system" fn window_proc(
                                     focused: s.focus,
                                     palette_open: s.palette_open,
                                     selected_color: s.selected_color,
+                                    maximized: IsZoomed(hwnd).as_bool(),
                                 },
                             )
                     })
@@ -109,22 +172,9 @@ pub(super) unsafe extern "system" fn window_proc(
                 let info = &mut *(lparam.0 as *mut MINMAXINFO);
                 let dpi = GetDpiForWindow(hwnd).max(96);
                 let s = dpi as f32 / 96.0;
-                let mut bounds = RECT {
-                    left: 0,
-                    top: 0,
-                    right: (layout::MIN_WIDTH * s) as i32,
-                    bottom: (layout::MIN_HEIGHT * s) as i32,
-                };
-                let _ = AdjustWindowRectExForDpi(
-                    &mut bounds,
-                    WS_OVERLAPPEDWINDOW,
-                    false,
-                    WINDOW_EX_STYLE::default(),
-                    dpi,
-                );
                 info.ptMinTrackSize = POINT {
-                    x: bounds.right - bounds.left,
-                    y: bounds.bottom - bounds.top,
+                    x: (layout::MIN_WIDTH * s).ceil() as i32,
+                    y: (layout::MIN_HEIGHT * s).ceil() as i32,
                 };
                 LRESULT(0)
             }
@@ -264,7 +314,14 @@ pub(super) unsafe extern "system" fn window_proc(
                         return LRESULT(0);
                     }
                     s.focus = None;
-                    s.pressed = s.layout.hit(p.0, p.1).filter(|c| c.enabled() && s.ready());
+                    s.pressed = s.layout.hit(p.0, p.1).filter(|c| {
+                        c.enabled()
+                            && (s.ready()
+                                || matches!(
+                                    c,
+                                    Control::Minimize | Control::Maximize | Control::Close
+                                ))
+                    });
                     if s.pressed == Some(Control::Drag) {
                         s.drag_start = Some(p);
                     }
@@ -401,7 +458,11 @@ pub(super) unsafe extern "system" fn window_proc(
                     IDC_HAND
                 } else if s.pan_start.is_some() {
                     IDC_SIZEALL
-                } else if s.hover.is_some_and(|c| c.enabled() && s.ready()) {
+                } else if s.hover.is_some_and(|c| {
+                    c.enabled()
+                        && (s.ready()
+                            || matches!(c, Control::Minimize | Control::Maximize | Control::Close))
+                }) {
                     IDC_HAND
                 } else {
                     IDC_ARROW
@@ -421,6 +482,28 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
         Control::Copy => state.request(hwnd, COPY),
         Control::Zoom => state.request(hwnd, ZOOM_MENU),
         Control::Color => state.palette_open = !state.palette_open,
+        Control::Minimize => unsafe {
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_SYSCOMMAND,
+                WPARAM(SC_MINIMIZE as usize),
+                LPARAM(0),
+            );
+        },
+        Control::Maximize => unsafe {
+            let command = if IsZoomed(hwnd).as_bool() {
+                SC_RESTORE
+            } else {
+                SC_MAXIMIZE
+            };
+            let _ = PostMessageW(
+                Some(hwnd),
+                WM_SYSCOMMAND,
+                WPARAM(command as usize),
+                LPARAM(0),
+            );
+        },
+        Control::Close => state.request(hwnd, CLOSE),
         _ => {}
     }
 }

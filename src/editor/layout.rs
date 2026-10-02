@@ -33,6 +33,9 @@ pub enum Control {
     Stroke,
     Style,
     Save,
+    Minimize,
+    Maximize,
+    Close,
     Zoom,
     Drag,
     Present,
@@ -45,7 +48,15 @@ impl Control {
     pub fn enabled(self) -> bool {
         matches!(
             self,
-            Self::Move | Self::Color | Self::Save | Self::Zoom | Self::Drag | Self::Copy
+            Self::Move
+                | Self::Color
+                | Self::Save
+                | Self::Minimize
+                | Self::Maximize
+                | Self::Close
+                | Self::Zoom
+                | Self::Drag
+                | Self::Copy
         )
     }
     pub fn label(self) -> &'static str {
@@ -69,6 +80,9 @@ impl Control {
             Self::Stroke => "Stroke size",
             Self::Style => "Tool style",
             Self::Save => "Save as... (Ctrl+S)",
+            Self::Minimize => "Minimize window",
+            Self::Maximize => "Maximize or restore window",
+            Self::Close => "Close editor (Ctrl+W)",
             Self::Zoom => "Zoom",
             Self::Drag => "Drag Me",
             Self::Present => "Presentation - not available yet",
@@ -156,12 +170,26 @@ impl Layout {
         controls.push((
             Control::Save,
             Rect {
-                x: width - 108.0,
+                x: width - 234.0,
                 y: 8.0,
                 w: 96.0,
                 h: 32.0,
             },
         ));
+        for (i, control) in [Control::Minimize, Control::Maximize, Control::Close]
+            .into_iter()
+            .enumerate()
+        {
+            controls.push((
+                control,
+                Rect {
+                    x: width - 126.0 + i as f32 * 42.0,
+                    y: 0.0,
+                    w: 42.0,
+                    h: TOP,
+                },
+            ));
+        }
         let y = height - BOTTOM + 10.0;
         controls.extend([
             (
@@ -231,11 +259,19 @@ impl Layout {
         // At unexpectedly small sizes, omit entire targets instead of overlapping.
         controls
             .retain(|(_, r)| r.x >= 0.0 && r.x + r.w <= width && r.y >= 0.0 && r.y + r.h <= height);
+        if width < 870.0 {
+            controls.retain(|(control, _)| {
+                !matches!(control, Control::Color | Control::Stroke | Control::Style)
+            });
+        }
         if width < MIN_WIDTH {
             controls.retain(|(c, _)| {
                 matches!(
                     c,
                     Control::Save
+                        | Control::Minimize
+                        | Control::Maximize
+                        | Control::Close
                         | Control::Zoom
                         | Control::Drag
                         | Control::Present
@@ -386,8 +422,20 @@ mod tests {
         }
     }
     #[test]
+    fn custom_caption_controls_keep_clear_tool_and_drag_regions() {
+        for width in [MIN_WIDTH, 800.0, 960.0, 1200.0] {
+            let layout = Layout::new(width, 640.0);
+            assert_eq!(layout.hit(width - 21.0, 24.0), Some(Control::Close));
+            assert_eq!(layout.hit(width - 63.0, 24.0), Some(Control::Maximize));
+            assert_eq!(layout.hit(width - 105.0, 24.0), Some(Control::Minimize));
+            assert!(layout.hit(width - 130.0, 24.0).is_none());
+            assert_eq!(layout.hit(width - 186.0, 24.0), Some(Control::Save));
+        }
+    }
+    #[test]
     fn palette_geometry_and_hit_testing_stay_in_client_at_minimum_size() {
-        for width in [MIN_WIDTH, 960.0, 1600.0] {
+        assert!(Layout::new(MIN_WIDTH, MIN_HEIGHT).palette_rect().is_none());
+        for width in [870.0, 960.0, 1600.0] {
             let l = Layout::new(width, MIN_HEIGHT);
             let p = l.palette_rect().unwrap();
             assert!(p.x >= 0.0 && p.x + p.w <= width);

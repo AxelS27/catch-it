@@ -20,6 +20,7 @@ pub struct ChromeState {
     pub focused: Option<Control>,
     pub palette_open: bool,
     pub selected_color: usize,
+    pub maximized: bool,
 }
 
 pub struct Renderer {
@@ -357,6 +358,21 @@ impl Renderer {
                     self.line((x + 2.5, y + 5.5), (x + 7.5, y + 5.5), rgb, 1.3);
                 }
             }
+            Control::Minimize => self.line((x - 5.0, y + 4.0), (x + 5.0, y + 4.0), rgb, 1.1),
+            Control::Maximize => self.outline(
+                Rect {
+                    x: x - 5.0,
+                    y: y - 5.0,
+                    w: 10.0,
+                    h: 10.0,
+                },
+                rgb,
+                1.1,
+            ),
+            Control::Close => {
+                self.line((x - 5.0, y - 5.0), (x + 5.0, y + 5.0), rgb, 1.1);
+                self.line((x + 5.0, y - 5.0), (x - 5.0, y + 5.0), rgb, 1.1);
+            }
             Control::Color => {
                 self.circle(x - 4.0, y, 6.0, PRESET_COLORS[selected_color], true);
                 self.line((x + 9.0, y - 2.0), (x + 12.0, y + 1.0), 0x817a86, 1.1);
@@ -473,6 +489,7 @@ impl Renderer {
             focused,
             palette_open,
             selected_color,
+            maximized,
         } = chrome;
         let (canvas, fg, muted, pill, group) = if dark {
             (0x19191d, 0xf3f3f5, 0x797982, 0x3b3b43, 0x222226)
@@ -580,7 +597,12 @@ impl Renderer {
             self.target.PopAxisAlignedClip();
         }
         for &(control, r) in &layout.controls {
-            let enabled = control.enabled() && (image.is_some() || control == Control::Move);
+            let enabled = control.enabled()
+                && (image.is_some()
+                    || matches!(
+                        control,
+                        Control::Move | Control::Minimize | Control::Maximize | Control::Close
+                    ));
             let active = control == Control::Move || control == Control::Save;
             let background = if active && enabled {
                 0x007aff
@@ -589,7 +611,21 @@ impl Renderer {
             } else {
                 pill
             };
-            if !matches!(
+            if matches!(
+                control,
+                Control::Minimize | Control::Maximize | Control::Close
+            ) {
+                if hovered == Some(control) {
+                    self.fill(
+                        r,
+                        if control == Control::Close {
+                            0xe81123
+                        } else {
+                            0xc8c0cd
+                        },
+                    );
+                }
+            } else if !matches!(
                 control,
                 Control::Rectangle
                     | Control::Fill
@@ -610,7 +646,9 @@ impl Renderer {
                     if control == Control::Move { 9.0 } else { 14.0 },
                 );
             }
-            let ink = if !enabled {
+            let ink = if control == Control::Close && hovered == Some(control) {
+                0xffffff
+            } else if !enabled {
                 if dark { muted } else { 0x55505b }
             } else if active {
                 0xffffff
@@ -630,6 +668,30 @@ impl Renderer {
                         })
                         .unwrap_or_else(|| "Fit  ▾".into());
                     self.text(&label, r, ink, false);
+                }
+                Control::Maximize if maximized => {
+                    self.outline(
+                        Rect {
+                            x: r.x + r.w / 2.0 - 6.0,
+                            y: r.y + r.h / 2.0 - 3.0,
+                            w: 9.0,
+                            h: 9.0,
+                        },
+                        ink,
+                        1.1,
+                    );
+                    self.line(
+                        (r.x + r.w / 2.0 - 3.0, r.y + r.h / 2.0 - 5.0),
+                        (r.x + r.w / 2.0 + 6.0, r.y + r.h / 2.0 - 5.0),
+                        ink,
+                        1.1,
+                    );
+                    self.line(
+                        (r.x + r.w / 2.0 + 6.0, r.y + r.h / 2.0 - 5.0),
+                        (r.x + r.w / 2.0 + 6.0, r.y + r.h / 2.0 + 4.0),
+                        ink,
+                        1.1,
+                    );
                 }
                 Control::Drag => {
                     self.text("Drag Me", r, ink, false);
