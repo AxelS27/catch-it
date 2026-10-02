@@ -2,9 +2,13 @@
 
 A lightweight Windows screenshot utility with floating capture previews, file drag/drop, a pending queue, and persistent reference cards. The initial macOS-inspired flow and approved CleanShot-inspired extension are described in [PRD.md](PRD.md). Exact reference parity is not claimed.
 
-## Next milestone: CleanShot X-style annotation
+## Current milestone: native Annotate editor foundation
 
-The native image editor is now approved. Its UI/UX research, official video references, tool behavior, delivery slices, and remaining exact-parity measurements are in [docs/annotation-cleanshot-research.md](docs/annotation-cleanshot-research.md). Research is complete enough to begin implementation, but no editor runtime has been added yet; Annotate remains disabled. Exact installed-version parity is still unvalidated.
+The Annotate pencil now opens an activated native editor with the original full-resolution image, reference-derived top toolbar/footer, automatic Windows light/dark appearance, percentage/Fit zoom, pointer-anchored Ctrl+wheel zoom, drag-to-pan, Copy, native PNG Save As, and copy-only `Drag Me` file output. Source thumbnails pause and reserve their queue slots while editing; other unpinned cards still expire. Reopening the same capture raises its existing editor. Each editor independently protects its source file even after its preview closes. Editors hide during capture without losing zoom, pan, or minimized state.
+
+This is **slice 1, not a complete annotation implementation**. Shape/arrow/text/redaction/crop/background controls are visibly disabled with explanatory tooltips; Upload remains unavailable. Four editors can be open simultaneously; decoded images are bounded to 256 MiB each and the graphics device's bitmap-size limit. The original PNG is never edited or re-encoded by this slice. Save/Copy/drop preserve the editor session.
+
+UI/UX evidence, delivery slices, and remaining exact-parity measurements are in [docs/annotation-cleanshot-research.md](docs/annotation-cleanshot-research.md). Windows caption/buttons and Segoe UI are intentional platform substitutions. Exact installed-version parity and real mixed-DPI/light-theme visual validation remain pending.
 
 ## Current implemented milestone: thumbnail actions, Save As, and automatic image clipboard
 
@@ -33,7 +37,7 @@ Implemented:
 - No keyboard focus activation when showing, hovering, copying, pinning, or dismissing the preview. Save intentionally opens a normal native dialog with keyboard focus.
 - Monotonic timeout that pauses on hover and resumes the remaining time after mouse exit. Auto-dismiss is FIFO per visible monitor stack: oldest unpinned card exits first; newer cards wait until its exit finishes, even if their own budgets have already elapsed. Hovering the oldest holds automatic dismissal behind it. Manual close and successful file drops are not FIFO-gated.
 - Event-driven timers: no recurring timer for an idle pin, hovered card, Never setting, or dismissed gallery.
-- Hover actions follow the relative arrangement in CleanShot's [official quick-access demo](https://cleanshot.com/video/home/quickaccess.mp4): Close top-left, Pin top-right, central Copy above Save, Annotate bottom-left, Upload bottom-right. Copy and Save are active; Annotate and Upload are visibly disabled placeholders that never initiate a drag. Small cards without enough room hide controls rather than overlapping targets. Relative positions are reference-based; exact macOS pixel parity and blur are not claimed.
+- Hover actions follow the relative arrangement in CleanShot's [official quick-access demo](https://cleanshot.com/video/home/quickaccess.mp4): Close top-left, Pin top-right, central Copy above Save, Annotate bottom-left, Upload bottom-right. Copy and Save are active; Annotate opens the native editor. Upload is a visibly disabled placeholder that never initiates a drag. Small cards without enough room hide controls rather than overlapping targets. Relative positions are reference-based; exact macOS pixel parity and blur are not claimed.
 - Copy the original screenshot automatically after each successful capture/save, including when the preview queue is full of pins. Publish both the original registered `PNG` bytes and a full-resolution native `CF_DIBV5` image, never a preview crop or file path. Copy can recopy any surviving older screenshot without dismissing it or taking focus. A busy clipboard retries on a 50 ms event timer for up to two seconds, then reports failure with the source PNG and preview intact; Copy allows retry. No recurring clipboard timer after success or failure.
 - Save opens Windows' native PNG Save As dialog. Cancel preserves the card; success dismisses an unpinned card and keeps a pin in place. All card clocks pause during the dialog. Unicode/spaced paths and native overwrite confirmation are supported. Export copies the exact original PNG bytes to a private file in the chosen folder, then atomically publishes it; failure preserves the existing target and source PNG. Quit safely cancels an active dialog.
 - Right-click opens pin/unpin, close, and close-all actions. Windows client-area animation preference is respected.
@@ -60,7 +64,7 @@ Output directory:
 
 The timer preference is atomically saved in `%LOCALAPPDATA%\SimpleScreenshot\settings.txt` and loaded on startup. The queue and pins are session-only, not a screenshot history/library, and are not restored after restart.
 
-No screenshot editor, annotation tools, resize/opacity/lock controls, or settings window. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
+The native editor shell is implemented, but drawing/text/redaction/crop/background tools, resize/opacity/lock controls, and a settings window are not. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
 
 ### Provisional UX profile
 
@@ -76,7 +80,7 @@ The floating implementation is functional, but exact macOS or CleanShot parity i
 | Hover behavior | Pause and resume remaining time, not reset |
 | Manual dismissal | Hover close control, context-menu Close, or Close all |
 
-These values are not measured native macOS specifications. Geometry, gestures, animation curves, and timing must still be compared against a versioned macOS reference. Clicking does not open an editor. Holding the left button and moving beyond the system threshold initiates a file drag. When Windows disables client-area animation, transitions become effectively immediate without changing the idle lifetime.
+These values are not measured native macOS specifications. Geometry, gestures, animation curves, and timing must still be compared against a versioned macOS reference. Clicking the card background does not open an editor; its Annotate pencil does. Holding the left button and moving beyond the system threshold initiates a file drag. When Windows disables client-area animation, transitions become effectively immediate without changing the idle lifetime.
 
 ## Run
 
@@ -94,7 +98,7 @@ cargo run --release
 2. Press `Alt + Shift + S`.
 3. Drag to select a region, then release to save.
 4. The preview appears in the bottom-right corner without taking keyboard focus.
-5. Every new screenshot automatically copies its original image to the clipboard. Hover for Copy, Save, pin, and close; Copy restores an older image, and Save chooses a PNG destination. Annotate and Upload are disabled for now. Drag a card's background into Explorer or a compatible terminal to copy its file. Overflow permanently evicts the oldest unpinned thumbnail; there is no preview history.
+5. Every new screenshot automatically copies its original image to the clipboard. Hover for Copy, Save, pin, and close; Copy restores an older image, and Save chooses a PNG destination. Annotate opens the native editor; Upload remains disabled. Drag a card's background into Explorer or a compatible terminal to copy its file. Overflow permanently evicts the oldest unpinned thumbnail; there is no preview history.
 6. Pin a card to keep it beyond the timer, in its existing stack position. Unpin preserves capture order and starts a fresh timeout. Closing or successfully dragging an unpinned card compacts the stack without changing surviving pins. Closing cards never deletes their PNGs.
 
 Debug or redirected console diagnostics include saved file paths. Use **Auto-close** in the tray to choose a timeout or Never; **Close all screenshots** closes pending cards and pins.
@@ -114,6 +118,19 @@ cargo build --release
 
 Unit tests cover selection direction, clamping, empty regions, crop boundaries, display-rotation transforms, invalid PNG buffers, and a real WIC PNG round trip through a Unicode filename containing spaces. Thumbnail tests cover layout at 100%, 125%, 150%, and 200% scaling, negative monitor origins, extreme aspect ratios, rounded hit testing, hover/drag/capture-hidden timing, pin/unpin lifecycles, Never, interval changes, interrupted dismissal, disabled motion, distinct DPI-scaled controls, permanent queue eviction/no-resurrection, chronological pin placement/compaction, screen-derived capacity, and persisted settings. Drag tests check actual COM source behavior, STA affinity, unchanged premultiplied card-pixel upload, invalid drag buffers, system thresholds, and native `CF_HDROP` paths with spaces and Unicode.
 
+### Focused editor test
+
+```powershell
+cargo build --release
+pwsh -NoProfile -Sta -File ./scripts/smoke-capture.ps1 -Configuration release -EditorOnly
+# Also test an accepted editor file drop into a real isolated Explorer folder:
+pwsh -NoProfile -Sta -File ./scripts/smoke-capture.ps1 -Configuration release -EditorOnly -DragDrop
+```
+
+Uses actual desktop capture and the thumbnail Annotate button, checking activation, native caption, one session per capture, full-image pixels, zoom menu, real pan/Escape rollback, Fit/resize, original image clipboard, Save As cancel/Unicode export, OLE drag/Escape, optional accepted Explorer copy, independent source/other-card timeouts, exclusion from new captures, minimized-state preservation, concurrent editors/native close, protection after preview close, and quit during editor Save As. The original PNG and clipboard survive shutdown. Local artifacts include `.pi/capture-smoke/editor-shell.png`.
+
+Passed repeatedly on the available 1080p/96-DPI desktop. Fmt, clippy, 62 unit tests, full capture smoke, ActionsOnly, FifoOnly, and repeated GalleryOnly also passed. Editor unit coverage includes geometry, Fit/aspect, pointer-anchored zoom, pan bounds, alpha premultiplication, bounded decoding, preview output, and source reservation. Real mixed-DPI monitors, light-theme rendering, installed Mac comparison, and remaining annotation tools are not yet validated. Tests move the actual pointer and open dialogs; do not interact while they run. All test files/settings are isolated under `.pi/`.
+
 ### Focused Save As / clipboard test
 
 ```powershell
@@ -124,7 +141,7 @@ cargo build --release
 pwsh -NoProfile -Sta -File ./scripts/smoke-capture.ps1 -Configuration release -ActionsOnly
 ```
 
-This mode runs only capture/image clipboard and thumbnail actions, not the complete suite. It checks original PNG bytes and native image pixels/dimensions, automatic replacement on the next capture, clipboard-lock retry, manual recopy of an older capture, disabled placeholders/focus, Save As cancellation beyond the idle budget, Unicode/spaced export, unpinned dismissal, unchanged pin placement, real overwrite confirmation, quit during Save As, and clipboard persistence after shutdown. Five focused unit tests cover clipboard buffers, atomic success/failure and unchanged targets, and all six control targets at four DPI scales. The real desktop, mouse, keyboard and clipboard are used; do not interact while it runs. The native save dialog must expose English Save/Cancel labels. File/settings fixtures are isolated under `.pi/capture-smoke/`.
+This mode runs only capture/image clipboard and thumbnail actions, not the complete suite. It checks original PNG bytes and native image pixels/dimensions, automatic replacement on the next capture, clipboard-lock retry, manual recopy of an older capture, disabled Upload/focus, Save As cancellation beyond the idle budget, Unicode/spaced export, unpinned dismissal, unchanged pin placement, real overwrite confirmation, quit during Save As, and clipboard persistence after shutdown. Five focused unit tests cover clipboard buffers, atomic success/failure and unchanged targets, and all six control targets at four DPI scales. The real desktop, mouse, keyboard and clipboard are used; do not interact while it runs. The native save dialog must expose English Save/Cancel labels. File/settings fixtures are isolated under `.pi/capture-smoke/`.
 
 ### Focused gallery regression test
 

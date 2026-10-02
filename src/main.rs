@@ -4,6 +4,7 @@ mod capture;
 mod cleanup;
 mod clipboard;
 mod drag_drop;
+mod editor;
 mod export;
 mod gallery;
 mod geometry;
@@ -55,6 +56,7 @@ fn exit_requested() -> bool {
 enum WorkResult {
     Captured(Result<capture::Snapshot>),
     Saved(Result<thumbnail::SavedScreenshot>),
+    EditorLoaded(usize, Result<storage::Raster>),
 }
 
 struct PendingClipboard {
@@ -73,9 +75,36 @@ struct App {
     compositor: Rc<thumbnail::Compositor>,
     started: Instant,
     clipboard: Option<PendingClipboard>,
+    editors: Vec<editor::Editor>,
+    editor_capture_focus: Option<(HWND, HWND)>,
 }
 
 impl App {
+    fn capture_hidden(&mut self, hidden: bool) -> Result<bool> {
+        let foreground = unsafe { GetForegroundWindow() };
+        let mut visible = self.gallery.capture_hidden(hidden)?;
+        let active_editor = self
+            .editors
+            .iter()
+            .any(|editor| editor.hwnd() == foreground);
+        for editor in &mut self.editors {
+            visible |= editor.capture_hidden(hidden)?;
+        }
+        if hidden && active_editor {
+            self.editor_capture_focus = Some((foreground, unsafe { GetForegroundWindow() }));
+        } else if !hidden && let Some((editor, fallback)) = self.editor_capture_focus.take() {
+            // Restore intentional editor focus only if the user hasn't switched apps.
+            if unsafe { GetForegroundWindow() } == fallback
+                && self.editors.iter().any(|e| e.hwnd() == editor)
+            {
+                unsafe {
+                    let _ = SetForegroundWindow(editor);
+                }
+            }
+        }
+        Ok(visible)
+    }
+
     fn start_capture(&mut self) -> Result<()> {
         if self.pending || self.overlay.is_some() {
             return Ok(());
@@ -87,14 +116,14 @@ impl App {
         let monitor = unsafe { MonitorFromPoint(pointer, MONITOR_DEFAULTTONEAREST) }.0 as isize;
         // Hide all pending/pinned cards, without discarding them, before DXGI.
         // Their clocks pause for the entire selection and PNG publication.
-        if self.gallery.capture_hidden(true)? {
+        if self.capture_hidden(true)? {
             unsafe {
                 DwmFlush()?;
             }
         }
         self.started = Instant::now();
         if let Err(error) = self.worker.capture(monitor) {
-            self.gallery.capture_hidden(false)?;
+            self.capture_hidden(false)?;
             self.schedule_thumbnail_timer()?;
             return Err(error);
         }
@@ -104,17 +133,40 @@ impl App {
     }
 
     fn receive_work(&mut self) -> Result<()> {
-        let result = self
-            .receiver
-            .try_recv()
-            .context("Capture worker returned no result")?;
-        self.pending = false;
+        // Nested loops coalesce wake messages. Drain every completion, including
+        // editor loads closed before completion, rather than losing a second result.
+        let mut first_error = None;
+        while let Ok(result) = self.receiver.try_recv() {
+            if let Err(error) = self.receive_result(result) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn receive_result(&mut self, result: WorkResult) -> Result<()> {
+        if !matches!(&result, WorkResult::EditorLoaded(..)) {
+            self.pending = false;
+        }
         match result {
+            WorkResult::EditorLoaded(id, result) => {
+                if let Some(index) = self.editors.iter().position(|e| e.matches(WPARAM(id))) {
+                    match result.and_then(|image| self.editors[index].load(image)) {
+                        Ok(()) => (),
+                        Err(error) => {
+                            let editor = self.editors.remove(index);
+                            self.gallery.set_editing(editor.path(), false)?;
+                            self.schedule_thumbnail_timer()?;
+                            return Err(error);
+                        }
+                    }
+                }
+            }
             WorkResult::Captured(result) => {
                 let snapshot = match result {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
-                        self.gallery.capture_hidden(false)?;
+                        self.capture_hidden(false)?;
                         self.schedule_thumbnail_timer()?;
                         return Err(error);
                     }
@@ -122,7 +174,7 @@ impl App {
                 match overlay::ActiveOverlay::create(self.controller, snapshot) {
                     Ok(overlay) => self.overlay = Some(overlay),
                     Err(error) => {
-                        self.gallery.capture_hidden(false)?;
+                        self.capture_hidden(false)?;
                         self.schedule_thumbnail_timer()?;
                         return Err(error);
                     }
@@ -151,6 +203,7 @@ impl App {
                     self.gallery.timeout(),
                 )?;
                 self.gallery.insert(preview)?;
+                self.capture_hidden(false)?;
                 self.schedule_thumbnail_timer()?;
                 println!("Preview ready in {} ms", self.started.elapsed().as_millis());
                 clipboard?;
@@ -166,13 +219,13 @@ impl App {
         let (region, error) = overlay.result();
         if let Some(error) = error {
             drop(overlay);
-            self.gallery.capture_hidden(false)?;
+            self.capture_hidden(false)?;
             self.schedule_thumbnail_timer()?;
             anyhow::bail!("{error}");
         }
         let Some(region) = region else {
             drop(overlay);
-            self.gallery.capture_hidden(false)?;
+            self.capture_hidden(false)?;
             self.schedule_thumbnail_timer()?;
             println!("Selection canceled");
             return Ok(());
@@ -184,7 +237,7 @@ impl App {
         );
         self.started = Instant::now();
         if let Err(error) = self.worker.save(snapshot, region) {
-            self.gallery.capture_hidden(false)?;
+            self.capture_hidden(false)?;
             self.schedule_thumbnail_timer()?;
             return Err(error);
         }
@@ -252,6 +305,75 @@ impl App {
             println!("Exported: {}", path.display());
         }
         result.map(|_| ())
+    }
+
+    fn annotate_thumbnail(&mut self, source: WPARAM) -> Result<()> {
+        let Some(item) = self.gallery.get(source) else {
+            return Ok(());
+        };
+        let path = item.path().to_path_buf();
+        if let Some(editor) = self.editors.iter().find(|editor| editor.path() == path) {
+            editor.activate();
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.editors.len() < 4,
+            "Close an editor before opening another (four concurrent editors maximum)"
+        );
+        let editor = editor::Editor::create(self.controller, HWND(source.0 as *mut _), &path)?;
+        self.worker.load_editor(editor.id(), path.clone())?;
+        self.editors.push(editor);
+        self.gallery.set_editing(&path, true)?;
+        self.schedule_thumbnail_timer()
+    }
+
+    fn editor_action(&mut self, source: WPARAM, action: isize) -> Result<()> {
+        let Some(index) = self
+            .editors
+            .iter()
+            .position(|editor| editor.matches(source))
+        else {
+            return Ok(());
+        };
+        if action == editor::CLOSE {
+            println!(
+                "Editor close requested: {}",
+                self.editors[index].path().display()
+            );
+            let editor = self.editors.remove(index);
+            self.gallery.set_editing(editor.path(), false)?;
+            drop(editor);
+            return self.schedule_thumbnail_timer();
+        }
+        if action == editor::COPY {
+            let editor = &self.editors[index];
+            let image = editor.image().context("Screenshot is still opening")?;
+            let clipboard =
+                clipboard::Image::new(editor.path(), &image.pixels, image.width, image.height)?;
+            return self.queue_clipboard(clipboard);
+        }
+        if action == editor::ERROR {
+            if let Some(error) = self.editors[index].take_error() {
+                anyhow::bail!("{error}");
+            }
+            return Ok(());
+        }
+        // Take the owner out before entering native modal/reentrant loops.
+        self.gallery.pause_all()?;
+        let mut editor = self.editors.remove(index);
+        unsafe {
+            let _ = KillTimer(Some(self.controller), THUMBNAIL_TIMER);
+        }
+        let result = match action {
+            editor::SAVE => export::save_as(editor.hwnd(), editor.path()).map(|_| ()),
+            editor::DRAG => editor.run_drag().map(|_| ()),
+            editor::ZOOM_MENU => editor.zoom_menu(),
+            _ => Ok(()),
+        };
+        self.editors.insert(index, editor);
+        self.gallery.reflow()?;
+        self.schedule_thumbnail_timer()?;
+        result
     }
 
     fn copy_thumbnail(&mut self, source: WPARAM) -> Result<()> {
@@ -347,7 +469,7 @@ impl App {
         // or leave their resumed clocks without a timer.
         if !self.pending
             && self.overlay.is_none()
-            && let Err(recovery) = self.gallery.capture_hidden(false)
+            && let Err(recovery) = self.capture_hidden(false)
         {
             eprintln!("Preview recovery failed: {recovery:#}");
         }
@@ -373,6 +495,7 @@ impl Drop for App {
             let _ = KillTimer(Some(self.controller), CLIPBOARD_TIMER);
         }
         self.clipboard.take();
+        self.editors.clear();
         self.overlay.take();
         self.clear_thumbnail();
         self.worker.shutdown();
@@ -436,6 +559,8 @@ unsafe extern "system" fn controller_proc(
             | thumbnail::CONTEXT_MENU
             | thumbnail::SAVE
             | thumbnail::COPY
+            | thumbnail::ANNOTATE
+            | editor::ACTION
             | tray::SET_TIMEOUT_REQUEST
             | tray::CLOSE_ALL_REQUEST
     ) || (message == WM_TIMER && matches!(wparam.0, THUMBNAIL_TIMER | CLIPBOARD_TIMER))
@@ -481,6 +606,7 @@ fn run() -> Result<()> {
     overlay::register_class()?;
     thumbnail::register_class()?;
     drag_drop::register_class()?;
+    editor::register_class()?;
     let compositor = thumbnail::Compositor::new()?;
     let controller = unsafe {
         let class = WNDCLASSW {
@@ -526,6 +652,8 @@ fn run() -> Result<()> {
         compositor,
         started: Instant::now(),
         clipboard: None,
+        editors: Vec::new(),
+        editor_capture_focus: None,
     };
     unsafe {
         RegisterHotKey(
@@ -594,6 +722,8 @@ fn run() -> Result<()> {
                 thumbnail::CONTEXT_MENU => app.context_menu(message.wParam),
                 thumbnail::SAVE => app.save_thumbnail(message.wParam),
                 thumbnail::COPY => app.copy_thumbnail(message.wParam),
+                thumbnail::ANNOTATE => app.annotate_thumbnail(message.wParam),
+                editor::ACTION => app.editor_action(message.wParam, message.lParam.0),
                 WM_TIMER if message.wParam.0 == CLIPBOARD_TIMER => app.publish_clipboard(),
                 tray::SET_TIMEOUT_REQUEST => app.configure_timeout(message.wParam.0),
                 tray::CLOSE_ALL_REQUEST => {
@@ -634,28 +764,37 @@ mod tests {
     #[test]
     fn nested_loop_preserves_completions_and_coalesces_lifecycle_messages() {
         DEFERRED_MESSAGES.with(|queue| queue.borrow_mut().clear());
-        for (message, source) in [
-            (WORK_READY, 0),
-            (WM_TIMER, THUMBNAIL_TIMER),
-            (WM_TIMER, THUMBNAIL_TIMER),
-            (thumbnail::HOVER_CHANGED, 10),
-            (thumbnail::HOVER_CHANGED, 10),
-            (thumbnail::HOVER_CHANGED, 20),
+        for (message, source, action) in [
+            (WORK_READY, 0, 0),
+            (WORK_READY, 0, 0),
+            (WM_TIMER, THUMBNAIL_TIMER, 0),
+            (WM_TIMER, THUMBNAIL_TIMER, 0),
+            (thumbnail::HOVER_CHANGED, 10, 0),
+            (thumbnail::HOVER_CHANGED, 10, 0),
+            (thumbnail::HOVER_CHANGED, 20, 0),
+            (editor::ACTION, 31, editor::COPY),
+            (editor::ACTION, 31, editor::COPY),
+            (editor::ACTION, 31, editor::CLOSE),
         ] {
             unsafe {
-                controller_proc(HWND::default(), message, WPARAM(source), LPARAM(0));
+                controller_proc(HWND::default(), message, WPARAM(source), LPARAM(action));
             }
         }
         DEFERRED_MESSAGES.with(|queue| {
             let mut queue = queue.borrow_mut();
-            let messages: Vec<_> = queue.drain(..).map(|m| (m.message, m.wParam.0)).collect();
+            let messages: Vec<_> = queue
+                .drain(..)
+                .map(|m| (m.message, m.wParam.0, m.lParam.0))
+                .collect();
             assert_eq!(
                 messages,
                 vec![
-                    (WORK_READY, 0),
-                    (WM_TIMER, THUMBNAIL_TIMER),
-                    (thumbnail::HOVER_CHANGED, 10),
-                    (thumbnail::HOVER_CHANGED, 20),
+                    (WORK_READY, 0, 0),
+                    (WM_TIMER, THUMBNAIL_TIMER, 0),
+                    (thumbnail::HOVER_CHANGED, 10, 0),
+                    (thumbnail::HOVER_CHANGED, 20, 0),
+                    (editor::ACTION, 31, editor::COPY),
+                    (editor::ACTION, 31, editor::CLOSE),
                 ]
             );
         });

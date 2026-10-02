@@ -43,6 +43,7 @@ pub const PIN: u32 = WM_APP + 9;
 pub const CONTEXT_MENU: u32 = WM_APP + 10;
 pub const SAVE: u32 = WM_APP + 14;
 pub const COPY: u32 = WM_APP + 15;
+pub const ANNOTATE: u32 = WM_APP + 16;
 const CLASS_NAME: windows::core::PCWSTR = w!("SimpleScreenshot.Thumbnail");
 
 /// Published only after the complete PNG has been saved by the worker.
@@ -85,6 +86,7 @@ pub struct Thumbnail {
     timing: Timing,
     cached_pixels: Vec<u8>,
     visible: bool,
+    editing: bool,
 }
 
 impl Thumbnail {
@@ -160,6 +162,7 @@ impl Thumbnail {
                 timing,
                 cached_pixels: Vec::new(),
                 visible: false,
+                editing: false,
             };
             let dpi = GetDpiForWindow(hwnd);
             thumbnail.state.drag_width = GetSystemMetricsForDpi(SM_CXDRAG, dpi).max(1);
@@ -222,8 +225,19 @@ impl Thumbnail {
         Ok(())
     }
 
+    pub fn reserved(&self) -> bool {
+        self.pinned() || self.editing
+    }
+
+    pub fn set_editing(&mut self, editing: bool) -> Result<()> {
+        self.editing = editing;
+        self.set_paused(editing)
+    }
+
     pub fn set_paused(&mut self, paused: bool) -> Result<()> {
-        let action = self.lifecycle.set_paused(Instant::now(), paused);
+        let action = self
+            .lifecycle
+            .set_paused(Instant::now(), paused || self.editing);
         self.apply(action)?;
         Ok(())
     }
@@ -612,7 +626,8 @@ unsafe extern "system" fn window_proc(
                             Control::Close => Some(DISMISS),
                             Control::Save => Some(SAVE),
                             Control::Copy => Some(COPY),
-                            Control::Annotate | Control::Upload => None,
+                            Control::Annotate => Some(ANNOTATE),
+                            Control::Upload => None,
                         };
                         if let Some(message) = message {
                             let _ = PostMessageW(

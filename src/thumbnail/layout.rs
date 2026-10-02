@@ -46,7 +46,7 @@ impl Control {
         Self::Upload,
     ];
     pub fn enabled(self) -> bool {
-        !matches!(self, Self::Annotate | Self::Upload)
+        !matches!(self, Self::Upload)
     }
 }
 
@@ -234,7 +234,7 @@ mod tests {
                     && upload.left == pin.left
                     && annotate.top == upload.top
             );
-            assert!(!Control::Annotate.enabled() && !Control::Upload.enabled());
+            assert!(Control::Annotate.enabled() && !Control::Upload.enabled());
             assert!(Control::Save.enabled() && Control::Copy.enabled());
         }
         Ok(())

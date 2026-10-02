@@ -4,7 +4,7 @@
 
 Research recorded on 2026-10-02. User-approved follow-up: reproduce CleanShot X's **image Annotate editor**, including UI and interaction behavior, in Simple Screenshot. This supersedes the initial exclusion of screenshot editing, not the exclusions of cloud, accounts, recording, or a screenshot library.
 
-**This document is a researched specification, not an implemented editor or a claim of exact parity.** The Annotate thumbnail action remains disabled until the first working editor slice is delivered.
+**This document records the researched specification and delivery status, not a claim of exact parity.** Slice 1 is implemented: Annotate opens a native editor shell with full-resolution viewing, zoom/pan, Copy/Save As/Drag Me, source ownership, and capture recovery. Actual drawing/editing tools remain disabled and pending.
 
 Preserve the existing native Rust/Win32/Direct2D/DirectWrite/WIC implementation. No web UI, Electron, or replacement capture stack. Match the reference's structure and gestures; isolate unavoidable Windows differences such as window management, file dialogs, fonts, accessibility, and Command-to-Control mappings.
 
@@ -180,12 +180,12 @@ These are our safety/architecture decisions, not undocumented CleanShot specific
 
 ## 5. Native implementation design
 
-Proposed file boundaries, to create when the corresponding working slice is implemented:
+File boundaries, created or planned for the corresponding working slice:
 
 - `src/editor/mod.rs`: activated Win32 window, lifecycle, controller routing, focus/DPI, source-file ownership.
 - `src/editor/document.rs`: original image assets, stable object IDs, z-order, shapes/text/paths/redaction, canvas transformations, revision and dirty state.
 - `src/editor/history.rs`: transactional undo/redo. One gesture = one command; preview changes are not hundreds of history entries.
-- `src/editor/interaction.rs`: pointer capture, selection, handles, drag/resize, text editing, crop and cancellation states.
+- `src/editor/interaction.rs`: native callback/input handling, pan/cancellation, keyboard navigation, and output requests implemented; selection/handles/drawing/text/crop pending.
 - `src/editor/layout.rs`: shared draw/hit-test geometry in DIPs, responsive toolbar, context properties, popup and sidebar layout.
 - `src/editor/render.rs`: Direct2D rendering of document content, shared between viewport and offscreen export; DirectWrite text; UI/selection overlays separate.
 - `src/editor/export.rs`: render snapshot revision to full-size pixels, encode off-thread, atomically publish, then reuse clipboard/Save As/OLE integration.
@@ -194,7 +194,7 @@ Do not build a generic plugin system or speculative editor framework. Use explic
 
 ### Existing integration points inspected
 
-- `src/thumbnail/layout.rs`, `src/thumbnail/mod.rs`, `src/thumbnail/render.rs`: activate the disabled Annotate target, route an explicit controller request, and retain target separation from drag.
+- `src/thumbnail/layout.rs`, `src/thumbnail/mod.rs`, `src/thumbnail/render.rs`: Annotate is active, routes an explicit controller request, and remains separate from card-background drag.
 - `src/main.rs`: owns capture lifecycle, worker completion, clipboard retries, nested-loop handling, and gallery actions. Add editor routing without burying document logic in this file.
 - `src/gallery.rs`: source ownership and pause/restore behavior must coexist with permanent FIFO eviction and pins. Do not reuse global `pause_all()` for the whole editing session.
 - `src/storage.rs`: WIC PNG encoding and `protect_png()` already exist. Extend export support without rewriting the original source file or weakening cleanup protections.
@@ -216,11 +216,11 @@ Do not build a generic plugin system or speculative editor framework. Use explic
 
 ## 6. Delivery sequence
 
-This sequence avoids presenting disconnected demo tools as a complete editor. All rows are currently pending.
+This sequence avoids presenting disconnected demo tools as a complete editor. Slice 1 is delivered as a foundation; slices 2-6 remain pending. Exact reference parity and real mixed-DPI/light-theme visual checks remain pending even for the shell.
 
 | Slice | Working end-to-end outcome |
 | --- | --- |
-| 1. Editor shell | Real Annotate button -> activated native editor -> full original image; reference toolbar/footer, zoom/view transform, light/dark, source lifetime, cancel/close/capture recovery |
+| 1. Editor shell (implemented) | Real Annotate button -> activated native editor -> original image decoded off-thread; reference-derived toolbar/footer, Windows light/dark preference, Fit/percentage and pointer-anchored zoom, pan/Escape rollback, source reservation/protection, close/capture recovery, original-image Copy/Save/Drag Me |
 | 2. Core annotation | Select, rectangle/fill/ellipse/line, four arrow styles, smoothing pencil; editable handles; undo/redo; Copy/Save/Drag Me from a shared renderer |
 | 3. Text and steps | In-place Unicode/IME text, seven equivalent text styles, sequential counters, color picker/favorites/eyedropper, transactional property changes |
 | 4. Privacy and emphasis | Smooth/secure redaction choices, randomized pixelation, spotlight, real text-aware highlighter and modifier override |
@@ -275,4 +275,16 @@ Before merging `feat/thumbnail-save-actions` into `main`:
 - `cargo build --release`: passed.
 - `pwsh -NoProfile -Sta -File ./scripts/smoke-capture.ps1 -Configuration release -ActionsOnly`: passed on the interactive 96-DPI desktop, including original PNG/image clipboard, contention retry, focus, disabled placeholders, Save As cancel, Unicode/spaced path, overwrite, pin retention, and quit during Save As.
 
-Merged baseline: `570dc0e`. Annotation research branch: `feat/annotation-cleanshot-parity`. No remote push performed. Annotation runtime tests remain pending because the editor is not implemented yet.
+Merged baseline: `570dc0e`. Annotation research branch: `feat/annotation-cleanshot-parity`. No remote push performed.
+
+### Slice 1 validation
+
+- Fmt, clippy with warnings denied, 62 unit tests, and release build passed.
+- `-EditorOnly` desktop E2E passed repeatedly on the available 1080p/96-DPI desktop: activated editor/caption, one session per capture, exact original pixels, 200% zoom, 400% pan with Escape rollback, Fit/resize, Copy, Save As cancel and Unicode export, canceled native file drag, reserved source timeout without pausing other cards, exclusion from capture, minimized-state preservation, independent editors/close, protected source after closing all previews, and quit during editor Save As.
+- `-EditorOnly -DragDrop` additionally passed actual accepted file drops into an isolated Explorer folder, checking exact copied PNG bytes and preservation of source/editor.
+- Full capture smoke, ActionsOnly, FifoOnly, and repeated GalleryOnly passed after repairing two pre-existing test assumptions: waiting for HWND counts was not waiting for survivor reflow; moving the capture scene into the preview corner left the pointer hovering/dimming the card during unhovered pixel checks.
+- Native tooltips use the compatible TOOLINFO V2 size; first editor presentation intentionally ignores launcher `SW_HIDE`; standard nonclient initialization preserves the caption.
+- A capture/minimization regression was reproduced end to end and traced with LLDB to `MacGenieAnimThreadClassic` in the installed Windhawk minimize-animation hook. Capture hiding/restoring now uses visibility-only `SetWindowPos`, retaining minimized state without invoking minimize again. User Windhawk settings were not changed.
+- Source sessions/actions use monotonic IDs so an old decode or deferred action cannot target a recycled HWND. Original PNGs are unchanged; output is not based on the viewport or preview crop.
+- Explicit Windows choices: retain a visible, paused source card and reserve its stack slot; up to four editors; 256 MiB decoded-image bound; standard Windows caption/buttons/Segoe UI; output keeps the editor open. These are not claims about undocumented CleanShot preferences.
+- Local visual evidence: `.pi/capture-smoke/editor-shell.png`. Exact Mac comparison, real light-theme/mixed-DPI validation, screen-reader automation for the custom chrome, and the remaining drawing/editing tools are not signed off.

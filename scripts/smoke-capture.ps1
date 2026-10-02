@@ -7,10 +7,11 @@ param(
     [switch]$Gallery,
     [switch]$GalleryOnly,
     [switch]$FifoOnly,
-    [switch]$ActionsOnly
+    [switch]$ActionsOnly,
+    [switch]$EditorOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $EditorOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -41,6 +42,14 @@ public static class CaptureInput {
         public uint Type; public InputData Data;
         public MouseInput Mouse { get { return Data.Mouse; } set { Data.Mouse=value; } }
         public KeyboardInput Keyboard { get { return Data.Keyboard; } set { Data.Keyboard=value; } }
+    }
+    public static void Chord(ushort key, params ushort[] modifiers) {
+        var inputs=new System.Collections.Generic.List<Input>();
+        foreach(ushort modifier in modifiers){inputs.Add(new Input { Type=1,Keyboard=new KeyboardInput { Key=modifier } });}
+        inputs.Add(new Input { Type=1,Keyboard=new KeyboardInput { Key=key } });
+        inputs.Add(new Input { Type=1,Keyboard=new KeyboardInput { Key=key,Flags=2 } });
+        for(int i=modifiers.Length-1;i>=0;i--){inputs.Add(new Input { Type=1,Keyboard=new KeyboardInput { Key=modifiers[i],Flags=2 } });}
+        if(SendInput((uint)inputs.Count,inputs.ToArray(),Marshal.SizeOf(typeof(Input))) != inputs.Count){throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());}
     }
     public static void TypeText(string text) {
         var inputs=new System.Collections.Generic.List<Input>();
@@ -172,6 +181,15 @@ public static class CaptureInput {
     }
     public static IntPtr SceneWindow() { return FindWindow(null, "SimpleScreenshot E2E Scene"); }
     public static IntPtr OverlayWindow() { return FindWindow("SimpleScreenshot.Selection", null); }
+    public static IntPtr EditorWindow() { return FindWindow("SimpleScreenshot.Editor", null); }
+    public static bool IsEditor(IntPtr window) { var name=new System.Text.StringBuilder(128);GetClassName(window,name,128);return name.ToString()=="SimpleScreenshot.Editor"; }
+    public static IntPtr[] EditorWindows() { var result=new System.Collections.Generic.List<IntPtr>(); IntPtr w=IntPtr.Zero; while((w=FindWindowEx(IntPtr.Zero,w,"SimpleScreenshot.Editor",null))!=IntPtr.Zero){result.Add(w);} return result.ToArray(); }
+    public static int EditorCount() { return EditorWindows().Length; }
+    [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd,out Rect rect);
+    [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hwnd,ref Point point);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd,int command);
+    public static Rect ClientBounds(IntPtr hwnd) { Rect rect; GetClientRect(hwnd,out rect); Point p=new Point(); ClientToScreen(hwnd,ref p); return new Rect { Left=p.X,Top=p.Y,Right=p.X+rect.Right,Bottom=p.Y+rect.Bottom }; }
     [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out Rect rect);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
@@ -228,11 +246,8 @@ function Press-Key([byte]$Key) {
     [CaptureInput]::keybd_event($Key, 0, 2, [UIntPtr]::Zero)
 }
 function Press-Capture {
-    [CaptureInput]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
-    [CaptureInput]::keybd_event(0x10, 0, 0, [UIntPtr]::Zero)
-    Press-Key 0x53
-    [CaptureInput]::keybd_event(0x10, 0, 2, [UIntPtr]::Zero)
-    [CaptureInput]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+    # Keep the actual hotkey gesture indivisible across remote input packets.
+    [CaptureInput]::Chord(0x53,[ushort[]]@(0x12,0x10))
 }
 function Wait-Overlay([bool]$Visible) {
     for ($i = 0; $i -lt 100; $i++) {
@@ -275,6 +290,11 @@ function Start-Selection([switch]$KeepPreviews) {
     $script:expectedFocus = [CaptureInput]::GetForegroundWindow()
     Press-Capture
     $window = Wait-Overlay $true
+    if($EditorOnly){
+        foreach($editorWindow in [CaptureInput]::EditorWindows()){
+            if([CaptureInput]::IsWindowVisible($editorWindow)){throw 'An editor remained visible while capturing the desktop.'}
+        }
+    }
     Start-Sleep -Milliseconds 150
     return $window
 }
@@ -345,6 +365,10 @@ function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeig
         $ready = $false
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
         while ($clock.ElapsedMilliseconds -lt 1500) {
+            # The exclusion fixture moves the scene into the preview corner.
+            # Its capture pointer can hover the new card and correctly dim it.
+            # Inspect explicitly unhovered pixels, not that dimmed UI.
+            [CaptureInput]::MouseAt(($work.Left+10),($work.Top+10),0)
             $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size)
             $ready = $true
             foreach ($sample in $Samples) {
@@ -680,6 +704,18 @@ function Preview-Rect([IntPtr]$Window) {
     if(-not [CaptureInput]::GetWindowRect($Window,[ref]$rect)){throw "Missing preview $Window"}
     return $rect
 }
+function Wait-PreviewTop([IntPtr]$Window,[int]$Top) {
+    # DestroyWindow changes counts before the controller finishes reflowing survivors.
+    # Wait for the visible outcome, not for a guessed animation/scheduler delay.
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    while($clock.ElapsedMilliseconds -lt 2500){
+        $r=Preview-Rect $Window
+        if($r.Top -eq $Top){return $r}
+        Start-Sleep -Milliseconds 10
+    }
+    Save-GalleryScreenshot 'gallery-compaction-failure.png'
+    throw "Preview did not compact to $Top (actual=$($r.Top))."
+}
 function Assert-Stack($Records) {
     # Records are oldest first, matching bottom-to-top visual order.
     $previous=$null
@@ -807,11 +843,11 @@ function Test-Actions {
     Assert-ClipboardImage $first.Shot
     Wait-GalleryCounts 2 2
     if([CaptureInput]::GetForegroundWindow() -ne $focus){throw 'Copy stole keyboard focus.'}
-    foreach($action in @('Annotate','Upload')){Click-PreviewAction $first.Window $action}
+    Click-PreviewAction $first.Window 'Upload'
     Wait-GalleryCounts 2 2
     if([CaptureInput]::GetForegroundWindow() -ne $focus -or [CaptureInput]::DragWindow() -ne [IntPtr]::Zero){throw 'Disabled placeholder triggered an action or drag.'}
     Save-GalleryScreenshot 'thumbnail-actions-hover.png'
-    Write-Host 'PASS: Copy restores older original image, placeholders do nothing, preview actions preserve focus'
+    Write-Host 'PASS: Copy restores older original image, Upload is inert, preview actions preserve focus'
 
     Set-AutoClose '5 seconds' '5'
     Click-PreviewAction $first.Window 'Save'
@@ -857,6 +893,216 @@ function Test-Actions {
     if([CaptureInput]::PendingCount() -ne 0 -or -not (Test-Path $second.Shot)){throw 'Save As shutdown left windows or deleted source PNG.'}
     Assert-ClipboardImage $first.Shot
     Write-Host 'PASS: quit safely cancels the native Save As dialog; source files and pasted clipboard image survive shutdown'
+}
+function Press-EditorChord([byte]$Key,[switch]$Shift) {
+    $modifiers=if($Shift){[ushort[]]@(17,16)}else{[ushort[]]@(17)}
+    [CaptureInput]::Chord($Key,$modifiers)
+}
+function Wait-Editor([bool]$Visible=$true) {
+    for($i=0;$i -lt 150;$i++){
+        $w=[CaptureInput]::EditorWindow()
+        if(-not $Visible -and $w -eq [IntPtr]::Zero){return $w}
+        if($Visible -and $w -ne [IntPtr]::Zero -and [CaptureInput]::IsWindowVisible($w)){
+            $log=Get-Content (Join-Path $artifacts 'stdout.log') -Raw
+            if($log.Contains('Editor loaded:')){return $w}
+        }
+        Start-Sleep -Milliseconds 25
+    }
+    Save-GalleryScreenshot 'editor-failure.png'
+    throw "Editor visibility did not become $Visible."
+}
+function Click-EditorAction([IntPtr]$Window,[string]$Action) {
+    $r=[CaptureInput]::ClientBounds($Window);$s=[CaptureInput]::GetDpiForWindow($Window)/96.0
+    switch($Action){
+        'Save' {$x=$r.Right-60*$s;$y=$r.Top+24*$s}
+        'Copy' {$x=$r.Right-68*$s;$y=$r.Bottom-24*$s}
+        'Zoom' {$x=$r.Left+56*$s;$y=$r.Bottom-24*$s}
+        'Rectangle' {$x=$r.Left+164*$s;$y=$r.Top+24*$s}
+        default {throw 'Unknown editor action'}
+    }
+    [CaptureInput]::ClickAt([int]$x,[int]$y)
+}
+function Assert-EditorPixels([IntPtr]$Window,[string]$Source,[double]$Zoom=1.0) {
+    $r=[CaptureInput]::ClientBounds($Window);$s=[CaptureInput]::GetDpiForWindow($Window)/96.0
+    $sourceImage=[Drawing.Bitmap]::new($Source)
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    $match=$false
+    try{
+        while($clock.ElapsedMilliseconds -lt 3000){
+            $bitmap=[Drawing.Bitmap]::new(($r.Right-$r.Left),($r.Bottom-$r.Top))
+            $g=[Drawing.Graphics]::FromImage($bitmap)
+            try{
+                $g.CopyFromScreen($r.Left,$r.Top,0,0,$bitmap.Size)
+                $left=($bitmap.Width-$sourceImage.Width*$Zoom*$s)/2
+                $top=48*$s+($bitmap.Height-96*$s-$sourceImage.Height*$Zoom*$s)/2
+                $match=$true
+                foreach($p in @(@(5,170),@(30,30),@(200,30))){
+                    $x=[int][Math]::Floor($left+($p[0]+0.5)*$Zoom*$s);$y=[int][Math]::Floor($top+($p[1]+0.5)*$Zoom*$s)
+                    if($x -lt 0 -or $x -ge $bitmap.Width -or $y -lt 0 -or $y -ge $bitmap.Height -or $bitmap.GetPixel($x,$y).ToArgb() -ne $sourceImage.GetPixel($p[0],$p[1]).ToArgb()){$match=$false;break}
+                }
+            }finally{$g.Dispose();$bitmap.Dispose()}
+            if($match){return}
+            Start-Sleep -Milliseconds 25
+        }
+    }finally{$sourceImage.Dispose()}
+    Save-GalleryScreenshot 'editor-pixels-failure.png'
+    throw 'Editor changed original pixels, cropped image, or used incorrect zoom/DPI geometry.'
+}
+function Assert-EditorScreenColor([int]$X,[int]$Y,[string]$Color) {
+    $expected=[Drawing.Color]::FromName($Color).ToArgb();$clock=[Diagnostics.Stopwatch]::StartNew()
+    while($clock.ElapsedMilliseconds -lt 3000){
+        $bitmap=[Drawing.Bitmap]::new(1,1);$g=[Drawing.Graphics]::FromImage($bitmap)
+        try{$g.CopyFromScreen($X,$Y,0,0,$bitmap.Size);$match=$bitmap.GetPixel(0,0).ToArgb() -eq $expected}
+        finally{$g.Dispose();$bitmap.Dispose()}
+        if($match){return};Start-Sleep -Milliseconds 25
+    }
+    Save-GalleryScreenshot 'editor-pan-failure.png';throw 'Editor pan did not transform image pixels or cancel back to the previous view.'
+}
+function Test-Editor {
+    if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run EditorOnly with pwsh -Sta.'}
+    Add-Type -AssemblyName UIAutomationClient
+    Add-Type -AssemblyName UIAutomationTypes
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $first=New-TestPreview
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $first.Window 'Annotate'
+    $editor=Wait-Editor
+    if([CaptureInput]::GetForegroundWindow() -ne $editor){throw 'Annotate did not intentionally activate the editor.'}
+    Assert-EditorPixels $editor $first.Shot
+    if([CaptureInput]::TaggedWindow('Annotate - Simple Screenshot',[uint32]$app.Id) -ne $editor){throw 'Native editor caption is missing.'}
+    Save-GalleryScreenshot 'editor-shell.png'
+    Click-PreviewAction $first.Window 'Annotate'
+    if([CaptureInput]::EditorCount() -ne 1){throw 'Repeated Annotate created duplicate sessions.'}
+    Click-EditorAction $editor 'Rectangle'
+    if([CaptureInput]::EditorCount() -ne 1 -or [CaptureInput]::DragWindow() -ne [IntPtr]::Zero){throw 'Disabled drawing tool launched an unrelated action.'}
+    Write-Host 'PASS: real Annotate opens one activated native editor, original full-resolution pixels, disabled drawing tools are inert'
+
+    Click-EditorAction $editor 'Zoom'
+    for($i=0;$i -lt 100 -and [CaptureInput]::MenuWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::MenuWindow() -eq [IntPtr]::Zero){throw 'Zoom menu did not open.'}
+    Select-TrayItem '200%' -Accessible
+    [CaptureInput]::MouseAt(100,100,0)
+    Assert-EditorPixels $editor $first.Shot 2.0
+    Click-EditorAction $editor 'Copy'
+    Assert-ClipboardImage $first.Shot
+    [void][CaptureInput]::SetForegroundWindow($editor)
+    Press-EditorChord 0x30
+    Assert-EditorPixels $editor $first.Shot
+    Click-EditorAction $editor 'Zoom';Select-TrayItem '400%' -Accessible
+    $bounds=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $cx=[int](($bounds.Left+$bounds.Right)/2);$cy=[int](($bounds.Top+$bounds.Bottom)/2)
+    [CaptureInput]::MouseAt(100,100,0);Assert-EditorScreenColor ([int]($cx+20*$s)) $cy 'Lime'
+    [CaptureInput]::HoldAt($cx,$cy);[CaptureInput]::MouseAt(([int]($cx+60*$s)),$cy,0);[CaptureInput]::DropAt(([int]($cx+60*$s)),$cy)
+    [CaptureInput]::MouseAt(100,100,0);Assert-EditorScreenColor ([int]($cx+20*$s)) $cy 'Red'
+    [CaptureInput]::HoldAt($cx,$cy);[CaptureInput]::MouseAt(([int]($cx-60*$s)),$cy,0);Start-Sleep -Milliseconds 100
+    Press-Key 27;[CaptureInput]::DropAt(([int]($cx-60*$s)),$cy);[CaptureInput]::MouseAt(100,100,0)
+    Assert-EditorScreenColor ([int]($cx+20*$s)) $cy 'Red'
+    Press-EditorChord 0x30
+    Assert-EditorPixels $editor $first.Shot
+    [void][CaptureInput]::MoveWindow($editor,450,180,800,520,$true)
+    Assert-EditorPixels $editor $first.Shot
+    Write-Host 'PASS: native zoom menu, actual pan/Escape rollback, Fit and resize share correct geometry; Copy exports original pixels, not viewport'
+
+    Click-EditorAction $editor 'Save';[void](Wait-SaveDialog $true)
+    Press-Key 27;[void](Wait-SaveDialog $false)
+    if(-not [CaptureInput]::IsWindow($editor)){throw 'Save cancellation destroyed editor.'}
+    $destination=Join-Path $artifacts ('Editor export 日本 '+[Guid]::NewGuid().ToString('N')+'.png');$script:created+=$destination
+    Click-EditorAction $editor 'Save';Enter-SavePath $destination
+    Assert-SavedCopy $destination $first.Shot
+    if(-not [CaptureInput]::IsWindow($editor)){throw 'Save destroyed the editable session.'}
+    Write-Host 'PASS: editor native Save As cancel/Unicode export preserves original bytes and session'
+
+    $r=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $x=[int](($r.Left+$r.Right)/2);$y=[int]($r.Bottom-24*$s)
+    [CaptureInput]::HoldAt($x,$y);Start-Sleep -Milliseconds 100
+    [CaptureInput]::MouseAt(($x+60),($y-60),0);Start-Sleep -Milliseconds 100
+    for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::DragWindow() -eq [IntPtr]::Zero){throw 'Drag Me did not start native OLE file drag.'}
+    Press-Key 27;[CaptureInput]::DropAt(($x+60),($y-60))
+    for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -ne [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::DragWindow() -ne [IntPtr]::Zero -or -not [CaptureInput]::IsWindow($editor)){throw 'Canceled Drag Me did not preserve editor.'}
+    Write-Host 'PASS: Drag Me starts actual OLE drag; Escape preserves original image and session'
+    if($DragDrop){
+        $folder=Join-Path $artifacts ('Editor drop '+[Guid]::NewGuid().ToString('N'))
+        [void](New-Item -ItemType Directory -Force $folder)
+        $shellApp=New-Object -ComObject Shell.Application
+        $existing=@($shellApp.Windows() | ForEach-Object {$_.HWND})
+        $shellApp.Explore($folder)
+        for($i=0;$i -lt 200;$i++){
+            foreach($window in $shellApp.Windows()){
+                try{if($window.Document.Folder.Self.Path -eq $folder){$script:explorerWindow=$window;break}}catch{}
+            }
+            if($script:explorerWindow){break};Start-Sleep -Milliseconds 25
+        }
+        if(-not $script:explorerWindow){throw 'Editor drop Explorer folder did not open.'}
+        $script:closeExplorer=$script:explorerWindow.HWND -notin $existing
+        $explorer=[IntPtr]$script:explorerWindow.HWND
+        $screen=[Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        [void][CaptureInput]::MoveWindow($explorer,($screen.Right-720),($screen.Top+60),700,650,$true)
+        [void][CaptureInput]::SetForegroundWindow($explorer);Start-Sleep -Milliseconds 150
+        $bounds=Preview-Rect $explorer;$tx=[int]($bounds.Left+($bounds.Right-$bounds.Left)*0.8);$ty=[int]($bounds.Top+($bounds.Bottom-$bounds.Top)*0.6)
+        [void][CaptureInput]::SetForegroundWindow($editor)
+        $bounds=[CaptureInput]::ClientBounds($editor);$x=[int](($bounds.Left+$bounds.Right)/2);$y=[int]($bounds.Bottom-24*$s)
+        [CaptureInput]::HoldAt($x,$y);Start-Sleep -Milliseconds 75
+        [CaptureInput]::MouseAt($tx,$ty,0)
+        for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+        if([CaptureInput]::DragWindow() -eq [IntPtr]::Zero){throw 'Editor Explorer drag never started.'}
+        Start-Sleep -Milliseconds 200;[CaptureInput]::DropAt($tx,$ty)
+        $copied=Join-Path $folder (Split-Path $first.Shot -Leaf);$script:created+=$copied
+        Assert-SavedCopy $copied $first.Shot
+        if(-not [CaptureInput]::IsWindow($editor) -or -not (Test-Path $first.Shot)){throw 'Accepted editor drag lost session or original.'}
+        Write-Host 'PASS: actual Drag Me drop into Explorer copies exact original PNG and preserves editor'
+    }
+
+    Set-AutoClose '5 seconds' '5';[CaptureInput]::MouseAt(100,100,0)
+    Start-Sleep -Seconds 6
+    if(-not [CaptureInput]::IsWindow($first.Window)){throw 'Editing source auto-expired.'}
+    $second=New-TestPreview -KeepPreviews
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    if(-not [CaptureInput]::IsWindowVisible($editor)){throw 'New capture did not restore editor.'}
+    Assert-Png $second.Shot
+    [CaptureInput]::MouseAt(100,100,0)
+    for($i=0;$i -lt 250 -and [CaptureInput]::IsWindow($second.Window);$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::IsWindow($second.Window) -or -not [CaptureInput]::IsWindow($first.Window)){throw 'Editing paused unrelated previews or failed to reserve source.'}
+    Set-AutoClose 'Never' 'never'
+    [void][CaptureInput]::ShowWindow($editor,6)
+    [void](Start-Selection -KeepPreviews);Press-Key 27;[void](Wait-Overlay $false)
+    if(-not [CaptureInput]::IsIconic($editor)){throw 'Capture cancellation restored minimized editor as a normal window.'}
+    [void][CaptureInput]::ShowWindow($editor,9)
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    [void][CaptureInput]::SetForegroundWindow($editor)
+    Assert-EditorPixels $editor $first.Shot
+    Write-Host 'PASS: source timeout is paused independently, editor is excluded from new capture, capture cancellation preserves minimized state'
+
+    $third=New-TestPreview -KeepPreviews
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $third.Window 'Annotate'
+    $other=[IntPtr]::Zero
+    for($i=0;$i -lt 150;$i++){
+        $candidate=[CaptureInput]::GetForegroundWindow()
+        if($candidate -ne $editor -and [CaptureInput]::IsEditor($candidate)){$other=$candidate;break}
+        Start-Sleep -Milliseconds 25
+    }
+    if([CaptureInput]::EditorCount() -ne 2){throw 'Opening another capture did not create an independent editor.'}
+    if($other -eq [IntPtr]::Zero){throw 'Second editor was not activated.'}
+    [void][CaptureInput]::PostMessage($other,0x0010,[IntPtr]::Zero,[IntPtr]::Zero)
+    for($i=0;$i -lt 100 -and [CaptureInput]::EditorCount() -ne 1;$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::EditorCount() -ne 1 -or -not [CaptureInput]::IsWindow($editor)){throw 'Closing second editor affected first session.'}
+    [void][CaptureInput]::SetForegroundWindow($editor)
+    Write-Host 'PASS: concurrent editors use independent lifetimes; native close tears down only the requested session'
+
+    Close-AllPreviews
+    if(-not [CaptureInput]::IsWindow($editor)){Save-GalleryScreenshot 'editor-close-source-failure.png';throw "Closing source previews destroyed editor: expected=$editor actual=$([CaptureInput]::EditorWindow()) count=$([CaptureInput]::EditorCount()) appExited=$($app.HasExited)."}
+    try{[IO.File]::Delete($first.Shot);throw 'Editor failed to protect active source from cleanup.'}
+    catch [IO.IOException] {if(($_.Exception.HResult -band 0xffff) -ne 32){throw}}
+    [void][CaptureInput]::SetForegroundWindow($editor);Press-EditorChord 0x43 -Shift
+    Assert-ClipboardImage $first.Shot
+    Click-EditorAction $editor 'Save';[void](Wait-SaveDialog $true)
+    [void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(),0x8008,[IntPtr]::Zero,[IntPtr]::Zero)
+    if(-not $app.WaitForExit(5000) -or $app.ExitCode -ne 0){throw 'Quit did not cancel editor Save As.'}
+    if([CaptureInput]::EditorCount() -ne 0 -or -not (Test-Path $first.Shot)){throw 'Shutdown left editor windows or removed original.'}
+    Assert-ClipboardImage $first.Shot
+    Write-Host 'PASS: independent source protection and copy survive preview close; quit cancels modal output and releases editor windows'
 }
 function Test-Fifo {
     Close-AllPreviews
@@ -941,13 +1187,13 @@ function Test-Gallery {
     while($records.Count -le $capacity){$records+=New-TestPreview -KeepPreviews}
     Wait-GalleryCounts $capacity $capacity
     if([CaptureInput]::IsWindow($records[0].Window)){throw 'Evicted screenshot 1 still has a hidden window/backlog entry.'}
-    $newBottom=Preview-Rect $records[1].Window
+    $newBottom=Wait-PreviewTop $records[1].Window $bottom.Top
     if($newBottom.Top -ne $bottom.Top){throw 'Screenshot 2 did not drop into the vacated bottom slot.'}
     Assert-Stack @($records | Select-Object -Skip 1)
     Click-PreviewControl $records[1].Window
     Wait-GalleryCounts ($capacity-1) ($capacity-1)
-    $third=Preview-Rect $records[2].Window
-    if($third.Top -ne $bottom.Top -or [CaptureInput]::IsWindow($records[0].Window)){throw 'Removal resurrected screenshot 1 or failed to compact screenshot 3.'}
+    $third=Wait-PreviewTop $records[2].Window $bottom.Top
+    if($third.Top -ne $bottom.Top -or [CaptureInput]::IsWindow($records[0].Window)){Save-GalleryScreenshot 'gallery-compaction-failure.png';throw "Removal resurrected screenshot 1 or failed to compact screenshot 3: top=$($third.Top), expected=$($bottom.Top), evictedExists=$([CaptureInput]::IsWindow($records[0].Window))."}
     foreach($record in $records){if(-not (Test-Path $record.Shot)){throw 'Overflow removed a source PNG.'}}
     Write-Host 'PASS: 1 is permanently evicted; 2 drops down; closing 2 drops 3 down without resurrecting 1'
     Close-AllPreviews
@@ -964,7 +1210,7 @@ function Test-Gallery {
     }
     Click-PreviewControl $records[1].Window
     Wait-GalleryCounts 3 3
-    $shifted=Preview-Rect $records[2].Window
+    $shifted=Wait-PreviewTop $records[2].Window $second.Top
     $stillBottom=Preview-Rect $records[0].Window
     if($shifted.Top -ne $second.Top -or $stillBottom.Top -ne $bottom.Top -or -not [CaptureInput]::Pinned($records[2].Window)){throw 'Closing card 2 must compact pinned card 3 into slot 2 without unpinning.'}
     Assert-Stack @($records[0],$records[2],$records[3])
@@ -1278,7 +1524,8 @@ try {
     Write-Host 'PASS: real app startup cleans expired files, preserves recent/unrelated/locked files'
     Start-Sleep -Milliseconds 350
     if ($Layout) { Test-Layout }
-    if ($ActionsOnly) { Test-Actions }
+    if ($EditorOnly) { Test-Editor }
+    elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }
     if ($GalleryOnly) {

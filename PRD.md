@@ -10,13 +10,13 @@ The application has one primary purpose:
 
 > Take a screenshot, show it temporarily as a floating thumbnail in the bottom-right corner, and allow the user to drag and drop that screenshot anywhere.
 
-The capture baseline has no screenshot editor or annotation tools implemented. A library, account system, and unrelated complex UI remain excluded.
+The capture baseline originally excluded editing. The approved follow-up now has a native editor shell; actual annotation tools remain pending. A library, account system, and unrelated complex UI remain excluded.
 
 **Approved follow-up milestone:** add a CleanShot-inspired pending thumbnail queue, persistent pinned reference cards, and a configurable auto-close timer through the native tray. This is a limited Windows extension, not a complete CleanShot clone. Our screen-derived stack capacity and timer defaults are design choices; CleanShot's exact overflow layout, default lifetime, and hover semantics are not yet verified.
 
 ---
 
-**New approved annotation milestone:** implement a native image editor matching CleanShot X Annotate's UI and interactions, not merely its tool list. Research, observed references, implementation slices, and exact-parity validation gaps are recorded in [docs/annotation-cleanshot-research.md](docs/annotation-cleanshot-research.md). This includes editable annotations, privacy/emphasis tools, crop/resize/rotate/flip, backgrounds, multi-image composition, and an own-format editable project. Annotation remains unimplemented; cloud, accounts, recording, and a screenshot library remain excluded. Exact parity cannot be claimed from marketing videos alone.
+**New approved annotation milestone:** implement a native image editor matching CleanShot X Annotate's UI and interactions, not merely its tool list. Research, observed references, implementation slices, and exact-parity validation gaps are recorded in [docs/annotation-cleanshot-research.md](docs/annotation-cleanshot-research.md). This includes editable annotations, privacy/emphasis tools, crop/resize/rotate/flip, backgrounds, multi-image composition, and an own-format editable project. The native editor foundation is implemented; drawing and other editing tools remain pending. Cloud, accounts, recording, and a screenshot library remain excluded. Exact parity cannot be claimed from marketing videos alone.
 
 ## 2. Core User Flow
 
@@ -218,7 +218,7 @@ Apple's public documentation describes the lifetime as "a few seconds" rather th
 
 - Use a bounded, session-only FIFO preview queue. Capacity follows the monitor's usable height and DPI. Show one bottom-right stack, oldest at the bottom and newest at the top. New captures permanently evict the oldest unpinned thumbnail on overflow; survivors compact downward. For capacity five, 1-6 leaves only 2-6. Eviction destroys the thumbnail window and releases its resources, never its PNG.
 - No hidden backlog or older/newer paging. Evicted thumbnails must never return after timeout, manual close, successful drag, capture cancellation, or a new capture.
-- Expose Close top-left, Pin top-right, Copy above Save in the center, Annotate bottom-left, and Upload bottom-right, following the official CleanShot quick-access demo's relative arrangement. Annotate and Upload are disabled placeholders for now. Keep native context-menu actions and tray close-all.
+- Expose Close top-left, Pin top-right, Copy above Save in the center, Annotate bottom-left, and Upload bottom-right, following the official CleanShot quick-access demo's relative arrangement. Annotate opens the native editor shell; Upload remains disabled. Keep native context-menu actions and tray close-all.
 - Pins remain always on top and do not auto-expire. Pin/unpin preserves capture order and the existing stack position, without moving cards to another column. Pins reserve slots and remain visible during overflow. Removing a card compacts cards above it, preserving pin state. If every visible slot is pinned, new PNGs are saved but cannot add a preview to the full queue.
 - A successful file drop closes an unpinned card but preserves a pinned reference. Closing a card never deletes its PNG.
 - Pins currently use the same fixed centered-cover card. Resizing, opacity, click-through locking, full-size reference windows, and editing are not part of this milestone.
@@ -226,9 +226,21 @@ Apple's public documentation describes the lifetime as "a few seconds" rather th
 - Changing the selected timer starts a fresh interval; unpinning also starts a fresh interval. Hover and active drag pause rather than reset the remaining interval. Automatic dismissal is FIFO within each visible monitor stack: skip pins, finish the oldest unpinned card's exit before a newer card starts exiting. Newer elapsed budgets wait without resetting; hovering the oldest blocks automatic dismissal behind it. Permanently evicted overflow never blocks or returns to the surviving queue. Manual close and successful file drops remain independent of FIFO.
 - Persist the timer preference across launches, not the queue/pin session. Closing the app or changing display/DPI dismisses reference cards; temporary files remain governed by retention independently.
 - Automatically copy each successfully saved screenshot's original PNG and full-resolution native image to the clipboard, never its cropped preview or file path. Recopy older surviving cards with Copy. Retry brief clipboard contention without blocking UI; explicitly report permanent failure instead of promising impossible clipboard availability.
-- Save opens native PNG Save As with destination/name selection and overwrite confirmation. Export the original PNG bytes atomically, without re-encoding. Successful unpinned Save closes the thumbnail; pins remain in place. Cancel/failure retains the thumbnail and source file. Pause card clocks during the dialog and safely cancel it on quit. Cloud upload, login, and annotation editing remain unimplemented.
+- Save opens native PNG Save As with destination/name selection and overwrite confirmation. Export the original PNG bytes atomically, without re-encoding. Successful unpinned Save closes the thumbnail; pins remain in place. Cancel/failure retains the thumbnail and source file. Pause card clocks during the dialog and safely cancel it on quit. Cloud upload, login, and actual annotation tools remain unimplemented; the editor shell is available.
 
 ---
+
+### 5.4 Implemented Annotation Foundation
+
+- Annotate intentionally activates a normal native editor window, loading the original full-resolution PNG on the sleeping worker. Card background clicks/drags retain their existing non-activating behavior.
+- Repeated Annotate on the same capture raises its existing editor. Up to four independent editors may be open. Decoding is bounded to 256 MiB per image and rendering rejects images exceeding the device bitmap-size limit.
+- Source cards pause and reserve their existing queue slots without becoming pins or changing capture order. Overflow and automatic FIFO dismissal skip editor sources; other cards continue normally. Manual source close/Save/drop remains allowed and never invalidates the editor's independent source-file protection.
+- Editors hide during capture and restore their prior visible/minimized/maximized state without rerunning a minimize animation. Capture errors/cancellation restore them too. Closing the preview queue does not close editors.
+- Top tool strip and bottom zoom/Drag Me/output strip follow the observed image-editor layout, with native Windows window controls and typography. Windows light/dark preference is read without changing it. Unsupported tools are disabled and described by native tooltips.
+- Fit/percentage zoom, pointer-anchored Ctrl+wheel zoom, canvas pan/Escape rollback, keyboard focus navigation, Ctrl+0 Fit, Ctrl+1 100%, Ctrl+S Save As, Ctrl+Shift+C Copy, and Ctrl+W Close are explicit Windows behavior, not unverified CleanShot shortcut claims.
+- Copy/Save As/Drag Me currently output the original PNG/image, independent of view zoom, and keep the editor open. Quit safely cancels an editor Save As or OLE loop.
+- Native callback/controller events use session IDs, not recycled HWNDs, for loading/action routing. Completion handling drains coalesced worker notifications; modal output runs outside borrowed callback state.
+- Shape, arrow, text, redaction, crop, resize, background, combining images, and editable projects remain future slices. Source preservation and viewport output guarantees must continue when a shared document renderer is added.
 
 ## 6. Performance Requirements
 

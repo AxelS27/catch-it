@@ -21,6 +21,7 @@ use crate::{
 enum Command {
     Capture(isize),
     Save(Snapshot, Region),
+    LoadEditor(usize, std::path::PathBuf),
     Stop,
 }
 
@@ -72,6 +73,9 @@ impl Worker {
                             pixels,
                         })
                     })()),
+                    Command::LoadEditor(id, path) => {
+                        WorkResult::EditorLoaded(id, storage::load_png(&path))
+                    }
                     Command::Stop => break,
                 };
                 if results.send(result).is_err() {
@@ -101,6 +105,12 @@ impl Worker {
     pub fn save(&self, snapshot: Snapshot, region: Region) -> Result<()> {
         self.commands
             .send(Command::Save(snapshot, region))
+            .context("Capture worker stopped")
+    }
+
+    pub fn load_editor(&self, id: usize, path: std::path::PathBuf) -> Result<()> {
+        self.commands
+            .send(Command::LoadEditor(id, path))
             .context("Capture worker stopped")
     }
 

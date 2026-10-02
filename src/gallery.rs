@@ -60,6 +60,13 @@ impl Gallery {
     pub fn get(&self, source: WPARAM) -> Option<&Thumbnail> {
         self.items.iter().find(|item| item.matches(source))
     }
+    pub fn set_editing(&mut self, path: &std::path::Path, editing: bool) -> Result<()> {
+        if let Some(item) = self.items.iter_mut().find(|item| item.path() == path) {
+            item.set_editing(editing)?;
+        }
+        self.reflow()
+    }
+
     pub fn take(&mut self, source: WPARAM) -> Option<(usize, Thumbnail)> {
         let index = self.items.iter().position(|item| item.matches(source))?;
         Some((index, self.items.remove(index)))
@@ -118,13 +125,13 @@ impl Gallery {
             }
             let mut keep = vec![true; self.items.len()];
             for indices in groups.into_values() {
-                let pinned: Vec<_> = indices
+                let reserved: Vec<_> = indices
                     .iter()
-                    .map(|&index| self.items[index].pinned())
+                    .map(|&index| self.items[index].reserved())
                     .collect();
                 let capacity = self.items[indices[0]].capacity();
-                let slots = stack_slots(&pinned, capacity);
-                let head = fifo_head(&pinned, &slots);
+                let slots = stack_slots(&reserved, capacity);
+                let head = fifo_head(&reserved, &slots);
                 // Gate all timers before resuming visibility. Keep a dismissing
                 // head until its exit finishes, so newer cards cannot vanish first.
                 for (ordinal, &index) in indices.iter().enumerate() {
@@ -173,14 +180,14 @@ impl Gallery {
     }
 }
 
-/// Select newest pending cards alongside every pin, then pack oldest-to-newest
+/// Select newest pending cards alongside every pin/editor source, then pack oldest-to-newest
 /// from the bottom of the dock. None means permanent eviction, not a hidden page.
 /// Pinning changes lifetime, never capture order.
-fn stack_slots(pinned: &[bool], capacity: usize) -> Vec<Option<usize>> {
-    let pending_capacity = capacity.saturating_sub(pinned.iter().filter(|&&pin| pin).count());
+fn stack_slots(reserved: &[bool], capacity: usize) -> Vec<Option<usize>> {
+    let pending_capacity = capacity.saturating_sub(reserved.iter().filter(|&&slot| slot).count());
     let mut pending = 0;
     let mut selected = Vec::new();
-    for (index, &pin) in pinned.iter().enumerate() {
+    for (index, &pin) in reserved.iter().enumerate() {
         if pin {
             selected.push(index);
         } else {
@@ -190,15 +197,15 @@ fn stack_slots(pinned: &[bool], capacity: usize) -> Vec<Option<usize>> {
             pending += 1;
         }
     }
-    let mut slots = vec![None; pinned.len()];
+    let mut slots = vec![None; reserved.len()];
     for (slot, index) in selected.into_iter().rev().enumerate() {
         slots[index] = Some(slot);
     }
     slots
 }
 
-fn fifo_head(pinned: &[bool], slots: &[Option<usize>]) -> Option<usize> {
-    pinned
+fn fifo_head(reserved: &[bool], slots: &[Option<usize>]) -> Option<usize> {
+    reserved
         .iter()
         .zip(slots)
         .rposition(|(&pin, slot)| !pin && slot.is_some())
@@ -299,6 +306,19 @@ fn show_menu(controller: HWND, source: WPARAM, pinned: bool, count: usize) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_source_reserves_overflow_slot_and_does_not_block_other_timers() {
+        let reserved = [false, false, false, false, false, true];
+        let slots = stack_slots(&reserved, 5);
+        assert_eq!(
+            slots,
+            vec![Some(4), Some(3), Some(2), Some(1), None, Some(0)]
+        );
+        assert_eq!(fifo_head(&reserved, &slots), Some(3));
+        // Closing the editor releases the reservation, not capture order.
+        assert_eq!(stack_slots(&[false; 6], 5)[5], None);
+    }
 
     #[test]
     fn pin_and_unpin_preserve_slots_and_removal_compacts_surviving_pins() {
