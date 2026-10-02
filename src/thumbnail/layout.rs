@@ -127,7 +127,7 @@ impl Layout {
         // The default dock is bottom-right. Keep the physical inset relative
         // to the capture monitor's usable work area, clear of the taskbar.
         // Placement and per-edge offsets can become settings in a later slice.
-        let right_margin = (50.0 * scale).round().min(area.width as f32 / 4.0) as u32;
+        let right_margin = (20.0 * scale).round().min(area.width as f32 / 4.0) as u32;
         // Twenty DIPs leaves room for the 14-DIP shadow surface while keeping
         // the card visually close to the taskbar.
         let bottom_margin = (20.0 * scale).round().min(area.height as f32 / 4.0) as u32;
@@ -276,7 +276,7 @@ mod tests {
                     layout.y as f32 + (layout.card_top + layout.card_height) * layout.scale;
                 assert!(
                     (right
-                        - (area.left as f32 + area.width as f32 - (50.0 * layout.scale).round()))
+                        - (area.left as f32 + area.width as f32 - (20.0 * layout.scale).round()))
                     .abs()
                         < 0.01
                 );
