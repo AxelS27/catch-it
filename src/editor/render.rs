@@ -372,9 +372,9 @@ impl Renderer {
                 if control == Control::Stroke { 3.0 } else { 1.5 },
             ),
             Control::Arrow | Control::Style => {
-                self.line((x - 6.0, y + 5.0), (x + 5.0, y - 5.0), rgb, 1.8);
-                self.line((x + 5.0, y - 5.0), (x + 5.0, y + 1.0), rgb, 1.8);
-                self.line((x + 5.0, y - 5.0), (x - 1.0, y - 5.0), rgb, 1.8);
+                self.line((x + 5.5, y - 5.5), (x - 5.0, y + 5.0), rgb, 1.8);
+                self.line((x - 5.0, y + 5.0), (x - 5.0, y - 1.0), rgb, 1.8);
+                self.line((x - 5.0, y + 5.0), (x + 1.0, y + 5.0), rgb, 1.8);
             }
             Control::Text => self.text("A", r, rgb, true),
             Control::Pixelate => {
@@ -396,12 +396,19 @@ impl Renderer {
                 self.circle(x, y, 7.0, rgb, true);
                 self.text("1", r, 0xffffff, false);
             }
-            Control::Pencil | Control::Highlighter => {
-                self.line((x - 5.0, y + 5.0), (x + 4.0, y - 4.0), rgb, 3.0);
-                self.line((x + 2.0, y - 6.0), (x + 6.0, y - 2.0), rgb, 1.5);
-                if control == Control::Highlighter {
-                    self.line((x - 7.0, y + 7.0), (x + 6.0, y + 7.0), rgb, 2.0);
-                }
+            Control::Pencil => {
+                self.line((x - 5.0, y + 3.5), (x + 3.0, y - 5.5), rgb, 1.8);
+                self.line((x - 5.0, y + 3.5), (x - 4.0, y + 6.0), rgb, 1.8);
+                self.line((x - 4.0, y + 6.0), (x - 1.5, y + 5.0), rgb, 1.8);
+                self.line((x - 1.5, y + 5.0), (x + 6.0, y - 3.5), rgb, 1.8);
+                self.line((x + 3.0, y - 5.5), (x + 6.0, y - 3.5), rgb, 1.8);
+                self.line((x - 2.5, y + 1.0), (x + 1.0, y + 4.0), rgb, 1.4);
+            }
+            Control::Highlighter => {
+                self.line((x - 5.5, y + 4.5), (x - 1.0, y - 5.0), rgb, 2.3);
+                self.line((x - 1.0, y - 5.0), (x + 5.5, y + 4.5), rgb, 2.3);
+                self.line((x - 3.5, y + 1.0), (x + 3.5, y + 1.0), rgb, 1.7);
+                self.line((x - 6.5, y + 6.5), (x + 6.5, y + 6.5), rgb, 2.1);
             }
             Control::Crop => {
                 self.line((x - 7.0, y - 4.0), (x + 4.0, y - 4.0), rgb, 1.8);
@@ -517,28 +524,18 @@ impl Renderer {
         for (index, &swatch) in PRESET_COLORS.iter().enumerate() {
             let (x, y) = (r.x + r.w / 2.0, r.y + 20.0 + 32.0 * index as f32);
             if index == selected_color {
-                self.circle(x, y, 13.0, if dark { 0x668773 } else { 0xb5d1be }, true);
-                self.circle(x, y, 11.0, if dark { 0x303036 } else { 0xf6f6f6 }, true);
+                self.circle(x, y, 14.5, if dark { 0x7cb897 } else { 0xb5d1be }, true);
+                self.circle(x, y, 12.5, if dark { 0x303036 } else { 0xf6f6f6 }, true);
             }
-            self.circle(x, y, 10.0, swatch, true);
-            self.circle(
-                x,
-                y,
-                10.0,
-                if dark {
-                    0xb5b5bd
-                } else if index == 9 {
-                    0xc7c7c7
-                } else {
-                    0x6e6a74
-                },
-                false,
-            );
+            self.circle(x, y, 11.0, swatch, true);
+            if index == 0 || index == 9 {
+                self.circle(x, y, 11.0, if dark { 0xa8a8ae } else { 0xc7c7c7 }, false);
+            }
         }
         let (x, y) = (r.x + r.w / 2.0, r.y + 20.0 + 32.0 * 10.0);
         if selected_color == PRESET_COLORS.len() {
-            self.circle(x, y, 13.0, if dark { 0x668773 } else { 0xb5d1be }, true);
-            self.circle(x, y, 11.0, if dark { 0x303036 } else { 0xf6f6f6 }, true);
+            self.circle(x, y, 14.5, if dark { 0x7cb897 } else { 0xb5d1be }, true);
+            self.circle(x, y, 12.5, if dark { 0x303036 } else { 0xf6f6f6 }, true);
         }
         for (i, hue) in [
             0xf92d3a, 0xfe8101, 0xffde00, 0x37d147, 0x28c8bb, 0x006dfd, 0x7f47ff, 0xfd265f,
@@ -1170,26 +1167,37 @@ impl Renderer {
                         },
                     );
                 }
-            } else if !matches!(
-                control,
-                Control::Rectangle
-                    | Control::Fill
-                    | Control::Ellipse
-                    | Control::Line
-                    | Control::Arrow
-                    | Control::Text
-                    | Control::Pixelate
-                    | Control::Spotlight
-                    | Control::Counter
-                    | Control::Pencil
-                    | Control::Highlighter
-            ) || active
-            {
-                self.pill(
-                    r,
-                    background,
-                    if control == Control::Move { 9.0 } else { 14.0 },
+            } else {
+                let drawing_tool = matches!(
+                    control,
+                    Control::Move
+                        | Control::Rectangle
+                        | Control::Fill
+                        | Control::Ellipse
+                        | Control::Line
+                        | Control::Arrow
+                        | Control::Text
+                        | Control::Pixelate
+                        | Control::Spotlight
+                        | Control::Counter
+                        | Control::Pencil
+                        | Control::Highlighter
                 );
+                if drawing_tool && enabled && (active || hovered == Some(control)) {
+                    // The reference uses a short, wide blue pill within the shared strip.
+                    self.pill(
+                        Rect {
+                            x: r.x - 4.0,
+                            y: r.y + 3.5,
+                            w: r.w + 8.0,
+                            h: 25.0,
+                        },
+                        background,
+                        12.5,
+                    );
+                } else if !drawing_tool {
+                    self.pill(r, background, 14.0);
+                }
             }
             let ink = if control == Control::Close && hovered == Some(control) {
                 0xffffff

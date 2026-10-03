@@ -69,7 +69,7 @@ Search summaries returned contradictory tool shortcuts and some unsupported deta
 - Compact horizontal top toolbar. Not a permanent left drawing toolbox or a large ribbon.
 - Utilities precede the grouped annotation tools. The visible utility icons depict crop, image-add, and background.
 - The main group visually runs through pointer, outline rectangle, filled rectangle, ellipse, line, arrow, text, mosaic/redaction, framed-region tool, counter, pen-like tool, and text-highlighter-like tool. Tooltips are needed to confirm every ambiguous icon's exact label and grouping.
-- Active tool has a bright blue rounded pill; inactive tools are monochrome on a shared muted/translucent strip with subtle separators.
+- Active tool has a bright blue **horizontally elongated pill** (roughly 49 x 34 encoded pixels at frame 0), not a circle; inactive tools are monochrome on a shared muted/translucent strip with subtle separators. The Windows editor redraws that silhouette with a 36 x 25-DIP active/hover surface inside the unchanged 28 x 32-DIP hit target. This is a reference-based approximation, not exact Mac points.
 - Context-sensitive property pills sit immediately after the tool group. Arrow mode shows color, stroke, and arrow-style controls. Text mode shows color, a size value such as `20 pt`, and a typography-style control. Counter mode exposes a number-related property.
 - Top-right `Save as...` is the prominent blue action in M. B and I instead show `Save as...` and `Done`; this is a version/mode difference, not evidence that both always appear.
 - Canvas is central and spacious, with the screenshot's full aspect ratio retained. It must never use the thumbnail's cover crop.
@@ -97,7 +97,7 @@ These are frame-relative observations, not macOS points or Windows DIPs. Marketi
 
 - Compact color menu opens vertically below the color control in M.
 - It contains ten color swatches and a multicolor custom-picker entry. Selected swatch has an outer selection ring.
-- Expanded P shows preset swatches on the left, adjacent empty favorite slots, a saturation/value field, hue slider, transparency slider over checkerboard, current-color preview, eyedropper, Hex and R/G/B/Alpha fields, and `+ Add to My Colors`.
+- Expanded P shows preset swatches on the left, adjacent empty favorite slots, a saturation/value field, hue slider, transparency slider over checkerboard, current-color preview, eyedropper, Hex and R/G/B/Alpha fields, and `+ Add to My Colors`. Our compact menu is custom Direct2D; our expanded picker is currently the unstyled Windows ChooseColor dialog, **not** the CleanShot picker. A custom-drawn, functional expanded picker remains outstanding.
 - F documents sampling colors from the screen and saving favorites. C 4.8 introduces the new picker.
 - Hex example `9425E7` in P is an example selected color, not an app-wide default.
 - Preserve alpha during editing and export; do not silently flatten transparency to white.

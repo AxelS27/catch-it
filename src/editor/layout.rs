@@ -329,11 +329,11 @@ impl Layout {
     pub fn palette_rect(&self) -> Option<Rect> {
         let color = self.rect(Control::Color)?;
         Some(Rect {
-            x: (color.x + color.w / 2.0 - 24.0)
-                .min(self.width - 48.0)
+            x: (color.x + color.w / 2.0 - 27.0)
+                .min(self.width - 54.0)
                 .max(0.0),
             y: TOP + 2.0,
-            w: 48.0,
+            w: 54.0,
             h: 360.0,
         })
     }
