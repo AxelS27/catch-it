@@ -109,14 +109,36 @@ fn hover_step(levels: &mut Vec<(Control, f32)>, target: Option<Control>, dt: f32
 }
 struct PillMotion {
     from: f32,
+    velocity: f32,
     to: f32,
+    min: f32,
+    max: f32,
     start: Instant,
 }
 impl PillMotion {
-    fn position(&self, now: Instant) -> (f32, bool) {
-        let t = (now.duration_since(self.start).as_secs_f32() / 0.17).clamp(0.0, 1.0);
-        let eased = t * t * (3.0 - 2.0 * t);
-        (self.from + (self.to - self.from) * eased, t < 1.0)
+    fn position(&self, now: Instant) -> (f32, f32, bool) {
+        // Damped spring: continuous position/velocity on rapid tool changes,
+        // gentle overshoot in the middle, no overshoot beyond the tool strip.
+        const FREQUENCY: f32 = 14.0;
+        const DAMPING: f32 = 0.62;
+        let t = now.duration_since(self.start).as_secs_f32().min(0.65);
+        let decay = DAMPING * FREQUENCY;
+        let wave = FREQUENCY * (1.0 - DAMPING * DAMPING).sqrt();
+        let a = self.from - self.to;
+        let b = (self.velocity + decay * a) / wave;
+        let (s, c) = (wave * t).sin_cos();
+        let envelope = (-decay * t).exp();
+        let displacement = envelope * (a * c + b * s);
+        let velocity = envelope * (-decay * (a * c + b * s) + wave * (b * c - a * s));
+        let unclamped = self.to + displacement;
+        let x = unclamped.clamp(self.min, self.max);
+        let v = if x != unclamped { 0.0 } else { velocity };
+        let moving = t < 0.65 && ((x - self.to).abs() > 0.15 || v.abs() > 1.5);
+        (
+            if moving { x } else { self.to },
+            if moving { v } else { 0.0 },
+            moving,
+        )
     }
 }
 struct WindowState {
@@ -174,7 +196,7 @@ impl WindowState {
             self.hover_levels.push((control, 0.0));
         }
         unsafe {
-            let _ = SetTimer(Some(hwnd), HOVER_TIMER, 16, None);
+            let _ = SetTimer(Some(hwnd), HOVER_TIMER, 10, None);
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
     }
@@ -192,21 +214,35 @@ impl WindowState {
             return;
         }
         let now = Instant::now();
-        let from = self
-            .pill_motion
-            .as_ref()
-            .map_or(self.pill_center, |motion| motion.position(now).0);
+        let (from, velocity) =
+            self.pill_motion
+                .as_ref()
+                .map_or((self.pill_center, 0.0), |motion| {
+                    let (position, velocity, _) = motion.position(now);
+                    (position, velocity)
+                });
         self.active_tool = control;
         if let Some(r) = self.layout.rect(control) {
             let to = r.x + r.w / 2.0;
             self.pill_center = from;
+            let min = self
+                .layout
+                .rect(Control::Move)
+                .map_or(to, |r| r.x + r.w / 2.0);
+            let max = self
+                .layout
+                .rect(Control::Highlighter)
+                .map_or(to, |r| r.x + r.w / 2.0);
             self.pill_motion = Some(PillMotion {
                 from,
+                velocity,
                 to,
+                min,
+                max,
                 start: now,
             });
             unsafe {
-                let _ = SetTimer(Some(hwnd), HOVER_TIMER, 16, None);
+                let _ = SetTimer(Some(hwnd), HOVER_TIMER, 10, None);
             }
         }
     }
@@ -214,7 +250,7 @@ impl WindowState {
         let Some(motion) = &self.pill_motion else {
             return false;
         };
-        let (center, moving) = motion.position(Instant::now());
+        let (center, _, moving) = motion.position(Instant::now());
         self.pill_center = center;
         if !moving {
             self.pill_motion = None;
@@ -1012,18 +1048,35 @@ mod tests {
         let now = Instant::now();
         let motion = PillMotion {
             from: 100.0,
+            velocity: 0.0,
             to: 129.0,
+            min: 90.0,
+            max: 150.0,
             start: now,
         };
-        assert_eq!(motion.position(now), (100.0, true));
-        let halfway = motion
-            .position(now + std::time::Duration::from_millis(85))
-            .0;
-        assert!(halfway > 100.0 && halfway < 129.0);
+        assert_eq!(motion.position(now), (100.0, 0.0, true));
+        let (middle, velocity, _) = motion.position(now + std::time::Duration::from_millis(85));
+        assert!(middle > 100.0 && middle < 129.0 && velocity > 0.0);
+        let (overshoot, _, _) = motion.position(now + std::time::Duration::from_millis(285));
+        assert!(overshoot > 130.0 && overshoot < 134.0);
         assert_eq!(
-            motion.position(now + std::time::Duration::from_millis(200)),
-            (129.0, false)
+            motion.position(now + std::time::Duration::from_millis(700)),
+            (129.0, 0.0, false)
         );
+        let retarget = PillMotion {
+            from: middle,
+            velocity,
+            to: 105.0,
+            min: 90.0,
+            max: 150.0,
+            start: now + std::time::Duration::from_millis(85),
+        };
+        assert!((retarget.position(retarget.start).0 - middle).abs() < 0.001);
+        let edge = PillMotion {
+            to: 150.0,
+            ..motion
+        };
+        assert!(edge.position(now + std::time::Duration::from_millis(285)).0 <= 150.0);
     }
     #[test]
     fn drag_preview_preserves_aspect_alpha_and_original() {

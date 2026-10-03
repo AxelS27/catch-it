@@ -149,6 +149,9 @@ pub(super) unsafe extern "system" fn window_proc(
                         Ok(())
                     }
                     .and_then(|()| {
+                        // Sample the spring at paint time rather than displaying
+                        // a stale position from an earlier low-priority WM_TIMER.
+                        s.advance_pill();
                         s.renderer
                             .as_ref()
                             .context("Editor renderer unavailable")?
@@ -518,6 +521,10 @@ pub(super) unsafe extern "system" fn window_proc(
                         s.layout.hit(p.0, p.1)
                     };
                     s.set_hover(hwnd, hit);
+                    if s.pill_motion.is_some() {
+                        s.advance_pill();
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
                     if let Some(slider) = s.background.dragging
                         && s.background.set_slider(slider, p.0)
                         && let Err(error) = refresh_background(hwnd, s)

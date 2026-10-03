@@ -1219,12 +1219,24 @@ function Test-Hover {
     $bitmap=[Drawing.Bitmap]::new((Join-Path $artifacts 'editor-hover-adjacent.png'))
     try{
         $edge=$bitmap.GetPixel([int]($rectX+16*$s),$y)
-        $left=$bitmap.GetPixel([int]($fillX-11*$s),$y)
-        $right=$bitmap.GetPixel([int]($fillX+11*$s),$y)
+        $left=$bitmap.GetPixel([int]($fillX-8*$s),$y)
+        $right=$bitmap.GetPixel([int]($fillX+8*$s),$y)
     }finally{$bitmap.Dispose()}
     if($edge.R -gt 30 -or $edge.G -lt 90 -or $edge.B -lt 180){throw "Hover obscures blue active tool: $edge"}
     if($left.ToArgb() -ne $right.ToArgb()){throw "Hover pill is off-center: left=$left right=$right"}
     Write-Host 'PASS: adjacent hover stays centered on its icon and does not obscure the blue active pill'
+    [CaptureInput]::ClickAt($fillX,$y)
+    $samples=@();$clock=[Diagnostics.Stopwatch]::StartNew()
+    for($frame=0;$frame -lt 20;$frame++){
+        $strip=[Drawing.Bitmap]::new(92,1);$g=[Drawing.Graphics]::FromImage($strip)
+        try{
+            $g.CopyFromScreen(($rectX-24),$y,0,0,$strip.Size)
+            $blue=@(for($i=0;$i -lt $strip.Width;$i++){$c=$strip.GetPixel($i,0);if($c.R -lt 25 -and $c.G -gt 100 -and $c.B -gt 210){$i}})
+            if($blue.Count -gt 0){$samples+=('{0}:{1:n1}' -f $clock.ElapsedMilliseconds,(($blue[0]+$blue[-1])/2))}
+        } finally {$g.Dispose();$strip.Dispose()}
+        Start-Sleep -Milliseconds 15
+    }
+    Write-Host "Blue pill centers (ms:screen-px): $($samples -join ', ')"
 }
 function Test-Drawing {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run DrawOnly with pwsh -Sta.'}
