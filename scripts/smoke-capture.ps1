@@ -11,10 +11,11 @@ param(
     [switch]$QuickAccessOnly,
     [switch]$ThemeOnly,
     [switch]$EditorOnly,
-    [switch]$BackgroundOnly
+    [switch]$BackgroundOnly,
+    [switch]$DrawOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -154,6 +155,18 @@ public static class CaptureInput {
     public static IntPtr ControllerWindow() { return FindWindow("SimpleScreenshot.Controller", null); }
     public static IntPtr TaskbarWindow() { return FindWindow("Shell_TrayWnd", null); }
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
+    public static IntPtr DialogWindow(uint process) {
+        IntPtr result=IntPtr.Zero;
+        EnumWindows((window,data)=>{
+            uint pid;GetWindowThreadProcessId(window,out pid);
+            if(pid==process && IsWindowVisible(window)){
+                var cls=new System.Text.StringBuilder(128);GetClassName(window,cls,128);
+                if(cls.ToString()=="#32770"){result=window;return false;}
+            }
+            return true;
+        },IntPtr.Zero);
+        return result;
+    }
     public static IntPtr MenuWindow() {
         uint controllerPid; GetWindowThreadProcessId(ControllerWindow(), out controllerPid);
         if (controllerPid == 0) { return IntPtr.Zero; }
@@ -949,7 +962,15 @@ function Click-EditorAction([IntPtr]$Window,[string]$Action) {
         'Close' {$x=$r.Right-21*$s;$y=$r.Top+24*$s}
         'Copy' {$x=$r.Right-68*$s;$y=$r.Bottom-24*$s}
         'Zoom' {$x=$r.Left+56*$s;$y=$r.Bottom-24*$s}
+        'Background' {$x=$r.Left+88*$s;$y=$r.Top+24*$s}
+        'Move' {$x=$r.Left+($origin+14)*$s;$y=$r.Top+24*$s}
         'Rectangle' {$x=$r.Left+($origin+43)*$s;$y=$r.Top+24*$s}
+        'Fill' {$x=$r.Left+($origin+72)*$s;$y=$r.Top+24*$s}
+        'Ellipse' {$x=$r.Left+($origin+101)*$s;$y=$r.Top+24*$s}
+        'Line' {$x=$r.Left+($origin+130)*$s;$y=$r.Top+24*$s}
+        'Arrow' {$x=$r.Left+($origin+159)*$s;$y=$r.Top+24*$s}
+        'Pencil' {$x=$r.Left+($origin+304)*$s;$y=$r.Top+24*$s}
+        'Stroke' {$x=$r.Left+($origin+423)*$s;$y=$r.Top+24*$s}
         'Color' {$x=$r.Left+($origin+381)*$s;$y=$r.Top+24*$s}
         default {throw 'Unknown editor action'}
     }
@@ -1177,6 +1198,119 @@ function Test-Background {
     if((Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Background Tool changed the original PNG.'}
     Write-Host 'PASS: native Background panel, gradients/wallpapers/blur, live controls on small windows, auto-balance, Save/Copy output, None reset and original PNG intact'
 }
+function Test-Drawing {
+    if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run DrawOnly with pwsh -Sta.'}
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $first=New-TestPreview
+    $sourceHash=(Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $first.Window 'Annotate'
+    $editor=Wait-Editor
+    $bounds=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $sx=[int]($bounds.Left+($bounds.Right-$bounds.Left-350*$s)/2)
+    $sy=[int]($bounds.Top+48*$s+($bounds.Bottom-$bounds.Top-96*$s-200*$s)/2)
+    $point={param([int]$X,[int]$Y) @{X=[int]($sx+$X*$s);Y=[int]($sy+$Y*$s)}}
+    $sample={param([string]$Path,[int]$X,[int]$Y) $image=[Drawing.Bitmap]::new($Path);try{$image.GetPixel($X,$Y)}finally{$image.Dispose()}}
+    Click-EditorAction $editor 'Rectangle'
+    Click-EditorAction $editor 'Color'
+    $cx=[int]($bounds.Left+((Editor-ToolOrigin $editor)+381)*$s)
+    [CaptureInput]::ClickAt($cx,[int]($bounds.Top+102*$s)) # red preset
+    $a=& $point 20 160;$b=& $point 120 190
+    [CaptureInput]::HoldAt($a.X,$a.Y)
+    for($i=1;$i -le 12;$i++){[CaptureInput]::MouseAt([int]($a.X+($b.X-$a.X)*$i/12),[int]($a.Y+($b.Y-$a.Y)*$i/12),0)}
+    [CaptureInput]::DropAt($b.X,$b.Y)
+    Save-GalleryScreenshot 'editor-drawing-rectangle.png'
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$outlined=Wait-NewShot $before
+    Assert-ClipboardImage $outlined
+    if((& $sample $outlined 60 160).ToArgb() -ne [Drawing.Color]::FromArgb(249,45,58).ToArgb()){throw 'Rectangle outline was not exported at original image coordinates.'}
+    if((& $sample $outlined 60 175).ToArgb() -ne [Drawing.Color]::Blue.ToArgb()){throw 'Outline rectangle filled its interior.'}
+    Click-EditorAction $editor 'Move'
+    $a=& $point 60 160;$b=& $point 90 175
+    [CaptureInput]::HoldAt($a.X,$a.Y);[CaptureInput]::MouseAt($b.X,$b.Y,0);[CaptureInput]::DropAt($b.X,$b.Y)
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$moved=Wait-NewShot $before
+    if((& $sample $moved 90 175).ToArgb() -ne [Drawing.Color]::FromArgb(249,45,58).ToArgb()){throw 'Move did not update the editable object/export.'}
+    if((& $sample $moved 60 160).ToArgb() -ne [Drawing.Color]::Blue.ToArgb()){throw 'Move retained a baked-in ghost in the screenshot.'}
+    [CaptureInput]::Chord(0x5a,[ushort[]]@(0x11)) # Ctrl+Z
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$undone=Wait-NewShot $before
+    if((& $sample $undone 60 160).ToArgb() -ne [Drawing.Color]::FromArgb(249,45,58).ToArgb()){throw 'Undo did not restore the original object position.'}
+    [CaptureInput]::Chord(0x59,[ushort[]]@(0x11)) # Ctrl+Y
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$redone=Wait-NewShot $before
+    if((& $sample $redone 90 175).ToArgb() -ne [Drawing.Color]::FromArgb(249,45,58).ToArgb()){throw 'Redo did not reapply object movement.'}
+    Click-EditorAction $editor 'Pencil'
+    Click-EditorAction $editor 'Color'
+    [CaptureInput]::ClickAt($cx,[int]($bounds.Top+166*$s)) # yellow preset
+    $a=& $point 200 165;$b=& $point 300 165
+    [CaptureInput]::HoldAt($a.X,$a.Y)
+    foreach($xy in @(@(230,180),@(270,180),@(300,165))){$mid=& $point $xy[0] $xy[1];[CaptureInput]::MouseAt($mid.X,$mid.Y,0)}
+    [CaptureInput]::DropAt($b.X,$b.Y)
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$drawn=Wait-NewShot $before
+    $yellow=& $sample $drawn 300 165
+    if($yellow.R -lt 240 -or $yellow.G -lt 200 -or $yellow.B -gt 20){throw "Pencil/export color is wrong: $yellow"}
+    $destination=Join-Path $artifacts ('Annotated export 日本 '+[Guid]::NewGuid().ToString('N')+'.png');$script:created+=$destination
+    Click-EditorAction $editor 'Save';Enter-SavePath $destination
+    Assert-SavedCopy $destination $drawn
+    Click-EditorAction $editor 'Arrow'
+    $a=& $point 160 105;$b=& $point 280 105
+    [CaptureInput]::HoldAt($a.X,$a.Y);[CaptureInput]::MouseAt($b.X,$b.Y,0);[CaptureInput]::DropAt($b.X,$b.Y)
+    Click-EditorAction $editor 'Move'
+    $a=& $point 220 105;$b=& $point 220 145
+    [CaptureInput]::HoldAt($a.X,$a.Y);[CaptureInput]::MouseAt($b.X,$b.Y,0);[CaptureInput]::DropAt($b.X,$b.Y)
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$bent=Wait-NewShot $before
+    $bendPixel=& $sample $bent 220 125
+    if($bendPixel.R -lt 240 -or $bendPixel.G -lt 200 -or $bendPixel.B -gt 20){throw "Dragging the arrow control handle did not bend the exported arrow: $bendPixel"}
+    $straightPixel=& $sample $bent 220 105
+    if($straightPixel.R -gt 240 -and $straightPixel.G -gt 200 -and $straightPixel.B -lt 20){throw 'Bent arrow left a baked straight-line ghost.'}
+    Click-EditorAction $editor 'Background'
+    $panel=[CaptureInput]::ClientBounds($editor)
+    [CaptureInput]::ClickAt([int]($panel.Left+131*$s),[int]($panel.Top+285*$s))
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$framed=Wait-NewShot $before
+    $base=[Drawing.Bitmap]::new($first.Shot);$outputImage=[Drawing.Bitmap]::new($framed)
+    try {
+        if($outputImage.Width -le $base.Width -or $outputImage.Height -le $base.Height){throw 'Background disappeared after drawing.'}
+        $pad=[int](($outputImage.Width-$base.Width)/2)
+        if($outputImage.GetPixel($pad+90,$pad+175).ToArgb() -ne [Drawing.Color]::FromArgb(249,45,58).ToArgb()){
+            throw 'Annotations shifted relative to the original after enabling Background Tool.'
+        }
+    } finally {$base.Dispose();$outputImage.Dispose()}
+    Click-EditorAction $editor 'Color'
+    [CaptureInput]::ClickAt($cx,[int]($bounds.Top+390*$s)) # custom color wheel
+    for($i=0;$i -lt 120 -and [CaptureInput]::DialogWindow([uint32]$app.Id) -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+    $picker=[CaptureInput]::DialogWindow([uint32]$app.Id)
+    if($picker -eq [IntPtr]::Zero){Save-GalleryScreenshot 'color-picker-failure.png';throw 'Native custom color dialog did not open.'}
+    Start-Sleep -Milliseconds 100
+    if([CaptureInput]::GetForegroundWindow() -ne $picker){
+        Save-GalleryScreenshot 'color-picker-behind-editor.png'
+        throw 'Color picker opened behind the topmost editor.'
+    }
+    Save-GalleryScreenshot 'editor-native-color-picker.png'
+    $root=[System.Windows.Automation.AutomationElement]::FromHandle($picker)
+    $cancel=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Cancel'))
+    if(-not $cancel){throw 'Color dialog Cancel button missing.'}
+    $button=$cancel.Current.BoundingRectangle
+    [CaptureInput]::ClickAt([int]($button.X+$button.Width/2),[int]($button.Y+$button.Height/2))
+    for($i=0;$i -lt 120 -and [CaptureInput]::DialogWindow([uint32]$app.Id) -ne [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::DialogWindow([uint32]$app.Id) -ne [IntPtr]::Zero){throw 'Cancelling color dialog left editor modal.'}
+    Click-EditorAction $editor 'Color'
+    [CaptureInput]::ClickAt($cx,[int]($bounds.Top+390*$s))
+    for($i=0;$i -lt 120 -and [CaptureInput]::DialogWindow([uint32]$app.Id) -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::DialogWindow([uint32]$app.Id) -eq [IntPtr]::Zero){throw 'Custom color dialog could not reopen.'}
+    $picker=[CaptureInput]::DialogWindow([uint32]$app.Id)
+    $pickerBounds=Preview-Rect $picker
+    [CaptureInput]::ClickAt([int]($pickerBounds.Left+45*$s),[int]($pickerBounds.Top+85*$s)) # Windows basic yellow (RGB 255,255,0)
+    $root=[System.Windows.Automation.AutomationElement]::FromHandle($picker)
+    $ok=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'OK'))
+    if(-not $ok){throw 'Color dialog OK button missing.'}
+    $button=$ok.Current.BoundingRectangle
+    [CaptureInput]::ClickAt([int]($button.X+$button.Width/2),[int]($button.Y+$button.Height/2))
+    for($i=0;$i -lt 120 -and [CaptureInput]::DialogWindow([uint32]$app.Id) -ne [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::DialogWindow([uint32]$app.Id) -ne [IntPtr]::Zero){throw 'Confirming custom color left editor modal.'}
+    if([CaptureInput]::EditorCount() -ne 1){throw 'Color dialog lost its editor session.'}
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$recolored=Wait-NewShot $before
+    $newColor=& $sample $recolored ($pad+220) ($pad+125)
+    if($newColor.R -ne 255 -or $newColor.G -ne 255 -or $newColor.B -ne 0){throw "Native picker did not recolor selected arrow with RGB conversion: $newColor"}
+    if((Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Annotate modified the original capture PNG.'}
+    Write-Host 'PASS: native Rectangle/Pencil/curved Arrow, Move and control handle, undo/redo, clipboard/Save/Background, native custom color dialog, source intact'
+}
 function Test-Editor {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run EditorOnly with pwsh -Sta.'}
     Add-Type -AssemblyName UIAutomationClient
@@ -1196,8 +1330,9 @@ function Test-Editor {
     Click-PreviewAction $first.Window 'Annotate'
     if([CaptureInput]::EditorCount() -ne 1){throw 'Repeated Annotate created duplicate sessions.'}
     Click-EditorAction $editor 'Rectangle'
-    if([CaptureInput]::EditorCount() -ne 1 -or [CaptureInput]::DragWindow() -ne [IntPtr]::Zero){throw 'Disabled drawing tool launched an unrelated action.'}
-    Write-Host 'PASS: real Annotate opens one activated native editor, original full-resolution pixels, disabled drawing tools are inert'
+    if([CaptureInput]::EditorCount() -ne 1 -or [CaptureInput]::DragWindow() -ne [IntPtr]::Zero){throw 'Selecting Rectangle launched an unrelated action.'}
+    Click-EditorAction $editor 'Move'
+    Write-Host 'PASS: real Annotate opens one activated native editor, original full-resolution pixels, drawing tool selection stays in editor'
 
     $bounds=[CaptureInput]::ClientBounds($editor);$scale=[CaptureInput]::GetDpiForWindow($editor)/96.0
     $colorX=[int]($bounds.Left+((Editor-ToolOrigin $editor)+381)*$scale)
@@ -1821,6 +1956,7 @@ try {
     elseif ($ThemeOnly) { Test-Theme }
     elseif ($EditorOnly) { Test-Editor }
     elseif ($BackgroundOnly) { Test-Background }
+    elseif ($DrawOnly) { Test-Drawing }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }

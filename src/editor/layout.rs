@@ -49,6 +49,13 @@ impl Control {
         matches!(
             self,
             Self::Move
+                | Self::Rectangle
+                | Self::Fill
+                | Self::Ellipse
+                | Self::Line
+                | Self::Arrow
+                | Self::Pencil
+                | Self::Stroke
                 | Self::Background
                 | Self::Color
                 | Self::Save
@@ -75,10 +82,10 @@ impl Control {
             Self::Pixelate => "Pixelate / blur",
             Self::Spotlight => "Spotlight",
             Self::Counter => "Counter",
-            Self::Pencil => "Pencil",
+            Self::Pencil => "Pencil (smoothed freehand stroke)",
             Self::Highlighter => "Smart highlighter",
-            Self::Color => "Color presets (custom picker not available yet)",
-            Self::Stroke => "Stroke size",
+            Self::Color => "Annotation colors and Windows custom color picker",
+            Self::Stroke => "Annotation stroke width",
             Self::Style => "Tool style",
             Self::Save => "Save as... (Ctrl+S)",
             Self::Minimize => "Minimize window",

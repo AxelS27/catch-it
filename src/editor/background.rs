@@ -312,6 +312,27 @@ fn blurred_at(grid: &[[u8; 3]], x: f32, y: f32, tint: u32) -> [u8; 3] {
     out
 }
 
+/// Original screenshot offset in the exported image. Shared by annotation
+/// preview, input mapping, and export so background framing cannot shift marks.
+pub fn source_origin(width: u32, height: u32, settings: &Background) -> Result<(u32, u32)> {
+    if !settings.selected() {
+        return Ok((0, 0));
+    }
+    anyhow::ensure!(width > 0 && height > 0, "Empty screenshot");
+    let shortest = width.min(height) as f32;
+    let pad = (shortest * (0.08 + settings.padding * 0.42)).round() as u32;
+    let inset = (shortest * settings.inset * 0.25).round() as u32;
+    let frame = pad
+        .checked_add(inset)
+        .context("Background padding overflow")?;
+    let shift = if settings.auto_balance {
+        (shortest * settings.shadow * 0.03).round() as u32
+    } else {
+        0
+    };
+    Ok((frame, frame.saturating_sub(shift)))
+}
+
 /// Composite at original-pixel scale. A 256 MiB bound prevents slider drags
 /// from allocating an unbounded raster for huge captures.
 pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
@@ -324,11 +345,7 @@ pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
     }
     anyhow::ensure!(source.width > 0 && source.height > 0, "Empty screenshot");
     let shortest = source.width.min(source.height) as f32;
-    let pad = (shortest * (0.08 + settings.padding * 0.42)).round() as u32;
-    let inset = (shortest * settings.inset * 0.25).round() as u32;
-    let frame = pad
-        .checked_add(inset)
-        .context("Background padding overflow")?;
+    let (frame, balanced_y) = source_origin(source.width, source.height, settings)?;
     let width = source
         .width
         .checked_add(frame.checked_mul(2).context("Background width overflow")?)
@@ -382,13 +399,6 @@ pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
     // identical images, then jump a full pixel when the integer radius changed.
     let radius = (shortest * settings.corners * 0.16)
         .min((source.width.min(source.height) - 1) as f32 * 0.5);
-    // Compensate for the downward cast shadow so the visual center aligns with the canvas.
-    let balanced_y = frame
-        - if settings.auto_balance {
-            (shortest * settings.shadow * 0.03).round() as u32
-        } else {
-            0
-        };
     if settings.shadow > 0.0 {
         let extent = shortest * 0.09 * settings.shadow;
         let blur = extent.max(0.5);

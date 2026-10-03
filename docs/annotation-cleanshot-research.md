@@ -4,7 +4,7 @@
 
 Research recorded on 2026-10-02. User-approved follow-up: reproduce CleanShot X's **image Annotate editor**, including UI and interaction behavior, in Simple Screenshot. This supersedes the initial exclusion of screenshot editing, not the exclusions of cloud, accounts, recording, or a screenshot library.
 
-**This document records the researched specification and delivery status, not a claim of exact parity.** Slice 1 is implemented: Annotate opens a native editor shell with full-resolution viewing, zoom/pan, Copy/Save As/Drag Me, source ownership, and capture recovery. Actual drawing/editing tools remain disabled and pending.
+**This document records the researched specification and delivery status, not a claim of exact parity.** Slice 1 and a core-drawing slice are implemented: Annotate opens a native editor shell with full-resolution viewing, zoom/pan, non-destructive Pencil/Rectangle/Filled Rectangle/Ellipse/Line/bendable Arrow, preset/custom Windows colors and stroke widths, object selection/move/resize handles, undo/redo, Copy/Save As/Drag Me, source ownership, and capture recovery. Text, redaction, crop, counter, smart highlighter and advanced tool variants remain pending; OCR and AI are excluded at user request.
 
 Preserve the existing native Rust/Win32/Direct2D/DirectWrite/WIC implementation. No web UI, Electron, or replacement capture stack. Match the reference's structure and gestures; isolate unavoidable Windows differences such as window management, file dialogs, fonts, accessibility, and Command-to-Control mappings.
 
@@ -221,7 +221,7 @@ This sequence avoids presenting disconnected demo tools as a complete editor. Sl
 | Slice | Working end-to-end outcome |
 | --- | --- |
 | 1. Editor shell (implemented) | Real Annotate button -> activated native editor -> original image decoded off-thread; video-referenced light toolbar/footer, Fit/percentage and pointer-anchored zoom, pan/Escape rollback, source reservation/protection, close/capture recovery, original-image Copy/Save/Drag Me |
-| 2. Core annotation | Select, rectangle/fill/ellipse/line, four arrow styles, smoothing pencil; editable handles; undo/redo; Copy/Save/Drag Me from a shared renderer |
+| 2. Core annotation (partly implemented) | Select/move/resize handles, rectangle/fill/ellipse/line, bendable arrow, smoothed pencil, preset/custom Windows colors and stroke widths, undo/redo, full-size Copy/Save/Drag Me delivered; the exact four arrow styles remain pending |
 | 3. Text and steps | In-place Unicode/IME text, seven equivalent text styles, sequential counters, color picker/favorites/eyedropper, transactional property changes |
 | 4. Privacy and emphasis | Smooth/secure redaction choices, randomized pixelation, spotlight, real text-aware highlighter and modifier override |
 | 5. Canvas and presentation | Crop/extend with snapping and fill, resize, rotate/flip, background sidebar/presets/auto-balance, multi-image positioning |

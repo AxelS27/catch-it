@@ -1,6 +1,28 @@
 //! Native input/callback handling. Keep modal work outside borrowed WindowState.
 use super::*;
 
+fn source_point(s: &WindowState, p: (f32, f32)) -> Option<(Point, f32)> {
+    let source = s.image.as_ref()?;
+    let image = s.composed.as_ref().unwrap_or(source);
+    let r = s
+        .view
+        .image_rect(s.layout.canvas, image.width, image.height);
+    let scale = s.view.scale(s.layout.canvas, image.width, image.height);
+    let (ox, oy) = background::source_origin(source.width, source.height, &s.background).ok()?;
+    Some((
+        Point {
+            x: (p.0 - r.x) / scale - ox as f32,
+            y: (p.1 - r.y) / scale - oy as f32,
+        },
+        scale,
+    ))
+}
+fn inside_source(s: &WindowState, p: Point) -> bool {
+    s.image.as_ref().is_some_and(|source| {
+        p.x >= 0.0 && p.y >= 0.0 && p.x < source.width as f32 && p.y < source.height as f32
+    })
+}
+
 pub(super) unsafe extern "system" fn window_proc(
     hwnd: HWND,
     message: u32,
@@ -125,11 +147,17 @@ pub(super) unsafe extern "system" fn window_proc(
                                 s.composed.as_ref().or(s.image.as_ref()),
                                 &s.background,
                                 render::ChromeState {
+                                    source: s.image.as_ref(),
+                                    document: &s.document,
+                                    pending: s.pending_mark.as_ref(),
+                                    active_tool: s.active_tool,
+                                    stroke_width: s.stroke_width,
                                     dark: s.dark,
                                     hovered: s.hover,
                                     focused: s.focus,
                                     palette_open: s.palette_open,
                                     selected_color: s.selected_color,
+                                    custom_color: s.custom_color,
                                     maximized: IsZoomed(hwnd).as_bool(),
                                 },
                             )
@@ -223,13 +251,22 @@ pub(super) unsafe extern "system" fn window_proc(
                 let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
                 if s.palette_open {
                     match wparam.0 as u16 {
-                        0x1b | 0x0d => s.palette_open = false,
+                        0x1b => s.palette_open = false,
+                        0x0d => {
+                            s.palette_open = false;
+                            if s.selected_color == layout::PRESET_COLORS.len() {
+                                s.request(hwnd, COLOR_PICKER);
+                            } else if let Some(index) = s.document.selected {
+                                s.document.recolor(index, s.drawing_color());
+                            }
+                        }
                         0x26 => {
-                            s.selected_color = (s.selected_color + layout::PRESET_COLORS.len() - 1)
-                                % layout::PRESET_COLORS.len()
+                            s.selected_color = (s.selected_color + layout::PRESET_COLORS.len())
+                                % (layout::PRESET_COLORS.len() + 1)
                         }
                         0x28 => {
-                            s.selected_color = (s.selected_color + 1) % layout::PRESET_COLORS.len()
+                            s.selected_color =
+                                (s.selected_color + 1) % (layout::PRESET_COLORS.len() + 1)
                         }
                         _ => {}
                     }
@@ -276,6 +313,18 @@ pub(super) unsafe extern "system" fn window_proc(
                         if let Some(c) = s.focus {
                             invoke(s, hwnd, c);
                         }
+                    }
+                    0x5a if ctrl && shift => {
+                        s.document.redo();
+                    }
+                    0x5a if ctrl => {
+                        s.document.undo();
+                    }
+                    0x59 if ctrl => {
+                        s.document.redo();
+                    }
+                    0x2e | 0x08 if s.document.selected.is_some() => {
+                        s.document.delete_selected();
                     }
                     0x53 if ctrl && s.ready() => s.request(hwnd, SAVE),
                     0x43 if ctrl && shift && s.ready() => s.request(hwnd, COPY),
@@ -339,6 +388,44 @@ pub(super) unsafe extern "system" fn window_proc(
                         SetCapture(hwnd);
                         return LRESULT(0);
                     }
+                    if s.layout.canvas.contains(p.0, p.1)
+                        && let Some((point, scale)) = source_point(s, p)
+                        && inside_source(s, point)
+                    {
+                        if s.active_tool == Control::Move {
+                            let handle = s.document.selected.and_then(|index| {
+                                s.document.marks[index].handles().iter().position(|target| {
+                                    (target.x - point.x).hypot(target.y - point.y) <= 7.0 / scale
+                                })
+                            });
+                            s.document.selected = if handle.is_some() {
+                                s.document.selected
+                            } else {
+                                s.document.hit(point, 6.0 / scale)
+                            };
+                            if let Some(index) = s.document.selected {
+                                s.moving_mark = Some(MarkGesture {
+                                    index,
+                                    original: s.document.marks[index].clone(),
+                                    start: point,
+                                    handle,
+                                });
+                                SetCapture(hwnd);
+                            }
+                            let _ = SetFocus(Some(hwnd));
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                            return LRESULT(0);
+                        }
+                        if let Some(mark) =
+                            Mark::from_tool(s.active_tool, point, s.drawing_color(), s.stroke_width)
+                        {
+                            s.pending_mark = Some(mark);
+                            s.document.selected = None;
+                            let _ = SetFocus(Some(hwnd));
+                            SetCapture(hwnd);
+                            return LRESULT(0);
+                        }
+                    }
                     s.focus = None;
                     s.pressed = s.layout.hit(p.0, p.1).filter(|c| {
                         c.enabled()
@@ -376,6 +463,8 @@ pub(super) unsafe extern "system" fn window_proc(
                 if !s.palette_open
                     && s.pressed.is_none()
                     && s.drag_start.is_none()
+                    && s.pending_mark.is_none()
+                    && s.moving_mark.is_none()
                     && s.layout.canvas.contains(p.0, p.1)
                     && s.ready()
                 {
@@ -416,6 +505,16 @@ pub(super) unsafe extern "system" fn window_proc(
                         s.error = Some(format!("{error:#}"));
                         s.request(hwnd, ERROR);
                     }
+                    if let Some((point, _)) = source_point(s, p) {
+                        if let Some(mark) = &mut s.pending_mark {
+                            mark.update(point);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        if let Some(gesture) = &s.moving_mark {
+                            s.document.marks[gesture.index] = gesture.at(point);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                    }
                     if let Some((start, pan)) = s.pan_start {
                         s.view.pan = (pan.0 + p.0 - start.0, pan.1 + p.1 - start.1);
                         if let Some(i) = s.composed.as_ref().or(s.image.as_ref()) {
@@ -453,6 +552,33 @@ pub(super) unsafe extern "system" fn window_proc(
                     let s = &mut *ptr;
                     let p = s.point(lparam);
                     s.drag_start = None;
+                    if let Some(mut mark) = s.pending_mark.take() {
+                        if let Some((point, _)) = source_point(s, p) {
+                            mark.update(point);
+                        }
+                        if mark.finish()
+                            && let Err(error) = s.document.add(mark)
+                        {
+                            s.error = Some(format!("{error:#}"));
+                            s.request(hwnd, ERROR);
+                        }
+                        if GetCapture() == hwnd {
+                            let _ = ReleaseCapture();
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
+                    if let Some(gesture) = s.moving_mark.take() {
+                        if let Some((point, _)) = source_point(s, p) {
+                            s.document.marks[gesture.index] = gesture.at(point);
+                        }
+                        s.document.edit(gesture.index, gesture.original);
+                        if GetCapture() == hwnd {
+                            let _ = ReleaseCapture();
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
                     if let Some(pressed) = s.background_pressed.take() {
                         s.background.dragging = None;
                         if s.background.hit(p.0, p.1) == Some(pressed)
@@ -500,7 +626,13 @@ pub(super) unsafe extern "system" fn window_proc(
                         if let Some(index) = s.layout.palette_hit(p.0, p.1) {
                             if index < layout::PRESET_COLORS.len() {
                                 s.selected_color = index;
+                                if let Some(selected) = s.document.selected {
+                                    s.document.recolor(selected, s.drawing_color());
+                                }
                                 s.palette_open = false;
+                            } else {
+                                s.palette_open = false;
+                                s.request(hwnd, COLOR_PICKER);
                             }
                         } else {
                             s.palette_open = false;
@@ -601,6 +733,30 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
         Control::Copy => state.request(hwnd, COPY),
         Control::Zoom => state.request(hwnd, ZOOM_MENU),
         Control::Color => state.palette_open = !state.palette_open,
+        Control::Stroke => {
+            state.stroke_width = match state.stroke_width as u32 {
+                2 => 4.0,
+                4 => 8.0,
+                8 => 12.0,
+                _ => 2.0,
+            };
+            if let Some(index) = state.document.selected {
+                state.document.set_width(index, state.stroke_width);
+            }
+        }
+        Control::Move
+        | Control::Rectangle
+        | Control::Fill
+        | Control::Ellipse
+        | Control::Line
+        | Control::Arrow
+        | Control::Pencil => {
+            state.active_tool = control;
+            if control != Control::Move {
+                state.document.selected = None;
+            }
+            state.palette_open = false;
+        }
         Control::Background => state.request(hwnd, BACKGROUND_TOGGLE),
         Control::Minimize => unsafe {
             let _ = PostMessageW(

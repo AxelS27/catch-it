@@ -1,5 +1,6 @@
 use super::{
     background::{self, Background, Slider, Style},
+    document::{self, Document, Mark, Point, Shape},
     layout::{Control, Layout, PRESET_COLORS, Rect, View},
 };
 use crate::storage::Raster;
@@ -17,12 +18,18 @@ use windows::{
 };
 use windows_numerics::Vector2;
 
-pub struct ChromeState {
+pub struct ChromeState<'a> {
+    pub source: Option<&'a Raster>,
+    pub document: &'a Document,
+    pub pending: Option<&'a Mark>,
+    pub active_tool: Control,
+    pub stroke_width: f32,
     pub dark: bool,
     pub hovered: Option<Control>,
     pub focused: Option<Control>,
     pub palette_open: bool,
     pub selected_color: usize,
+    pub custom_color: u32,
     pub maximized: bool,
 }
 
@@ -321,7 +328,7 @@ impl Renderer {
             }
         }
     }
-    fn icon(&self, control: Control, r: Rect, rgb: u32, selected_color: usize) {
+    fn icon(&self, control: Control, r: Rect, rgb: u32, drawing_color: u32) {
         let (x, y) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
         let square = Rect {
             x: x - 5.5,
@@ -416,7 +423,7 @@ impl Renderer {
                     self.line((x + 2.5, y + 5.5), (x + 7.5, y + 5.5), rgb, 1.3);
                 }
             }
-            Control::Minimize => self.line((x - 5.0, y + 4.0), (x + 5.0, y + 4.0), rgb, 1.1),
+            Control::Minimize => self.line((x - 5.0, y - 0.5), (x + 5.0, y - 0.5), rgb, 1.5),
             Control::Maximize => self.outline(
                 Rect {
                     x: x - 5.0,
@@ -432,7 +439,7 @@ impl Renderer {
                 self.line((x + 5.0, y - 5.0), (x - 5.0, y + 5.0), rgb, 1.1);
             }
             Control::Color => {
-                self.circle(x - 4.0, y, 6.0, PRESET_COLORS[selected_color], true);
+                self.circle(x - 4.0, y, 6.0, drawing_color, true);
                 self.line((x + 9.0, y - 2.0), (x + 12.0, y + 1.0), 0x817a86, 1.1);
                 self.line((x + 12.0, y + 1.0), (x + 15.0, y - 2.0), 0x817a86, 1.1);
             }
@@ -524,6 +531,10 @@ impl Renderer {
             );
         }
         let (x, y) = (r.x + r.w / 2.0, r.y + 20.0 + 32.0 * 10.0);
+        if selected_color == PRESET_COLORS.len() {
+            self.circle(x, y, 13.0, if dark { 0x668773 } else { 0xb5d1be }, true);
+            self.circle(x, y, 11.0, if dark { 0x303036 } else { 0xf6f6f6 }, true);
+        }
         for (i, hue) in [
             0xf92d3a, 0xfe8101, 0xffde00, 0x37d147, 0x28c8bb, 0x006dfd, 0x7f47ff, 0xfd265f,
         ]
@@ -539,6 +550,86 @@ impl Renderer {
             );
         }
         self.circle(x, y, 10.0, 0x999399, false);
+    }
+    fn mark(&self, mark: &Mark, origin: Point, scale: f32) {
+        let map = |p: Point| (origin.x + p.x * scale, origin.y + p.y * scale);
+        let width = (mark.width * scale).max(0.5);
+        let segment = |a: Point, b: Point| {
+            let (a, b) = (map(a), map(b));
+            self.line(a, b, mark.color, width);
+            self.circle(a.0, a.1, width / 2.0, mark.color, true);
+            self.circle(b.0, b.1, width / 2.0, mark.color, true);
+        };
+        match &mark.shape {
+            Shape::Pencil(points) => {
+                for pair in points.windows(2) {
+                    segment(pair[0], pair[1]);
+                }
+            }
+            Shape::Line(a, b) => segment(*a, *b),
+            Shape::Arrow(a, b, control) => {
+                let steps = (((b.x - a.x).hypot(b.y - a.y)) / 4.0).clamp(16.0, 128.0) as usize;
+                let mut last = *a;
+                for i in 1..=steps {
+                    let next = document::curve(*a, *control, *b, i as f32 / steps as f32);
+                    segment(last, next);
+                    last = next;
+                }
+                let angle = (b.y - control.y).atan2(b.x - control.x);
+                let len = (mark.width * 5.0).max(12.0);
+                for direction in [-0.55_f32, 0.55] {
+                    let end = Point {
+                        x: b.x - len * (angle + direction).cos(),
+                        y: b.y - len * (angle + direction).sin(),
+                    };
+                    segment(*b, end);
+                }
+            }
+            Shape::Rectangle(a, b) | Shape::FilledRectangle(a, b) => {
+                let lo = Point {
+                    x: a.x.min(b.x),
+                    y: a.y.min(b.y),
+                };
+                let hi = Point {
+                    x: a.x.max(b.x),
+                    y: a.y.max(b.y),
+                };
+                let r = Rect {
+                    x: origin.x + lo.x * scale,
+                    y: origin.y + lo.y * scale,
+                    w: (hi.x - lo.x) * scale,
+                    h: (hi.y - lo.y) * scale,
+                };
+                if matches!(mark.shape, Shape::FilledRectangle(_, _)) {
+                    self.fill(r, mark.color);
+                } else {
+                    self.line((r.x, r.y), (r.x + r.w, r.y), mark.color, width);
+                    self.line((r.x + r.w, r.y), (r.x + r.w, r.y + r.h), mark.color, width);
+                    self.line((r.x + r.w, r.y + r.h), (r.x, r.y + r.h), mark.color, width);
+                    self.line((r.x, r.y + r.h), (r.x, r.y), mark.color, width);
+                }
+            }
+            Shape::Ellipse(a, b) => {
+                let x = (a.x + b.x) / 2.0;
+                let y = (a.y + b.y) / 2.0;
+                unsafe {
+                    self.brush.SetColor(&color(mark.color));
+                    self.target.DrawEllipse(
+                        &D2D1_ELLIPSE {
+                            point: Vector2 {
+                                X: origin.x + x * scale,
+                                Y: origin.y + y * scale,
+                            },
+                            radiusX: (a.x - b.x).abs() * scale / 2.0,
+                            radiusY: (a.y - b.y).abs() * scale / 2.0,
+                        },
+                        &self.brush,
+                        width,
+                        None,
+                    );
+                }
+            }
+        }
     }
     fn panel(&self, layout: &Layout, model: &Background, dark: bool) {
         if !model.open {
@@ -858,14 +949,20 @@ impl Renderer {
         view: &View,
         image: Option<&Raster>,
         background: &Background,
-        chrome: ChromeState,
+        chrome: ChromeState<'_>,
     ) -> Result<()> {
         let ChromeState {
+            source,
+            document,
+            pending,
+            active_tool,
+            stroke_width,
             dark,
             hovered,
             focused,
             palette_open,
             selected_color,
+            custom_color,
             maximized,
         } = chrome;
         let (canvas, fg, muted, pill, group) = if dark {
@@ -961,6 +1058,51 @@ impl Renderer {
                     );
                 }
             }
+            if let Some(source) = source {
+                let (ox, oy) = background::source_origin(source.width, source.height, background)?;
+                let scale = view.scale(layout.canvas, image.width, image.height);
+                let origin = Point {
+                    x: r.x + ox as f32 * scale,
+                    y: r.y + oy as f32 * scale,
+                };
+                for mark in &document.marks {
+                    self.mark(mark, origin, scale);
+                }
+                if let Some(mark) = pending {
+                    self.mark(mark, origin, scale);
+                }
+                if let Some(index) = document.selected
+                    && active_tool == Control::Move
+                    && let Some(mark) = document.marks.get(index)
+                {
+                    let (lo, hi) = mark.bounds();
+                    self.rounded_outline(
+                        Rect {
+                            x: origin.x + lo.x * scale - 4.0,
+                            y: origin.y + lo.y * scale - 4.0,
+                            w: ((hi.x - lo.x) * scale + 8.0).max(8.0),
+                            h: ((hi.y - lo.y) * scale + 8.0).max(8.0),
+                        },
+                        0x007aff,
+                        3.0,
+                    );
+                    for (i, p) in mark.handles().into_iter().enumerate() {
+                        let (x, y) = (origin.x + p.x * scale, origin.y + p.y * scale);
+                        self.circle(x, y, 5.0, 0xffffff, true);
+                        self.circle(
+                            x,
+                            y,
+                            5.0,
+                            if i == 2 && matches!(mark.shape, Shape::Arrow(_, _, _)) {
+                                0xf92d3a
+                            } else {
+                                0x007aff
+                            },
+                            false,
+                        );
+                    }
+                }
+            }
             self.outline(r, crate::theme::border_rgb(dark), 1.0);
         } else {
             self.text("Opening screenshot...", layout.canvas, muted, false);
@@ -978,7 +1120,7 @@ impl Renderer {
                     ));
             let active = control == Control::Save
                 || (control == Control::Background && background.open)
-                || (control == Control::Move && !background.open);
+                || control == active_tool;
             let background = if active && enabled {
                 0x007aff
             } else if hovered == Some(control) && enabled {
@@ -1032,6 +1174,12 @@ impl Renderer {
             };
             match control {
                 Control::Save => self.text("Save as...", r, ink, false),
+                Control::Stroke => self.text(
+                    &format!("{} px", stroke_width.round() as u32),
+                    r,
+                    ink,
+                    false,
+                ),
                 Control::Zoom => {
                     let label = image
                         .map(|i| {
@@ -1095,7 +1243,15 @@ impl Renderer {
                         1.0,
                     );
                 }
-                _ => self.icon(control, r, ink, selected_color),
+                _ => self.icon(
+                    control,
+                    r,
+                    ink,
+                    PRESET_COLORS
+                        .get(selected_color)
+                        .copied()
+                        .unwrap_or(custom_color),
+                ),
             }
             if focused == Some(control) {
                 self.outline(

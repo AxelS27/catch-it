@@ -1,6 +1,7 @@
 //! Activated native image editor. Modal output actions are dispatched by App,
-//! never inside a callback holding WindowState. Drawing tools arrive in later slices.
+//! never inside a callback holding WindowState. The source raster remains immutable.
 mod background;
+mod document;
 mod interaction;
 mod layout;
 mod render;
@@ -12,6 +13,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use background::Background;
+use document::{Document, Mark, Point};
 use layout::{Control, Layout, View, Zoom};
 use render::Renderer;
 use std::{
@@ -25,7 +27,10 @@ use windows::{
         Foundation::*,
         Graphics::{Dwm::*, Gdi::*},
         System::LibraryLoader::GetModuleHandleW,
-        UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+        UI::{
+            Controls::Dialogs::*, Controls::*, HiDpi::*, Input::KeyboardAndMouse::*,
+            WindowsAndMessaging::*,
+        },
     },
     core::{BOOL, PCWSTR, w},
 };
@@ -38,10 +43,53 @@ pub const DRAG: isize = 4;
 pub const ERROR: isize = 5;
 pub const ZOOM_MENU: isize = 6;
 pub const BACKGROUND_TOGGLE: isize = 7;
+pub const COLOR_PICKER: isize = 8;
 const CLASS: PCWSTR = w!("SimpleScreenshot.Editor");
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const ZOOM_VALUES: [f32; 8] = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0];
 
+unsafe extern "system" fn color_dialog_hook(
+    hwnd: HWND,
+    message: u32,
+    _: WPARAM,
+    _: LPARAM,
+) -> usize {
+    if message == WM_INITDIALOG {
+        // The editor is temporarily topmost over floating thumbnails. A stock
+        // common dialog otherwise opens *behind* its owner and looks hung.
+        unsafe {
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+            );
+            let _ = SetForegroundWindow(hwnd);
+        }
+    }
+    0
+}
+
+struct MarkGesture {
+    index: usize,
+    original: Mark,
+    start: Point,
+    handle: Option<usize>,
+}
+impl MarkGesture {
+    fn at(&self, point: Point) -> Mark {
+        let mut mark = self.original.clone();
+        if let Some(handle) = self.handle {
+            mark.resize_handle(handle, point);
+        } else {
+            mark.translate(point.x - self.start.x, point.y - self.start.y);
+        }
+        mark
+    }
+}
 struct WindowState {
     controller: HWND,
     id: usize,
@@ -56,6 +104,13 @@ struct WindowState {
     pressed: Option<Control>,
     palette_open: bool,
     selected_color: usize,
+    custom_color: u32,
+    active_tool: Control,
+    stroke_width: f32,
+    document: Document,
+    pending_mark: Option<Mark>,
+    moving_mark: Option<MarkGesture>,
+    exported: Option<Raster>,
     background: Background,
     committed_background: Background,
     composed: Option<Raster>,
@@ -71,6 +126,12 @@ struct WindowState {
     cancel_drag: Rc<Cell<bool>>,
 }
 impl WindowState {
+    fn drawing_color(&self) -> u32 {
+        layout::PRESET_COLORS
+            .get(self.selected_color)
+            .copied()
+            .unwrap_or(self.custom_color)
+    }
     fn request(&self, _hwnd: HWND, action: isize) {
         unsafe {
             let _ = PostMessageW(
@@ -97,6 +158,10 @@ impl WindowState {
         }
         self.pressed = None;
         self.drag_start = None;
+        self.pending_mark = None;
+        if let Some(gesture) = self.moving_mark.take() {
+            self.document.marks[gesture.index] = gesture.original;
+        }
         self.background_pressed = None;
         self.background.dragging = None;
     }
@@ -109,7 +174,7 @@ pub struct Editor {
     _protection: std::fs::File,
     drag_image: Option<(u32, u32, Vec<u8>)>,
     output_path: Option<PathBuf>,
-    output_revision: u64,
+    output_revision: (u64, u64),
 }
 impl Editor {
     pub fn create(controller: HWND, source: HWND, path: &Path) -> Result<Self> {
@@ -131,6 +196,13 @@ impl Editor {
             pressed: None,
             palette_open: false,
             selected_color: 4,
+            custom_color: 0x006dfd,
+            active_tool: Control::Move,
+            stroke_width: 3.0,
+            document: Document::default(),
+            pending_mark: None,
+            moving_mark: None,
+            exported: None,
             background: Background::default(),
             committed_background: Background::default(),
             composed: None,
@@ -187,7 +259,7 @@ impl Editor {
                 _protection: protection,
                 drag_image: None,
                 output_path: None,
-                output_revision: 0,
+                output_revision: (0, 0),
             };
             editor.state.dpi = GetDpiForWindow(hwnd);
             editor.theme();
@@ -221,15 +293,43 @@ impl Editor {
         &self.path
     }
     pub fn image(&self) -> Option<&Raster> {
-        self.state.composed.as_ref().or(self.state.image.as_ref())
+        self.state
+            .exported
+            .as_ref()
+            .or(self.state.composed.as_ref())
+            .or(self.state.image.as_ref())
     }
     pub fn output(&mut self) -> Result<(&Path, &Raster)> {
-        if self.output_revision != self.state.background_revision {
+        let revision = (self.state.background_revision, self.state.document.revision);
+        if self.output_revision != revision {
             self.output_path = None;
-            self.output_revision = self.state.background_revision;
+            self.state.exported = None;
+            self.output_revision = revision;
+        }
+        if !self.state.document.marks.is_empty() && self.state.exported.is_none() {
+            let source = self
+                .state
+                .image
+                .as_ref()
+                .context("Screenshot is still opening")?;
+            let base = self.state.composed.as_ref().unwrap_or(source);
+            let (x, y) =
+                background::source_origin(source.width, source.height, &self.state.background)?;
+            self.state.exported = Some(document::flatten(
+                base,
+                &self.state.document.marks,
+                Point {
+                    x: x as f32,
+                    y: y as f32,
+                },
+            )?);
         }
         if self.output_path.is_none()
-            && let Some(composed) = &self.state.composed
+            && let Some(composed) = self
+                .state
+                .exported
+                .as_ref()
+                .or(self.state.composed.as_ref())
         {
             self.output_path = Some(storage::save_png(
                 &composed.pixels,
@@ -289,6 +389,40 @@ impl Editor {
         apply_theme(self.hwnd, self.state.dark);
     }
 
+    pub fn choose_color(&mut self) -> Result<()> {
+        let current = if self.state.selected_color < layout::PRESET_COLORS.len() {
+            layout::PRESET_COLORS[self.state.selected_color]
+        } else {
+            self.state.custom_color
+        };
+        let mut colors = [COLORREF(0); 16];
+        let mut choose = CHOOSECOLORW {
+            lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
+            hwndOwner: self.hwnd,
+            rgbResult: COLORREF(
+                (current & 0xff00) | ((current & 0xff) << 16) | ((current >> 16) & 0xff),
+            ),
+            lpCustColors: colors.as_mut_ptr(),
+            Flags: CC_FULLOPEN | CC_RGBINIT | CC_ENABLEHOOK,
+            lpfnHook: Some(color_dialog_hook),
+            ..Default::default()
+        };
+        if unsafe { ChooseColorW(&mut choose) }.as_bool() {
+            let bgr = choose.rgbResult.0;
+            self.state.custom_color = ((bgr & 0xff) << 16) | (bgr & 0xff00) | ((bgr >> 16) & 0xff);
+            self.state.selected_color = layout::PRESET_COLORS.len();
+            if let Some(index) = self.state.document.selected {
+                self.state.document.recolor(index, self.state.custom_color);
+            }
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), None, false);
+            }
+        } else {
+            let error = unsafe { CommDlgExtendedError() };
+            anyhow::ensure!(error.0 == 0, "Color dialog failed: {}", error.0);
+        }
+        Ok(())
+    }
     pub fn toggle_background(&mut self) -> Result<()> {
         self.state.background.open = !self.state.background.open;
         self.state.committed_background.open = self.state.background.open;
@@ -473,7 +607,7 @@ impl Editor {
         if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
             return Ok(Outcome::Canceled);
         }
-        let composed = self.state.composed.is_some();
+        let composed = self.state.background.selected() || !self.state.document.marks.is_empty();
         let (path, image) = self.output()?;
         let path = path.to_path_buf();
         let preview = if composed {
@@ -697,6 +831,7 @@ fn refresh_background(hwnd: HWND, state: &mut WindowState) -> Result<()> {
                 .clamp_pan(state.layout.canvas, image.width, image.height);
         }
         state.composed = composed;
+        state.exported = None;
         state.view.fit_limit = if state.background.selected() {
             1.6
         } else {
