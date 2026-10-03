@@ -1,25 +1,195 @@
 //! Native input/callback handling. Keep modal work outside borrowed WindowState.
 use super::*;
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+
+const TEXT_DONE: u32 = WM_APP + 52;
+pub(super) unsafe extern "system" fn text_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    parent: usize,
+) -> LRESULT {
+    unsafe {
+        if message == WM_KEYDOWN
+            && (wparam.0 as u16 == 0x1b
+                || (wparam.0 as u16 == 0x0d && GetKeyState(VK_CONTROL.0 as i32) < 0))
+        {
+            let _ = PostMessageW(
+                Some(HWND(parent as *mut _)),
+                TEXT_DONE,
+                WPARAM(usize::from(wparam.0 as u16 != 0x1b)),
+                LPARAM(0),
+            );
+            return LRESULT(0);
+        }
+        if message == WM_ERASEBKGND {
+            let ptr =
+                GetWindowLongPtrW(HWND(parent as *mut _), GWLP_USERDATA) as *const WindowState;
+            if !ptr.is_null()
+                && let Some(edit) = &(*ptr).text_editing
+            {
+                let mut rect = RECT::default();
+                let _ = GetClientRect(hwnd, &mut rect);
+                FillRect(HDC(wparam.0 as *mut _), &rect, edit.brush);
+                return LRESULT(1);
+            }
+        }
+        if message == WM_KILLFOCUS {
+            let _ = PostMessageW(
+                Some(HWND(parent as *mut _)),
+                TEXT_DONE,
+                WPARAM(1),
+                LPARAM(0),
+            );
+        }
+        DefSubclassProc(hwnd, message, wparam, lparam)
+    }
+}
+fn start_text(hwnd: HWND, s: &mut WindowState, point: Point, index: Option<usize>) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let source = s.image.as_ref().context("Screenshot is still opening")?;
+    let base = s.composed.as_ref().unwrap_or(source);
+    let (ox, oy) = background::source_origin(source.width, source.height, &s.background)?;
+    let (cx, cy, ex, ey) = s
+        .document
+        .crop_pixels(
+            base.width,
+            base.height,
+            Point {
+                x: ox as f32,
+                y: oy as f32,
+            },
+        )
+        .unwrap_or((0, 0, base.width, base.height));
+    let r = s.view.image_rect(s.layout.canvas, ex - cx, ey - cy);
+    let scale = s.view.scale(s.layout.canvas, ex - cx, ey - cy);
+    let x = r.x + (point.x + ox as f32 - cx as f32) * scale;
+    let y = r.y + (point.y + oy as f32 - cy as f32) * scale;
+    let width = (300.0_f32).min((s.layout.width - x - 12.0).max(120.0));
+    let text = index
+        .and_then(|i| match &s.document.marks[i].shape {
+            document::Shape::Text(_, text) => Some(text.as_str()),
+            _ => None,
+        })
+        .unwrap_or("");
+    let wide: Vec<u16> = std::ffi::OsStr::new(text)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let dpi = s.dpi as f32 / 96.0;
+    unsafe {
+        let edit = CreateWindowExW(
+            WINDOW_EX_STYLE::default(),
+            w!("EDIT"),
+            PCWSTR(wide.as_ptr()),
+            WS_CHILD
+                | WS_VISIBLE
+                | WS_TABSTOP
+                | WS_BORDER
+                | WINDOW_STYLE((ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN) as u32),
+            (x * dpi).round() as i32,
+            (y * dpi).round() as i32,
+            (width.min(150.0) * dpi).round() as i32,
+            (38.0 * dpi).round() as i32,
+            Some(hwnd),
+            None,
+            Some(GetModuleHandleW(None)?.into()),
+            None,
+        )?;
+        let _ = SendMessageW(edit, EM_SETLIMITTEXT, Some(WPARAM(4096)), Some(LPARAM(0)));
+        let font = CreateFontW(
+            -((20.0 * scale * dpi).round() as i32).max(8),
+            0,
+            0,
+            0,
+            FW_SEMIBOLD.0 as i32,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY,
+            DEFAULT_PITCH.0 as u32,
+            w!("Segoe UI"),
+        );
+        let brush = CreateSolidBrush(if s.dark {
+            COLORREF(0x0025252d)
+        } else {
+            COLORREF(0x00ffffff)
+        });
+        if !SetWindowSubclass(edit, Some(text_subclass), 1, hwnd.0 as usize).as_bool() {
+            let _ = DestroyWindow(edit);
+            let _ = DeleteObject(HGDIOBJ(font.0));
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+            anyhow::bail!("Cannot attach native text editor");
+        }
+        let _ = SendMessageW(
+            edit,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+        s.text_editing = Some(TextEdit {
+            hwnd: edit,
+            font,
+            brush,
+            point,
+            index,
+        });
+        let _ = SetFocus(Some(edit));
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+    Ok(())
+}
 
 fn source_point(s: &WindowState, p: (f32, f32)) -> Option<(Point, f32)> {
     let source = s.image.as_ref()?;
     let image = s.composed.as_ref().unwrap_or(source);
-    let r = s
-        .view
-        .image_rect(s.layout.canvas, image.width, image.height);
-    let scale = s.view.scale(s.layout.canvas, image.width, image.height);
     let (ox, oy) = background::source_origin(source.width, source.height, &s.background).ok()?;
+    let (cx, cy, ex, ey) = s
+        .document
+        .crop_pixels(
+            image.width,
+            image.height,
+            Point {
+                x: ox as f32,
+                y: oy as f32,
+            },
+        )
+        .unwrap_or((0, 0, image.width, image.height));
+    let r = s.view.image_rect(s.layout.canvas, ex - cx, ey - cy);
+    let scale = s.view.scale(s.layout.canvas, ex - cx, ey - cy);
     Some((
         Point {
-            x: (p.0 - r.x) / scale - ox as f32,
-            y: (p.1 - r.y) / scale - oy as f32,
+            x: (p.0 - r.x) / scale + cx as f32 - ox as f32,
+            y: (p.1 - r.y) / scale + cy as f32 - oy as f32,
         },
         scale,
     ))
 }
+fn crop_point(s: &WindowState, p: (f32, f32)) -> Option<Point> {
+    let source = s.image.as_ref()?;
+    let (point, _) = source_point(s, p)?;
+    let (lo, hi) = s.document.crop().unwrap_or((
+        Point::default(),
+        Point {
+            x: source.width as f32,
+            y: source.height as f32,
+        },
+    ));
+    Some(Point {
+        x: point.x.clamp(lo.x, hi.x),
+        y: point.y.clamp(lo.y, hi.y),
+    })
+}
 fn redaction_point(mark: &Mark, point: Point, source: Option<&Raster>) -> Point {
-    if matches!(mark.shape, document::Shape::Mosaic(..))
-        && let Some(source) = source
+    if matches!(
+        mark.shape,
+        document::Shape::Mosaic(..) | document::Shape::Spotlight(..) | document::Shape::Counter(..)
+    ) && let Some(source) = source
     {
         return Point {
             x: point.x.clamp(0.0, source.width as f32),
@@ -30,7 +200,12 @@ fn redaction_point(mark: &Mark, point: Point, source: Option<&Raster>) -> Point 
 }
 fn inside_source(s: &WindowState, p: Point) -> bool {
     s.image.as_ref().is_some_and(|source| {
-        p.x >= 0.0 && p.y >= 0.0 && p.x < source.width as f32 && p.y < source.height as f32
+        let within_image =
+            p.x >= 0.0 && p.y >= 0.0 && p.x < source.width as f32 && p.y < source.height as f32;
+        within_image
+            && s.document
+                .crop()
+                .is_none_or(|(lo, hi)| p.x >= lo.x && p.y >= lo.y && p.x < hi.x && p.y < hi.y)
     })
 }
 
@@ -52,6 +227,74 @@ pub(super) unsafe extern "system" fn window_proc(
             return DefWindowProcW(hwnd, message, wparam, lparam);
         }
         match message {
+            TEXT_DONE => {
+                let s = &mut *ptr;
+                s.finish_text(wparam.0 != 0);
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                LRESULT(0)
+            }
+            WM_COMMAND if (wparam.0 >> 16) as u16 == EN_CHANGE as u16 => {
+                let s = &mut *ptr;
+                if let Some(edit) = &s.text_editing
+                    && lparam.0 == edit.hwnd.0 as isize
+                {
+                    let len = GetWindowTextLengthW(edit.hwnd).max(0) as usize;
+                    let mut buf = vec![0u16; len + 1];
+                    let read = GetWindowTextW(edit.hwnd, &mut buf).max(0) as usize;
+                    let text = String::from_utf16_lossy(&buf[..read]);
+                    let longest = text
+                        .lines()
+                        .map(|line| line.chars().count())
+                        .max()
+                        .unwrap_or(0) as i32;
+                    let lines = SendMessageW(edit.hwnd, EM_GETLINECOUNT, None, None).0 as i32;
+                    let dpi = s.dpi as f32 / 96.0;
+                    let width = ((longest * 13 + 28).clamp(150, 300) as f32 * dpi).round() as i32;
+                    let height = ((lines * 26 + 12).clamp(38, 140) as f32 * dpi).round() as i32;
+                    let mut rect = RECT::default();
+                    let _ = GetWindowRect(edit.hwnd, &mut rect);
+                    let mut p = POINT {
+                        x: rect.left,
+                        y: rect.top,
+                    };
+                    let _ = ScreenToClient(hwnd, &mut p);
+                    let _ = SetWindowPos(
+                        edit.hwnd,
+                        None,
+                        p.x,
+                        p.y,
+                        width,
+                        height,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                LRESULT(0)
+            }
+            WM_CTLCOLOREDIT => {
+                let s = &*ptr;
+                if let Some(edit) = &s.text_editing {
+                    let dc = HDC(wparam.0 as *mut _);
+                    SetTextColor(
+                        dc,
+                        if s.dark {
+                            COLORREF(0x00ffffff)
+                        } else {
+                            COLORREF(0x00181818)
+                        },
+                    );
+                    SetBkColor(
+                        dc,
+                        if s.dark {
+                            COLORREF(0x0025252d)
+                        } else {
+                            COLORREF(0x00ffffff)
+                        },
+                    );
+                    LRESULT(edit.brush.0 as isize)
+                } else {
+                    DefWindowProcW(hwnd, message, wparam, lparam)
+                }
+            }
             WM_NCCALCSIZE => {
                 // Both forms begin with the proposed client RECT. Creation uses
                 // wParam=0, frame changes use wParam=1. Handle both to avoid a
@@ -164,6 +407,12 @@ pub(super) unsafe extern "system" fn window_proc(
                                     source: s.image.as_ref(),
                                     document: &s.document,
                                     pending: s.pending_mark.as_ref(),
+                                    editing_text: s
+                                        .text_editing
+                                        .as_ref()
+                                        .and_then(|edit| edit.index),
+                                    crop_mode: s.crop_mode,
+                                    crop_drag: s.crop_drag.as_ref(),
                                     active_tool: s.active_tool,
                                     pill_center: s.pill_center,
                                     stroke_width: s.stroke_width,
@@ -201,6 +450,7 @@ pub(super) unsafe extern "system" fn window_proc(
                 if wparam.0 != SIZE_MINIMIZED as usize {
                     let s = &mut *ptr;
                     s.cancel_gesture();
+                    s.finish_text(true);
                     s.finish_color();
                     s.finish_stroke();
                     s.palette_open = false;
@@ -233,6 +483,7 @@ pub(super) unsafe extern "system" fn window_proc(
                 {
                     let s = &mut *ptr;
                     s.cancel_gesture();
+                    s.finish_text(true);
                     s.finish_color();
                     s.finish_stroke();
                     s.palette_open = false;
@@ -258,6 +509,9 @@ pub(super) unsafe extern "system" fn window_proc(
             WM_KILLFOCUS | WM_CANCELMODE => {
                 let s = &mut *ptr;
                 s.cancel_gesture();
+                if message == WM_CANCELMODE {
+                    s.finish_text(false);
+                }
                 s.finish_color();
                 s.finish_stroke();
                 s.picker.open = false;
@@ -363,6 +617,7 @@ pub(super) unsafe extern "system" fn window_proc(
                 match wparam.0 as u16 {
                     0x1b => {
                         s.cancel_gesture();
+                        s.crop_mode = false;
                         if GetCapture() == hwnd {
                             let _ = ReleaseCapture();
                         }
@@ -410,6 +665,16 @@ pub(super) unsafe extern "system" fn window_proc(
                     0x59 if ctrl => {
                         s.document.redo();
                     }
+                    0x71 if s.document.selected.is_some() => {
+                        let index = s.document.selected.unwrap();
+                        if let document::Shape::Text(point, _) =
+                            s.document.marks[index].shape.clone()
+                            && let Err(error) = start_text(hwnd, s, point, Some(index))
+                        {
+                            s.error = Some(format!("{error:#}"));
+                            s.request(hwnd, ERROR);
+                        }
+                    }
                     0x2e | 0x08 if s.document.selected.is_some() => {
                         s.document.delete_selected();
                     }
@@ -430,17 +695,11 @@ pub(super) unsafe extern "system" fn window_proc(
                         }
                     }
                     0xbb | 0xbd if ctrl => {
-                        if let Some(i) = s.composed.as_ref().or(s.image.as_ref()) {
-                            let scale = s.view.scale(s.layout.canvas, i.width, i.height)
+                        if let Some((w, h)) = s.view_size() {
+                            let scale = s.view.scale(s.layout.canvas, w, h)
                                 * if wparam.0 == 0xbb { 1.25 } else { 0.8 };
                             let c = s.layout.canvas;
-                            s.view.zoom_at(
-                                scale,
-                                (c.w / 2.0, c.y + c.h / 2.0),
-                                c,
-                                i.width,
-                                i.height,
-                            );
+                            s.view.zoom_at(scale, (c.w / 2.0, c.y + c.h / 2.0), c, w, h);
                         }
                     }
                     _ => {}
@@ -470,6 +729,9 @@ pub(super) unsafe extern "system" fn window_proc(
                 let (capture, move_window) = {
                     let s = &mut *ptr;
                     let p = s.point(lparam);
+                    if s.text_editing.is_some() {
+                        s.finish_text(true);
+                    }
                     if s.picker.open {
                         match color_picker::hit(&s.layout, p.0, p.1) {
                             Some(
@@ -515,7 +777,7 @@ pub(super) unsafe extern "system" fn window_proc(
                         {
                             if p.1 >= r.y + 43.0 && p.1 <= r.y + 85.0 {
                                 s.stroke_dragging = true;
-                                if let Some(width) = s.layout.stroke_at(p.0) {
+                                if let Some(width) = s.layout.stroke_at(p.0, s.is_text_property()) {
                                     s.live_stroke(width);
                                 }
                                 let _ = SetFocus(Some(hwnd));
@@ -555,6 +817,13 @@ pub(super) unsafe extern "system" fn window_proc(
                         && let Some((point, scale)) = source_point(s, p)
                         && inside_source(s, point)
                     {
+                        if s.crop_mode {
+                            s.crop_drag = Mark::from_tool(Control::Crop, point, 0, 1.0);
+                            let _ = SetFocus(Some(hwnd));
+                            SetCapture(hwnd);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                            return LRESULT(0);
+                        }
                         if s.active_tool == Control::Move {
                             let handle = s.document.selected.and_then(|index| {
                                 s.document.marks[index].handles().iter().position(|target| {
@@ -567,6 +836,14 @@ pub(super) unsafe extern "system" fn window_proc(
                                 s.document.hit(point, 6.0 / scale)
                             };
                             if let Some(index) = s.document.selected {
+                                s.stroke_width = if matches!(
+                                    s.document.marks[index].shape,
+                                    document::Shape::Text(..)
+                                ) {
+                                    s.document.marks[index].width
+                                } else {
+                                    s.drawing_stroke_width
+                                };
                                 s.moving_mark = Some(MarkGesture {
                                     index,
                                     original: s.document.marks[index].clone(),
@@ -579,9 +856,19 @@ pub(super) unsafe extern "system" fn window_proc(
                             let _ = InvalidateRect(Some(hwnd), None, false);
                             return LRESULT(0);
                         }
-                        if let Some(mark) =
+                        if s.active_tool == Control::Text {
+                            if let Err(error) = start_text(hwnd, s, point, None) {
+                                s.error = Some(format!("{error:#}"));
+                                s.request(hwnd, ERROR);
+                            }
+                            return LRESULT(0);
+                        }
+                        if let Some(mut mark) =
                             Mark::from_tool(s.active_tool, point, s.drawing_color(), s.stroke_width)
                         {
+                            if let document::Shape::Counter(_, ref mut number) = mark.shape {
+                                *number = s.next_counter;
+                            }
                             s.pending_mark = Some(mark);
                             s.document.selected = None;
                             let _ = SetFocus(Some(hwnd));
@@ -664,6 +951,16 @@ pub(super) unsafe extern "system" fn window_proc(
                 {
                     let s = &mut *ptr;
                     let p = s.point(lparam);
+                    if s.crop_drag.is_some() {
+                        let point = crop_point(s, p);
+                        if let Some(mark) = &mut s.crop_drag
+                            && let Some(point) = point
+                        {
+                            mark.update(point);
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
                     if let Some(region) = s.picker.dragging {
                         if let Some(rgb) = s.picker.update(region, p.0, p.1, &s.layout) {
                             s.live_color(rgb);
@@ -672,7 +969,7 @@ pub(super) unsafe extern "system" fn window_proc(
                         return LRESULT(0);
                     }
                     if s.stroke_dragging {
-                        if let Some(width) = s.layout.stroke_at(p.0) {
+                        if let Some(width) = s.layout.stroke_at(p.0, s.is_text_property()) {
                             s.live_stroke(width);
                         }
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -708,8 +1005,8 @@ pub(super) unsafe extern "system" fn window_proc(
                     }
                     if let Some((start, pan)) = s.pan_start {
                         s.view.pan = (pan.0 + p.0 - start.0, pan.1 + p.1 - start.1);
-                        if let Some(i) = s.composed.as_ref().or(s.image.as_ref()) {
-                            s.view.clamp_pan(s.layout.canvas, i.width, i.height);
+                        if let Some((w, h)) = s.view_size() {
+                            s.view.clamp_pan(s.layout.canvas, w, h);
                         }
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -742,6 +1039,27 @@ pub(super) unsafe extern "system" fn window_proc(
                     let s = &mut *ptr;
                     let p = s.point(lparam);
                     s.drag_start = None;
+                    if let Some(mut mark) = s.crop_drag.take() {
+                        if let Some(point) = crop_point(s, p) {
+                            mark.update(point);
+                        }
+                        if mark.finish() {
+                            if let Err(error) = s.document.add(mark) {
+                                s.error = Some(format!("{error:#}"));
+                                s.request(hwnd, ERROR);
+                            } else {
+                                s.document.selected = None;
+                                s.crop_mode = false;
+                                s.view.zoom = Zoom::Fit;
+                                s.view.pan = (0.0, 0.0);
+                            }
+                        }
+                        if GetCapture() == hwnd {
+                            let _ = ReleaseCapture();
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
                     if let Some(region) = s.picker.dragging.take() {
                         if let Some(rgb) = s.picker.update(region, p.0, p.1, &s.layout) {
                             s.live_color(rgb);
@@ -755,7 +1073,7 @@ pub(super) unsafe extern "system" fn window_proc(
                     }
                     if s.stroke_dragging {
                         s.stroke_dragging = false;
-                        if let Some(width) = s.layout.stroke_at(p.0) {
+                        if let Some(width) = s.layout.stroke_at(p.0, s.is_text_property()) {
                             s.live_stroke(width);
                         }
                         s.finish_stroke();
@@ -769,11 +1087,14 @@ pub(super) unsafe extern "system" fn window_proc(
                         if let Some((point, _)) = source_point(s, p) {
                             mark.update(redaction_point(&mark, point, s.image.as_ref()));
                         }
-                        if mark.finish()
-                            && let Err(error) = s.document.add(mark)
-                        {
-                            s.error = Some(format!("{error:#}"));
-                            s.request(hwnd, ERROR);
+                        if mark.finish() {
+                            let counter = matches!(mark.shape, document::Shape::Counter(..));
+                            if let Err(error) = s.document.add(mark) {
+                                s.error = Some(format!("{error:#}"));
+                                s.request(hwnd, ERROR);
+                            } else if counter {
+                                s.next_counter = s.next_counter.saturating_add(1);
+                            }
                         }
                         if GetCapture() == hwnd {
                             let _ = ReleaseCapture();
@@ -899,16 +1220,15 @@ pub(super) unsafe extern "system" fn window_proc(
                     return LRESULT(0);
                 }
                 if s.layout.canvas.contains(p.0, p.1)
-                    && let Some(i) = s.composed.as_ref().or(s.image.as_ref())
+                    && let Some((w, h)) = s.view_size()
                 {
                     let delta = (wparam.0 >> 16) as u16 as i16 as f32 / 120.0;
                     if GetKeyState(VK_CONTROL.0 as i32) < 0 {
-                        let scale =
-                            s.view.scale(s.layout.canvas, i.width, i.height) * 1.25_f32.powf(delta);
-                        s.view.zoom_at(scale, p, s.layout.canvas, i.width, i.height);
+                        let scale = s.view.scale(s.layout.canvas, w, h) * 1.25_f32.powf(delta);
+                        s.view.zoom_at(scale, p, s.layout.canvas, w, h);
                     } else {
                         s.view.pan.1 += delta * 48.0;
-                        s.view.clamp_pan(s.layout.canvas, i.width, i.height);
+                        s.view.clamp_pan(s.layout.canvas, w, h);
                     }
                     let _ = InvalidateRect(Some(hwnd), None, false);
                 }
@@ -964,6 +1284,29 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
         Control::Save => state.request(hwnd, SAVE),
         Control::Copy => state.request(hwnd, COPY),
         Control::Zoom => state.request(hwnd, ZOOM_MENU),
+        Control::Crop => {
+            state.finish_text(true);
+            if state.crop_mode {
+                state.crop_mode = false;
+                state.crop_drag = None;
+            } else if let Some(index) = state
+                .document
+                .marks
+                .iter()
+                .rposition(|mark| matches!(mark.shape, document::Shape::Crop(..)))
+            {
+                state.document.selected = Some(index);
+                state.document.delete_selected();
+                state.document.selected = None;
+                state.view.zoom = Zoom::Fit;
+                state.view.pan = (0.0, 0.0);
+            } else {
+                state.crop_mode = true;
+                state.palette_open = false;
+                state.picker.open = false;
+                state.stroke_open = false;
+            }
+        }
         Control::Color => {
             state.finish_stroke();
             state.stroke_open = false;
@@ -982,9 +1325,24 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
         | Control::Line
         | Control::Arrow
         | Control::Pencil
-        | Control::Highlighter
-        | Control::Pixelate => {
+        | Control::Pixelate
+        | Control::Spotlight
+        | Control::Text
+        | Control::Counter => {
+            if state.active_tool == Control::Text {
+                state.text_size = state.stroke_width;
+            } else if !state.is_text_property() {
+                state.drawing_stroke_width = state.stroke_width;
+            }
+            state.stroke_width = if control == Control::Text {
+                state.text_size
+            } else {
+                state.drawing_stroke_width
+            };
             state.select_tool(hwnd, control);
+            if matches!(control, Control::Counter | Control::Text) {
+                state.selected_color = 8;
+            }
             if control != Control::Move {
                 state.document.selected = None;
             }
@@ -995,6 +1353,7 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
             state.stroke_open = false;
         }
         Control::Background => state.request(hwnd, BACKGROUND_TOGGLE),
+        Control::AddImage => state.request(hwnd, ADD_IMAGE),
         Control::Minimize => unsafe {
             let _ = PostMessageW(
                 Some(hwnd),

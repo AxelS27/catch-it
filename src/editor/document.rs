@@ -2,6 +2,7 @@
 use super::layout::Control;
 use crate::storage::Raster;
 use anyhow::{Result, ensure};
+use std::sync::Arc;
 
 const MAX_MARKS: usize = 512;
 const MAX_POINTS: usize = 4096;
@@ -27,6 +28,11 @@ pub enum Shape {
     FilledRectangle(Point, Point),
     Highlighter(Point, Point),
     Mosaic(Point, Point),
+    Spotlight(Point, Point),
+    Counter(Point, u32),
+    Text(Point, String),
+    Crop(Point, Point),
+    Image(Point, Point, Arc<Raster>),
     Ellipse(Point, Point),
     Line(Point, Point),
     Arrow(Point, Point, Point),
@@ -46,6 +52,10 @@ impl Mark {
             Control::Fill => Shape::FilledRectangle(start, start),
             Control::Highlighter => Shape::Highlighter(start, start),
             Control::Pixelate => Shape::Mosaic(start, start),
+            Control::Spotlight => Shape::Spotlight(start, start),
+            Control::Counter => Shape::Counter(start, 1),
+            Control::Text => Shape::Text(start, String::new()),
+            Control::Crop => Shape::Crop(start, start),
             Control::Ellipse => Shape::Ellipse(start, start),
             Control::Line => Shape::Line(start, start),
             Control::Arrow => Shape::Arrow(start, start, start),
@@ -64,6 +74,8 @@ impl Mark {
     }
     pub fn update(&mut self, point: Point) {
         match &mut self.shape {
+            Shape::Counter(center, _) | Shape::Text(center, _) => *center = point,
+            Shape::Image(_, end, _) => *end = point,
             Shape::Pencil(points) => {
                 if points.len() < MAX_POINTS
                     && points.last().is_some_and(|last| {
@@ -77,6 +89,8 @@ impl Mark {
             | Shape::FilledRectangle(_, end)
             | Shape::Highlighter(_, end)
             | Shape::Mosaic(_, end)
+            | Shape::Spotlight(_, end)
+            | Shape::Crop(_, end)
             | Shape::Ellipse(_, end)
             | Shape::Line(_, end) => *end = point,
             Shape::Arrow(start, end, control) => {
@@ -116,20 +130,35 @@ impl Mark {
             }
             return true;
         }
+        if let Shape::Text(_, ref text) = self.shape {
+            return !text.trim().is_empty();
+        }
+        if matches!(self.shape, Shape::Counter(..)) {
+            return true;
+        }
         let (a, b) = self.endpoints().expect("non-pencil shape");
+        if matches!(self.shape, Shape::Crop(..)) {
+            return (a.x - b.x).abs() >= 4.0 && (a.y - b.y).abs() >= 4.0;
+        }
         (a.x - b.x).abs() >= 1.0 || (a.y - b.y).abs() >= 1.0
     }
     pub fn endpoints(&self) -> Option<(Point, Point)> {
         match &self.shape {
-            Shape::Pencil(_) => None,
+            Shape::Pencil(_) | Shape::Counter(..) | Shape::Text(..) => None,
             Shape::Rectangle(a, b)
             | Shape::FilledRectangle(a, b)
             | Shape::Highlighter(a, b)
             | Shape::Mosaic(a, b)
+            | Shape::Spotlight(a, b)
+            | Shape::Crop(a, b)
+            | Shape::Image(a, b, _)
             | Shape::Ellipse(a, b)
             | Shape::Line(a, b) => Some((*a, *b)),
             Shape::Arrow(a, b, _) => Some((*a, *b)),
         }
+    }
+    pub fn counter_radius(&self) -> f32 {
+        14.0 + (self.width - 3.0) * 0.5
     }
     pub fn bounds(&self) -> (Point, Point) {
         if let Some((a, b)) = self.endpoints() {
@@ -148,6 +177,37 @@ impl Mark {
                 hi.y = hi.y.max(control.y);
             }
             return (lo, hi);
+        }
+        if let Shape::Text(point, ref text) = self.shape {
+            let w = text
+                .lines()
+                .map(|line| line.chars().count())
+                .max()
+                .unwrap_or(0) as f32
+                * self.width
+                * 0.65
+                + 8.0;
+            let h = text.lines().count().max(1) as f32 * self.width * 1.35 + 6.0;
+            return (
+                point,
+                Point {
+                    x: point.x + w.clamp(32.0, 2048.0),
+                    y: point.y + h.clamp(24.0, 4096.0),
+                },
+            );
+        }
+        if let Shape::Counter(center, _) = self.shape {
+            let radius = self.counter_radius();
+            return (
+                Point {
+                    x: center.x - radius,
+                    y: center.y - radius,
+                },
+                Point {
+                    x: center.x + radius,
+                    y: center.y + radius,
+                },
+            );
         }
         let Shape::Pencil(points) = &self.shape else {
             unreachable!()
@@ -170,6 +230,7 @@ impl Mark {
     }
     pub fn translate(&mut self, dx: f32, dy: f32) {
         match &mut self.shape {
+            Shape::Counter(center, _) | Shape::Text(center, _) => *center = center.moved(dx, dy),
             Shape::Pencil(points) => {
                 for p in points {
                     *p = p.moved(dx, dy);
@@ -179,6 +240,9 @@ impl Mark {
             | Shape::FilledRectangle(a, b)
             | Shape::Highlighter(a, b)
             | Shape::Mosaic(a, b)
+            | Shape::Spotlight(a, b)
+            | Shape::Crop(a, b)
+            | Shape::Image(a, b, _)
             | Shape::Ellipse(a, b)
             | Shape::Line(a, b) => {
                 *a = a.moved(dx, dy);
@@ -193,6 +257,7 @@ impl Mark {
     }
     pub fn handles(&self) -> Vec<Point> {
         match &self.shape {
+            Shape::Counter(..) | Shape::Text(..) | Shape::Crop(..) => Vec::new(),
             Shape::Line(a, b) => vec![*a, *b],
             Shape::Arrow(a, b, c) => vec![*a, *b, *c],
             _ => {
@@ -210,6 +275,7 @@ impl Mark {
     pub fn resize_handle(&mut self, handle: usize, point: Point) {
         let (old_lo, old_hi) = self.bounds();
         match &mut self.shape {
+            Shape::Counter(center, _) | Shape::Text(center, _) => *center = point,
             Shape::Line(a, b) => {
                 if handle == 0 {
                     *a = point;
@@ -237,6 +303,9 @@ impl Mark {
             | Shape::FilledRectangle(a, b)
             | Shape::Highlighter(a, b)
             | Shape::Mosaic(a, b)
+            | Shape::Spotlight(a, b)
+            | Shape::Crop(a, b)
+            | Shape::Image(a, b, _)
             | Shape::Ellipse(a, b) => {
                 let lo = Point {
                     x: a.x.min(b.x),
@@ -285,6 +354,11 @@ impl Mark {
             return false;
         }
         match &self.shape {
+            Shape::Text(..) => true,
+            Shape::Crop(..) => false,
+            Shape::Counter(center, _) => {
+                (p.x - center.x).hypot(p.y - center.y) <= self.counter_radius() + tolerance
+            }
             Shape::Pencil(points) => points
                 .windows(2)
                 .any(|pair| segment_distance(p, pair[0], pair[1]) <= r),
@@ -300,7 +374,11 @@ impl Mark {
                 }
                 false
             }
-            Shape::FilledRectangle(_, _) | Shape::Highlighter(_, _) | Shape::Mosaic(_, _) => true,
+            Shape::FilledRectangle(_, _)
+            | Shape::Highlighter(_, _)
+            | Shape::Mosaic(_, _)
+            | Shape::Spotlight(_, _)
+            | Shape::Image(..) => true,
             Shape::Rectangle(_, _) => {
                 (p.x - lo.x).abs() <= r
                     || (p.x - hi.x).abs() <= r
@@ -321,38 +399,92 @@ impl Mark {
         }
     }
 }
-/// A content-independent, opaque mosaic. Tiles never sample or retain source pixels.
-/// This protects the *export* region; the original capture file remains untouched.
-pub fn mosaic_tiles(a: Point, b: Point, mut paint: impl FnMut(Point, Point, u32)) {
+/// Image-derived visual pixelation. Never use this for confidential redaction:
+/// block averages retain information about the underlying source image.
+pub fn mosaic_tiles(
+    source: &Raster,
+    a: Point,
+    b: Point,
+    offset: Point,
+    mut paint: impl FnMut(Point, Point, u32),
+) {
     let (x0, x1) = ((a.x.min(b.x).floor() as i32), (a.x.max(b.x).ceil() as i32));
     let (y0, y1) = ((a.y.min(b.y).floor() as i32), (a.y.max(b.y).ceil() as i32));
     if x0 >= x1 || y0 >= y1 {
         return;
     }
     let span = x1.saturating_sub(x0).max(y1.saturating_sub(y0)) as u32;
-    let step = span.div_ceil(96).max(8) as i32;
+    let step = span.div_ceil(96).max(16) as i32;
     for y in (y0..y1).step_by(step as usize) {
         for x in (x0..x1).step_by(step as usize) {
-            let mut hash =
-                (x as u32).wrapping_mul(0x9e3779b9) ^ (y as u32).wrapping_mul(0x85ebca6b);
-            hash ^= hash >> 16;
-            hash = hash.wrapping_mul(0x7feb352d);
-            hash ^= hash >> 15;
-            let value = 58 + hash % 73;
-            let tint = (value << 16) | ((value + hash % 6) << 8) | (value + hash % 11);
+            let (right, bottom) = (
+                x.saturating_add(step).min(x1),
+                y.saturating_add(step).min(y1),
+            );
+            let mut channels = [0u32; 3];
+            let mut samples = 0u32;
+            // Sample a stratified grid so preview and full-resolution export
+            // share exactly the same image-derived tiles without a per-frame
+            // allocation or downscaled/blurred intermediate bitmap.
+            for row in 0..4 {
+                for column in 0..4 {
+                    let sx =
+                        (x as f32 + (right - x) as f32 * (column as f32 + 0.5) / 4.0 + offset.x)
+                            .floor() as i32;
+                    let sy = (y as f32 + (bottom - y) as f32 * (row as f32 + 0.5) / 4.0 + offset.y)
+                        .floor() as i32;
+                    if sx < 0 || sy < 0 || sx >= source.width as i32 || sy >= source.height as i32 {
+                        continue;
+                    }
+                    let i = ((sy as u32 * source.width + sx as u32) * 4) as usize;
+                    for (channel, sum) in channels.iter_mut().enumerate() {
+                        *sum += u32::from(source.pixels[i + channel]);
+                    }
+                    samples += 1;
+                }
+            }
+            if samples == 0 {
+                continue;
+            }
+            let rgb = ((channels[2] / samples) << 16)
+                | ((channels[1] / samples) << 8)
+                | (channels[0] / samples);
             paint(
                 Point {
                     x: x as f32,
                     y: y as f32,
                 },
                 Point {
-                    x: x.saturating_add(step).min(x1) as f32,
-                    y: y.saturating_add(step).min(y1) as f32,
+                    x: right as f32,
+                    y: bottom as f32,
                 },
-                tint,
+                rgb,
             );
         }
     }
+}
+/// Four nonoverlapping rectangles covering everything except the spotlight.
+pub fn spotlight_regions(
+    width: u32,
+    height: u32,
+    a: Point,
+    b: Point,
+    offset: Point,
+) -> [(u32, u32, u32, u32); 4] {
+    let (left, right) = (
+        (a.x.min(b.x) + offset.x).floor().clamp(0.0, width as f32) as u32,
+        (a.x.max(b.x) + offset.x).ceil().clamp(0.0, width as f32) as u32,
+    );
+    let (top, bottom) = (
+        (a.y.min(b.y) + offset.y).floor().clamp(0.0, height as f32) as u32,
+        (a.y.max(b.y) + offset.y).ceil().clamp(0.0, height as f32) as u32,
+    );
+    [
+        (0, 0, width, top),
+        (0, bottom, width, height),
+        (0, top, left, bottom),
+        (right, top, width, bottom),
+    ]
 }
 pub fn curve(a: Point, control: Point, b: Point, t: f32) -> Point {
     let u = 1.0 - t;
@@ -427,6 +559,64 @@ impl Document {
         self.marks[index].color = color;
         self.edit(index, previous);
     }
+    pub fn asset_bytes(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        let mut bytes = 0;
+        let mut count = |mark: &Mark| {
+            if let Shape::Image(_, _, image) = &mark.shape
+                && seen.insert(Arc::as_ptr(image) as usize)
+            {
+                bytes += image.pixels.len();
+            }
+        };
+        for mark in &self.marks {
+            count(mark);
+        }
+        for change in self.undo.iter().chain(self.redo.iter()) {
+            if let Some(mark) = &change.before {
+                count(mark);
+            }
+            if let Some(mark) = &change.after {
+                count(mark);
+            }
+        }
+        bytes
+    }
+    pub fn crop(&self) -> Option<(Point, Point)> {
+        self.marks.iter().rev().find_map(|mark| {
+            if let Shape::Crop(a, b) = mark.shape {
+                Some((
+                    Point {
+                        x: a.x.min(b.x),
+                        y: a.y.min(b.y),
+                    },
+                    Point {
+                        x: a.x.max(b.x),
+                        y: a.y.max(b.y),
+                    },
+                ))
+            } else {
+                None
+            }
+        })
+    }
+    pub fn crop_pixels(
+        &self,
+        width: u32,
+        height: u32,
+        offset: Point,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let (lo, hi) = self.crop()?;
+        let (x0, x1) = (
+            (lo.x + offset.x).floor().clamp(0.0, width as f32) as u32,
+            (hi.x + offset.x).ceil().clamp(0.0, width as f32) as u32,
+        );
+        let (y0, y1) = (
+            (lo.y + offset.y).floor().clamp(0.0, height as f32) as u32,
+            (hi.y + offset.y).ceil().clamp(0.0, height as f32) as u32,
+        );
+        (x1 > x0 && y1 > y0).then_some((x0, y0, x1, y1))
+    }
     pub fn delete_selected(&mut self) -> bool {
         let Some(index) = self.selected.take() else {
             return false;
@@ -466,7 +656,9 @@ impl Document {
             (Some(_), Some(mark)) => self.marks[change.index] = mark.clone(),
             (None, None) => unreachable!(),
         }
-        self.selected = target.as_ref().map(|_| change.index);
+        self.selected = target
+            .as_ref()
+            .and_then(|mark| (!matches!(mark.shape, Shape::Crop(..))).then_some(change.index));
         self.revision = self.revision.wrapping_add(1);
     }
     pub fn undo(&mut self) -> bool {
@@ -539,7 +731,7 @@ fn paint_segment(image: &mut Raster, a: Point, b: Point, width: f32, color: u32,
         }
     }
 }
-fn paint_mark(image: &mut Raster, mark: &Mark, offset: Point) {
+fn paint_mark(image: &mut Raster, source: &Raster, mark: &Mark, offset: Point) -> Result<()> {
     match &mark.shape {
         Shape::Pencil(points) => {
             for pair in points.windows(2) {
@@ -566,7 +758,7 @@ fn paint_mark(image: &mut Raster, mark: &Mark, offset: Point) {
             }
         }
         Shape::Mosaic(a, b) => {
-            mosaic_tiles(*a, *b, |lo, hi, rgb| {
+            mosaic_tiles(source, *a, *b, offset, |lo, hi, rgb| {
                 let x0 = (lo.x + offset.x).floor().max(0.0) as u32;
                 let x1 = (hi.x + offset.x).ceil().min(image.width as f32) as u32;
                 let y0 = (lo.y + offset.y).floor().max(0.0) as u32;
@@ -583,6 +775,115 @@ fn paint_mark(image: &mut Raster, mark: &Mark, offset: Point) {
                     }
                 }
             });
+        }
+        Shape::Counter(center, number) => {
+            let radius = mark.counter_radius();
+            let diameter = (radius * 2.0).ceil() as u32;
+            let x0 = (center.x + offset.x - radius).floor() as i32;
+            let y0 = (center.y + offset.y - radius).floor() as i32;
+            let text = super::text_raster::glyph_mask(
+                &number.to_string(),
+                diameter,
+                diameter,
+                radius * 1.12,
+                true,
+            )?;
+            for y in 0..diameter {
+                for x in 0..diameter {
+                    let (px, py) = (x0 + x as i32, y0 + y as i32);
+                    if px < 0 || py < 0 || px >= image.width as i32 || py >= image.height as i32 {
+                        continue;
+                    }
+                    let coverage = (radius + 0.5
+                        - ((px as f32 + 0.5 - center.x - offset.x)
+                            .hypot(py as f32 + 0.5 - center.y - offset.y)))
+                    .clamp(0.0, 1.0);
+                    let i = ((py as u32 * image.width + px as u32) * 4) as usize;
+                    blend(&mut image.pixels, i, mark.color, coverage);
+                    blend(
+                        &mut image.pixels,
+                        i,
+                        0xffffff,
+                        text[(y * diameter + x) as usize] as f32 / 255.0,
+                    );
+                }
+            }
+        }
+        Shape::Crop(..) => {}
+        Shape::Image(a, b, overlay) => {
+            let (lo, hi) = (
+                Point {
+                    x: a.x.min(b.x) + offset.x,
+                    y: a.y.min(b.y) + offset.y,
+                },
+                Point {
+                    x: a.x.max(b.x) + offset.x,
+                    y: a.y.max(b.y) + offset.y,
+                },
+            );
+            let (w, h) = (hi.x - lo.x, hi.y - lo.y);
+            if w >= 1.0 && h >= 1.0 {
+                let x0 = lo.x.floor().max(0.0) as u32;
+                let y0 = lo.y.floor().max(0.0) as u32;
+                let x1 = hi.x.ceil().min(image.width as f32) as u32;
+                let y1 = hi.y.ceil().min(image.height as f32) as u32;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let sx = (((x as f32 + 0.5 - lo.x) / w * overlay.width as f32) as u32)
+                            .min(overlay.width - 1);
+                        let sy = (((y as f32 + 0.5 - lo.y) / h * overlay.height as f32) as u32)
+                            .min(overlay.height - 1);
+                        let source = ((sy * overlay.width + sx) * 4) as usize;
+                        let target = ((y * image.width + x) * 4) as usize;
+                        let pixel = &overlay.pixels[source..source + 4];
+                        let rgb = (u32::from(pixel[2]) << 16)
+                            | (u32::from(pixel[1]) << 8)
+                            | u32::from(pixel[0]);
+                        blend(&mut image.pixels, target, rgb, pixel[3] as f32 / 255.0);
+                    }
+                }
+            }
+        }
+        Shape::Text(point, content) => {
+            let (_, hi) = mark.bounds();
+            let w = ((hi.x - point.x).ceil() as u32).min(image.width).max(1);
+            let h = ((hi.y - point.y).ceil() as u32).min(image.height).max(1);
+            let mask = super::text_raster::glyph_mask(content, w, h, mark.width, false)?;
+            let (px, py) = (
+                (point.x + offset.x).floor() as i32,
+                (point.y + offset.y).floor() as i32,
+            );
+            for y in 0..h {
+                for x in 0..w {
+                    let (dx, dy) = (px + x as i32, py + y as i32);
+                    if dx < 0 || dy < 0 || dx >= image.width as i32 || dy >= image.height as i32 {
+                        continue;
+                    }
+                    let coverage = mask[(y * w + x) as usize] as f32 / 255.0;
+                    if coverage > 0.0 {
+                        blend(
+                            &mut image.pixels,
+                            ((dy as u32 * image.width + dx as u32) * 4) as usize,
+                            mark.color,
+                            coverage,
+                        );
+                    }
+                }
+            }
+        }
+        Shape::Spotlight(a, b) => {
+            for (x0, y0, x1, y1) in spotlight_regions(image.width, image.height, *a, *b, offset) {
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        blend(
+                            &mut image.pixels,
+                            ((y * image.width + x) * 4) as usize,
+                            0x080912,
+                            0.64,
+                        );
+                    }
+                }
+            }
         }
         Shape::Rectangle(a, b) | Shape::FilledRectangle(a, b) | Shape::Highlighter(a, b) => {
             let lo = Point {
@@ -646,6 +947,7 @@ fn paint_mark(image: &mut Raster, mark: &Mark, offset: Point) {
             }
         }
     }
+    Ok(())
 }
 /// Flatten only on output; preview objects remain editable and the capture stays untouched.
 pub fn flatten(base: &Raster, marks: &[Mark], offset: Point) -> Result<Raster> {
@@ -659,7 +961,39 @@ pub fn flatten(base: &Raster, marks: &[Mark], offset: Point) -> Result<Raster> {
         pixels: base.pixels.clone(),
     };
     for mark in marks {
-        paint_mark(&mut image, mark, offset);
+        paint_mark(&mut image, base, mark, offset)?;
+    }
+    if let Some((a, b)) = marks.iter().rev().find_map(|mark| {
+        if let Shape::Crop(a, b) = mark.shape {
+            Some((a, b))
+        } else {
+            None
+        }
+    }) {
+        let x0 = (a.x.min(b.x) + offset.x)
+            .floor()
+            .clamp(0.0, image.width as f32) as u32;
+        let y0 = (a.y.min(b.y) + offset.y)
+            .floor()
+            .clamp(0.0, image.height as f32) as u32;
+        let x1 = (a.x.max(b.x) + offset.x)
+            .ceil()
+            .clamp(0.0, image.width as f32) as u32;
+        let y1 = (a.y.max(b.y) + offset.y)
+            .ceil()
+            .clamp(0.0, image.height as f32) as u32;
+        ensure!(x1 > x0 && y1 > y0, "Empty crop");
+        let (width, height) = (x1 - x0, y1 - y0);
+        let mut pixels = Vec::with_capacity(width as usize * height as usize * 4);
+        for y in y0..y1 {
+            let start = ((y * image.width + x0) * 4) as usize;
+            pixels.extend_from_slice(&image.pixels[start..start + width as usize * 4]);
+        }
+        image = Raster {
+            width,
+            height,
+            pixels,
+        };
     }
     Ok(image)
 }
@@ -667,33 +1001,118 @@ pub fn flatten(base: &Raster, marks: &[Mark], offset: Point) -> Result<Raster> {
 mod tests {
     use super::*;
     #[test]
-    fn mosaic_export_replaces_source_pixels_with_content_independent_opaque_tiles() -> Result<()> {
-        let red = Raster {
-            width: 40,
-            height: 40,
-            pixels: [0, 0, 255, 255].repeat(40 * 40),
-        };
-        let blue = Raster {
-            width: 40,
-            height: 40,
-            pixels: [255, 0, 0, 255].repeat(40 * 40),
+    fn mosaic_export_samples_source_and_does_not_modify_original() -> Result<()> {
+        let source = Raster {
+            width: 64,
+            height: 32,
+            pixels: (0..64 * 32)
+                .flat_map(|i| {
+                    if i % 64 < 32 {
+                        [0, 0, 255, 255]
+                    } else {
+                        [0, 255, 0, 255]
+                    }
+                })
+                .collect(),
         };
         let mut mark =
-            Mark::from_tool(Control::Pixelate, Point { x: 4.0, y: 5.0 }, 0xffde00, 3.0).unwrap();
-        mark.update(Point { x: 32.0, y: 33.0 });
+            Mark::from_tool(Control::Pixelate, Point { x: 4.0, y: 4.0 }, 0xffde00, 3.0).unwrap();
+        mark.update(Point { x: 60.0, y: 28.0 });
+        let result = flatten(&source, &[mark], Point::default())?;
+        let pixel = |x: usize, y: usize| &result.pixels[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        assert_eq!(pixel(10, 10), &[0, 0, 255, 255]);
+        assert_eq!(pixel(45, 10), &[0, 255, 0, 255]);
+        assert_eq!(pixel(0, 0), &[0, 0, 255, 255]);
+        assert_eq!(
+            source.pixels[(10 * 64 + 45) * 4..(10 * 64 + 45) * 4 + 4],
+            [0, 255, 0, 255]
+        );
+        Ok(())
+    }
+    #[test]
+    fn imported_image_alpha_resizes_and_remains_editable() -> Result<()> {
+        let base = Raster {
+            width: 10,
+            height: 10,
+            pixels: [255, 0, 0, 255].repeat(100),
+        };
+        let imported = Arc::new(Raster {
+            width: 2,
+            height: 2,
+            pixels: [0, 0, 255, 128].repeat(4),
+        });
+        let mut document = Document::default();
+        document.add(Mark {
+            shape: Shape::Image(Point { x: 2.0, y: 2.0 }, Point { x: 6.0, y: 6.0 }, imported),
+            color: 0,
+            width: 1.0,
+            opacity: 1.0,
+        })?;
+        assert_eq!(document.asset_bytes(), 16);
+        let result = flatten(&base, &document.marks, Point::default())?;
+        assert_eq!(
+            result.pixels[(3 * 10 + 3) * 4..(3 * 10 + 3) * 4 + 4],
+            [127, 0, 128, 255]
+        );
+        assert_eq!(result.pixels[0..4], [255, 0, 0, 255]);
+        assert_eq!(
+            base.pixels[(3 * 10 + 3) * 4..(3 * 10 + 3) * 4 + 4],
+            [255, 0, 0, 255]
+        );
+        assert!(document.hit(Point { x: 3.0, y: 3.0 }, 0.0).is_some());
+        assert!(document.undo());
+        assert!(document.marks.is_empty());
+        assert_eq!(document.asset_bytes(), 16);
+        assert!(document.redo());
+        assert_eq!(document.asset_bytes(), 16);
+        Ok(())
+    }
+    #[test]
+    fn crop_changes_export_dimensions_but_keeps_source_and_history() -> Result<()> {
+        let source = Raster {
+            width: 20,
+            height: 16,
+            pixels: [1, 2, 3, 255].repeat(320),
+        };
+        let mut doc = Document::default();
+        let mut mark = Mark::from_tool(Control::Crop, Point { x: 3.0, y: 2.0 }, 0, 1.0).unwrap();
+        mark.update(Point { x: 17.0, y: 11.0 });
         assert!(mark.finish());
-        let a = flatten(&red, &[mark.clone()], Point::default())?;
-        let b = flatten(&blue, &[mark], Point::default())?;
-        for y in 5..33 {
-            for x in 4..32 {
-                let i = ((y * 40 + x) * 4) as usize;
-                assert_eq!(&a.pixels[i..i + 4], &b.pixels[i..i + 4]);
-                assert_eq!(a.pixels[i + 3], 255);
-                assert_ne!(&a.pixels[i..i + 4], &red.pixels[i..i + 4]);
-            }
-        }
-        assert_eq!(&a.pixels[0..4], &red.pixels[0..4]);
-        assert_eq!(&red.pixels[0..4], &[0, 0, 255, 255]);
+        doc.add(mark)?;
+        let image = flatten(&source, &doc.marks, Point::default())?;
+        assert_eq!((image.width, image.height), (14, 9));
+        assert_eq!(
+            &image.pixels[0..4],
+            &source.pixels[(2 * 20 + 3) * 4..(2 * 20 + 3) * 4 + 4]
+        );
+        assert!(doc.undo());
+        assert!(doc.crop().is_none());
+        assert!(doc.redo());
+        assert_eq!(
+            doc.crop_pixels(20, 16, Point::default()),
+            Some((3, 2, 17, 11))
+        );
+        assert_eq!((source.width, source.height), (20, 16));
+        Ok(())
+    }
+    #[test]
+    fn spotlight_keeps_focus_and_does_not_modify_source() -> Result<()> {
+        let source = Raster {
+            width: 20,
+            height: 20,
+            pixels: [255, 0, 0, 255].repeat(400),
+        };
+        let mut mark =
+            Mark::from_tool(Control::Spotlight, Point { x: 5.0, y: 5.0 }, 0xffffff, 3.0).unwrap();
+        mark.update(Point { x: 15.0, y: 15.0 });
+        assert!(mark.finish());
+        let result = flatten(&source, &[mark], Point::default())?;
+        assert_eq!(
+            &result.pixels[(10 * 20 + 10) * 4..(10 * 20 + 10) * 4 + 4],
+            &[255, 0, 0, 255]
+        );
+        assert!(result.pixels[0] < 130);
+        assert_eq!(source.pixels[0], 255);
         Ok(())
     }
     #[test]

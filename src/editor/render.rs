@@ -6,7 +6,11 @@ use super::{
 };
 use crate::storage::Raster;
 use anyhow::{Context, Result};
-use std::cell::RefCell;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use windows::{
     Win32::{
         Foundation::HWND,
@@ -24,6 +28,9 @@ pub struct ChromeState<'a> {
     pub source: Option<&'a Raster>,
     pub document: &'a Document,
     pub pending: Option<&'a Mark>,
+    pub editing_text: Option<usize>,
+    pub crop_mode: bool,
+    pub crop_drag: Option<&'a Mark>,
     pub active_tool: Control,
     pub pill_center: f32,
     pub stroke_width: f32,
@@ -48,6 +55,7 @@ pub struct Renderer {
     bitmap: Option<ID2D1Bitmap>,
     swatches: Vec<ID2D1Bitmap>,
     picker_bitmap: RefCell<Option<(u16, ID2D1Bitmap)>>,
+    overlay_bitmaps: RefCell<HashMap<usize, ID2D1Bitmap>>,
 }
 fn rect(r: Rect) -> D2D_RECT_F {
     D2D_RECT_F {
@@ -168,6 +176,7 @@ impl Renderer {
                 brush,
                 swatches,
                 picker_bitmap: RefCell::new(None),
+                overlay_bitmaps: RefCell::new(HashMap::new()),
                 font: make_font(12.0)?,
                 label,
                 large: make_font(16.0)?,
@@ -753,7 +762,7 @@ impl Renderer {
         self.text("Done", done, 0xffffff, false);
         Ok(())
     }
-    fn stroke_panel(&self, layout: &Layout, width: f32, rgb: u32) {
+    fn stroke_panel(&self, layout: &Layout, width: f32, rgb: u32, text_size: bool) {
         let Some(r) = layout.stroke_rect() else {
             return;
         };
@@ -769,7 +778,11 @@ impl Renderer {
         self.pill(r, 0x25252d, 16.0);
         self.rounded_outline(r, 0x595965, 16.0);
         self.text(
-            "Stroke width",
+            if text_size {
+                "Text size"
+            } else {
+                "Stroke width"
+            },
             Rect {
                 x: r.x + 16.0,
                 y: r.y + 10.0,
@@ -780,7 +793,7 @@ impl Renderer {
             false,
         );
         self.text(
-            &format!("{width:.1} px"),
+            &format!("{width:.1} {}", if text_size { "pt" } else { "px" }),
             Rect {
                 x: r.x + 150.0,
                 y: r.y + 10.0,
@@ -800,7 +813,11 @@ impl Renderer {
             0x555561,
             2.0,
         );
-        let value = ((width - 1.0) / 23.0).clamp(0.0, 1.0);
+        let value = if text_size {
+            ((width - 8.0) / 64.0).clamp(0.0, 1.0)
+        } else {
+            ((width - 1.0) / 23.0).clamp(0.0, 1.0)
+        };
         self.pill(
             Rect {
                 x: r.x + 18.0,
@@ -813,14 +830,64 @@ impl Renderer {
         );
         self.circle(r.x + 18.0 + 180.0 * value, r.y + 69.0, 7.0, 0x007aff, true);
         self.circle(r.x + 18.0 + 180.0 * value, r.y + 69.0, 4.5, 0xffffff, true);
-        self.line(
-            (r.x + 18.0, r.y + 93.0),
-            (r.x + 198.0, r.y + 93.0),
-            rgb,
-            (width / 2.0).clamp(1.0, 9.0),
-        );
+        if text_size {
+            self.text(
+                "Aa",
+                Rect {
+                    x: r.x + 18.0,
+                    y: r.y + 81.0,
+                    w: 180.0,
+                    h: 26.0,
+                },
+                rgb,
+                true,
+            );
+        } else {
+            self.line(
+                (r.x + 18.0, r.y + 93.0),
+                (r.x + 198.0, r.y + 93.0),
+                rgb,
+                (width / 2.0).clamp(1.0, 9.0),
+            );
+        }
     }
-    fn mark(&self, mark: &Mark, origin: Point, scale: f32) {
+    fn overlay_bitmap(&self, overlay: &Arc<Raster>) -> Result<ID2D1Bitmap> {
+        let key = Arc::as_ptr(overlay) as usize;
+        if let Some(bitmap) = self.overlay_bitmaps.borrow().get(&key) {
+            return Ok(bitmap.clone());
+        }
+        let pixels = premultiply(&overlay.pixels);
+        let bitmap = unsafe {
+            self.target.CreateBitmap(
+                D2D_SIZE_U {
+                    width: overlay.width,
+                    height: overlay.height,
+                },
+                Some(pixels.as_ptr().cast()),
+                overlay.width * 4,
+                &D2D1_BITMAP_PROPERTIES {
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                },
+            )?
+        };
+        self.overlay_bitmaps
+            .borrow_mut()
+            .insert(key, bitmap.clone());
+        Ok(bitmap)
+    }
+    fn mark(
+        &self,
+        mark: &Mark,
+        origin: Point,
+        scale: f32,
+        source: &Raster,
+        source_offset: Point,
+    ) -> Result<()> {
         let map = |p: Point| (origin.x + p.x * scale, origin.y + p.y * scale);
         let width = (mark.width * scale).max(0.5);
         let segment = |a: Point, b: Point| {
@@ -858,7 +925,7 @@ impl Renderer {
                 unsafe {
                     self.target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
                 }
-                document::mosaic_tiles(*a, *b, |lo, hi, rgb| {
+                document::mosaic_tiles(source, *a, *b, source_offset, |lo, hi, rgb| {
                     self.fill(
                         Rect {
                             x: origin.x + lo.x * scale,
@@ -872,6 +939,102 @@ impl Renderer {
                 unsafe {
                     self.target
                         .SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                }
+            }
+            Shape::Counter(center, number) => {
+                let (x, y) = map(*center);
+                let radius = mark.counter_radius() * scale;
+                self.circle(x, y, radius, mark.color, true);
+                self.text(
+                    &number.to_string(),
+                    Rect {
+                        x: x - radius,
+                        y: y - radius,
+                        w: radius * 2.0,
+                        h: radius * 2.0,
+                    },
+                    0xffffff,
+                    true,
+                );
+            }
+            Shape::Crop(..) => {}
+            Shape::Image(a, b, overlay) => {
+                let bitmap = self.overlay_bitmap(overlay)?;
+                let (lo, hi) = (
+                    Point {
+                        x: a.x.min(b.x),
+                        y: a.y.min(b.y),
+                    },
+                    Point {
+                        x: a.x.max(b.x),
+                        y: a.y.max(b.y),
+                    },
+                );
+                unsafe {
+                    self.target.DrawBitmap(
+                        &bitmap,
+                        Some(&rect(Rect {
+                            x: origin.x + lo.x * scale,
+                            y: origin.y + lo.y * scale,
+                            w: (hi.x - lo.x) * scale,
+                            h: (hi.y - lo.y) * scale,
+                        })),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        None,
+                    );
+                }
+            }
+            Shape::Text(point, content) => {
+                let (_, hi) = mark.bounds();
+                let font = unsafe {
+                    DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED).and_then(
+                        |factory| {
+                            factory.CreateTextFormat(
+                                w!("Segoe UI"),
+                                None,
+                                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                                DWRITE_FONT_STYLE_NORMAL,
+                                DWRITE_FONT_STRETCH_NORMAL,
+                                (mark.width * scale).max(1.0),
+                                w!("en-US"),
+                            )
+                        },
+                    )
+                };
+                if let Ok(font) = font {
+                    unsafe {
+                        self.brush.SetColor(&color(mark.color));
+                        self.target.DrawText(
+                            &content.encode_utf16().collect::<Vec<_>>(),
+                            &font,
+                            &rect(Rect {
+                                x: origin.x + point.x * scale,
+                                y: origin.y + point.y * scale,
+                                w: (hi.x - point.x) * scale,
+                                h: (hi.y - point.y) * scale,
+                            }),
+                            &self.brush,
+                            D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                            DWRITE_MEASURING_MODE_NATURAL,
+                        );
+                    }
+                }
+            }
+            Shape::Spotlight(a, b) => {
+                for (x0, y0, x1, y1) in
+                    document::spotlight_regions(source.width, source.height, *a, *b, source_offset)
+                {
+                    self.fill_opacity(
+                        Rect {
+                            x: origin.x + (x0 as f32 - source_offset.x) * scale,
+                            y: origin.y + (y0 as f32 - source_offset.y) * scale,
+                            w: (x1 - x0) as f32 * scale,
+                            h: (y1 - y0) as f32 * scale,
+                        },
+                        0x080912,
+                        0.64,
+                    );
                 }
             }
             Shape::Rectangle(a, b) | Shape::FilledRectangle(a, b) | Shape::Highlighter(a, b) => {
@@ -922,6 +1085,7 @@ impl Renderer {
                 }
             }
         }
+        Ok(())
     }
     fn panel(&self, layout: &Layout, model: &Background, dark: bool) {
         if !model.open {
@@ -1247,6 +1411,9 @@ impl Renderer {
             source,
             document,
             pending,
+            editing_text,
+            crop_mode,
+            crop_drag,
             active_tool,
             pill_center,
             stroke_width,
@@ -1266,6 +1433,24 @@ impl Renderer {
         } else {
             (0xffffff, 0x242127, 0x79737e, 0xffffff, 0xded5df)
         };
+        let live: HashSet<usize> = document
+            .marks
+            .iter()
+            .filter_map(|mark| {
+                if let Shape::Image(_, _, overlay) = &mark.shape {
+                    Some(Arc::as_ptr(overlay) as usize)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        self.overlay_bitmaps
+            .borrow_mut()
+            .retain(|key, _| live.contains(key));
+        let text_property = active_tool == Control::Text
+            || document
+                .selected
+                .is_some_and(|index| matches!(document.marks[index].shape, Shape::Text(..)));
         unsafe {
             self.target.BeginDraw();
             self.target.Clear(Some(&color(canvas)));
@@ -1311,7 +1496,23 @@ impl Renderer {
                 .PushAxisAlignedClip(&rect(layout.canvas), D2D1_ANTIALIAS_MODE_ALIASED);
         }
         if let Some(image) = image {
-            let r = view.image_rect(layout.canvas, image.width, image.height);
+            let (ox, oy) = if let Some(source) = source {
+                background::source_origin(source.width, source.height, background)?
+            } else {
+                (0, 0)
+            };
+            let (cx, cy, ex, ey) = document
+                .crop_pixels(
+                    image.width,
+                    image.height,
+                    Point {
+                        x: ox as f32,
+                        y: oy as f32,
+                    },
+                )
+                .unwrap_or((0, 0, image.width, image.height));
+            let (shown_w, shown_h) = (ex - cx, ey - cy);
+            let r = view.image_rect(layout.canvas, shown_w, shown_h);
             let visible = Rect {
                 x: r.x.max(layout.canvas.x),
                 y: r.y.max(layout.canvas.y),
@@ -1344,28 +1545,85 @@ impl Renderer {
                         Some(&rect(r)),
                         1.0,
                         if !background.selected()
-                            && view.scale(layout.canvas, image.width, image.height) >= 1.0
+                            && view.scale(layout.canvas, shown_w, shown_h) >= 1.0
                         {
                             D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
                         } else {
                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
                         },
-                        None,
+                        Some(&D2D_RECT_F {
+                            left: cx as f32,
+                            top: cy as f32,
+                            right: ex as f32,
+                            bottom: ey as f32,
+                        }),
                     );
                 }
             }
-            if let Some(source) = source {
-                let (ox, oy) = background::source_origin(source.width, source.height, background)?;
-                let scale = view.scale(layout.canvas, image.width, image.height);
+            if source.is_some() {
+                let scale = view.scale(layout.canvas, shown_w, shown_h);
                 let origin = Point {
-                    x: r.x + ox as f32 * scale,
-                    y: r.y + oy as f32 * scale,
+                    x: r.x + (ox as f32 - cx as f32) * scale,
+                    y: r.y + (oy as f32 - cy as f32) * scale,
                 };
-                for mark in &document.marks {
-                    self.mark(mark, origin, scale);
+                let source_offset = Point {
+                    x: ox as f32,
+                    y: oy as f32,
+                };
+                unsafe {
+                    self.target
+                        .PushAxisAlignedClip(&rect(r), D2D1_ANTIALIAS_MODE_ALIASED);
+                }
+                for (index, mark) in document.marks.iter().enumerate() {
+                    if editing_text != Some(index) {
+                        self.mark(mark, origin, scale, image, source_offset)?;
+                    }
                 }
                 if let Some(mark) = pending {
-                    self.mark(mark, origin, scale);
+                    self.mark(mark, origin, scale, image, source_offset)?;
+                }
+                if let Some(mark) = crop_drag {
+                    let (lo, hi) = mark.bounds();
+                    let focus = Rect {
+                        x: origin.x + lo.x * scale,
+                        y: origin.y + lo.y * scale,
+                        w: (hi.x - lo.x) * scale,
+                        h: (hi.y - lo.y) * scale,
+                    };
+                    self.fill_opacity(r, 0x080912, 0.58);
+                    if focus.w > 0.0 && focus.h > 0.0 {
+                        if let Some(bitmap) = &self.bitmap {
+                            unsafe {
+                                self.target.DrawBitmap(
+                                    bitmap,
+                                    Some(&rect(focus)),
+                                    1.0,
+                                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                                    Some(&D2D_RECT_F {
+                                        left: lo.x + ox as f32,
+                                        top: lo.y + oy as f32,
+                                        right: hi.x + ox as f32,
+                                        bottom: hi.y + oy as f32,
+                                    }),
+                                );
+                            }
+                        }
+                        self.outline(focus, 0x007aff, 2.0);
+                        for fraction in [1.0 / 3.0, 2.0 / 3.0] {
+                            self.line(
+                                (focus.x + focus.w * fraction, focus.y),
+                                (focus.x + focus.w * fraction, focus.y + focus.h),
+                                0xb8d9ff,
+                                0.6,
+                            );
+                            self.line(
+                                (focus.x, focus.y + focus.h * fraction),
+                                (focus.x + focus.w, focus.y + focus.h * fraction),
+                                0xb8d9ff,
+                                0.6,
+                            );
+                        }
+                    }
                 }
                 if let Some(index) = document.selected
                     && active_tool == Control::Move
@@ -1397,6 +1655,9 @@ impl Renderer {
                             false,
                         );
                     }
+                }
+                unsafe {
+                    self.target.PopAxisAlignedClip();
                 }
             }
             self.outline(r, crate::theme::border_rgb(dark), 1.0);
@@ -1458,6 +1719,7 @@ impl Renderer {
                     ));
             let active = control == Control::Save
                 || (control == Control::Background && background.open)
+                || (control == Control::Crop && (crop_mode || document.crop().is_some()))
                 || control == active_tool;
             let background = if active && enabled {
                 0x007aff
@@ -1503,7 +1765,11 @@ impl Renderer {
             match control {
                 Control::Save => self.text("Save as...", r, ink, false),
                 Control::Stroke => self.text(
-                    &format!("{} px", stroke_width.round() as u32),
+                    &format!(
+                        "{} {}",
+                        stroke_width.round() as u32,
+                        if text_property { "pt" } else { "px" }
+                    ),
                     r,
                     ink,
                     false,
@@ -1605,6 +1871,7 @@ impl Renderer {
                     .get(selected_color)
                     .copied()
                     .unwrap_or(custom_color),
+                text_property,
             );
         }
         if picker.open {

@@ -14,10 +14,14 @@ param(
     [switch]$BackgroundOnly,
     [switch]$DrawOnly,
     [switch]$HoverOnly,
-    [switch]$PickerOnly
+    [switch]$PickerOnly,
+    [switch]$MosaicOnly,
+    [switch]$TextOnly,
+    [switch]$CropOnly,
+    [switch]$ImageOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -965,13 +969,18 @@ function Click-EditorAction([IntPtr]$Window,[string]$Action) {
         'Copy' {$x=$r.Right-68*$s;$y=$r.Bottom-24*$s}
         'Zoom' {$x=$r.Left+56*$s;$y=$r.Bottom-24*$s}
         'Background' {$x=$r.Left+88*$s;$y=$r.Top+24*$s}
+        'Crop' {$x=$r.Left+28*$s;$y=$r.Top+24*$s}
+        'AddImage' {$x=$r.Left+66*$s;$y=$r.Top+24*$s}
         'Move' {$x=$r.Left+($origin+14)*$s;$y=$r.Top+24*$s}
         'Rectangle' {$x=$r.Left+($origin+43)*$s;$y=$r.Top+24*$s}
         'Fill' {$x=$r.Left+($origin+72)*$s;$y=$r.Top+24*$s}
         'Ellipse' {$x=$r.Left+($origin+101)*$s;$y=$r.Top+24*$s}
         'Line' {$x=$r.Left+($origin+130)*$s;$y=$r.Top+24*$s}
         'Arrow' {$x=$r.Left+($origin+159)*$s;$y=$r.Top+24*$s}
+        'Text' {$x=$r.Left+($origin+188)*$s;$y=$r.Top+24*$s}
         'Pixelate' {$x=$r.Left+($origin+217)*$s;$y=$r.Top+24*$s}
+        'Spotlight' {$x=$r.Left+($origin+246)*$s;$y=$r.Top+24*$s}
+        'Counter' {$x=$r.Left+($origin+275)*$s;$y=$r.Top+24*$s}
         'Pencil' {$x=$r.Left+($origin+304)*$s;$y=$r.Top+24*$s}
         'Highlighter' {$x=$r.Left+($origin+333)*$s;$y=$r.Top+24*$s}
         'Stroke' {$x=$r.Left+($origin+423)*$s;$y=$r.Top+24*$s}
@@ -1202,6 +1211,148 @@ function Test-Background {
     if((Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Background Tool changed the original PNG.'}
     Write-Host 'PASS: native Background panel, gradients/wallpapers/blur, live controls on small windows, auto-balance, Save/Copy output, None reset and original PNG intact'
 }
+function Test-Image {
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $preview=New-TestPreview
+    $sourceHash=(Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $preview.Window 'Annotate'
+    $editor=Wait-Editor
+    $fixture=Join-Path $artifacts 'annotation-import.png'
+    $overlay=[Drawing.Bitmap]::new(24,24,[Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    try{
+        for($y=0;$y -lt 24;$y++){for($x=0;$x -lt 24;$x++){$overlay.SetPixel($x,$y,[Drawing.Color]::FromArgb(128,255,0,255))}}
+        $overlay.Save($fixture,[Drawing.Imaging.ImageFormat]::Png)
+    }finally{$overlay.Dispose()}
+    Click-EditorAction $editor 'AddImage'
+    $dialog=[IntPtr]::Zero
+    for($i=0;$i -lt 100;$i++){
+        $candidate=[CaptureInput]::GetForegroundWindow()
+        if($candidate -ne $editor -and $candidate -ne [IntPtr]::Zero){$dialog=$candidate;break}
+        Start-Sleep -Milliseconds 50
+    }
+    if($dialog -eq [IntPtr]::Zero){throw 'Native Add Image dialog did not activate.'}
+    [void][CaptureInput]::SetForegroundWindow($dialog)
+    [CaptureInput]::keybd_event(18,0,0,[UIntPtr]::Zero);Press-Key 0x4E;[CaptureInput]::keybd_event(18,0,2,[UIntPtr]::Zero)
+    [CaptureInput]::keybd_event(17,0,0,[UIntPtr]::Zero);Press-Key 0x41;[CaptureInput]::keybd_event(17,0,2,[UIntPtr]::Zero)
+    [CaptureInput]::TypeText($fixture);Press-Key 13
+    for($i=0;$i -lt 100 -and [CaptureInput]::IsWindowVisible($dialog);$i++){Start-Sleep -Milliseconds 50}
+    if([CaptureInput]::IsWindowVisible($dialog)){throw 'Add Image dialog did not close.'}
+    Start-Sleep -Milliseconds 700
+    Save-GalleryScreenshot 'editor-added-image.png'
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$out=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($out)
+    try{
+        $p=$image.GetPixel(171,100)
+        if($p.R -lt 240 -or $p.B -lt 115 -or $p.B -gt 140){throw "Imported transparent image was not composited in export: $p"}
+    }finally{$image.Dispose()}
+    if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Import modified source PNG.'}
+    Write-Host 'PASS: native Add Image dialog, transparent imported PNG in full-resolution output, source unchanged'
+}
+function Test-Crop {
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $preview=New-TestPreview
+    $sourceHash=(Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $preview.Window 'Annotate'
+    $editor=Wait-Editor
+    $bounds=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $sx=[int]($bounds.Left+($bounds.Right-$bounds.Left-350*$s)/2)
+    $sy=[int]($bounds.Top+48*$s+($bounds.Bottom-$bounds.Top-96*$s-200*$s)/2)
+    Click-EditorAction $editor 'Crop'
+    $x1=[int]($sx+30*$s);$y1=[int]($sy+20*$s);$x2=[int]($sx+280*$s);$y2=[int]($sy+170*$s)
+    [CaptureInput]::HoldAt($x1,$y1);[CaptureInput]::MouseAt($x2,$y2,0);[CaptureInput]::DropAt($x2,$y2)
+    Save-GalleryScreenshot 'editor-cropped.png'
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$cropped=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($cropped)
+    try{
+        if($image.Width -ne 250 -or $image.Height -ne 150){throw "Crop export size mismatch: $($image.Width)x$($image.Height)"}
+        if($image.GetPixel(20,50).ToArgb() -ne [Drawing.Color]::Red.ToArgb()){throw 'Crop content offset is wrong.'}
+    }finally{$image.Dispose()}
+    [CaptureInput]::Chord(0x5a,[ushort[]]@(0x11))
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));Assert-ClipboardImage $preview.Shot
+    [CaptureInput]::Chord(0x59,[ushort[]]@(0x11))
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$redone=Wait-NewShot $before
+    $again=[Drawing.Bitmap]::new($redone);try{if($again.Width -ne 250 -or $again.Height -ne 150){throw 'Redo did not reapply crop.'}}finally{$again.Dispose()}
+    if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Crop modified source PNG.'}
+    Write-Host 'PASS: native crop preview/export dimension, undo/redo, unchanged original PNG'
+}
+function Test-Text {
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $preview=New-TestPreview
+    $sourceHash=(Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $preview.Window 'Annotate'
+    $editor=Wait-Editor
+    $bounds=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $sx=[int]($bounds.Left+($bounds.Right-$bounds.Left-350*$s)/2)
+    $sy=[int]($bounds.Top+48*$s+($bounds.Bottom-$bounds.Top-96*$s-200*$s)/2)
+    Click-EditorAction $editor 'Text'
+    [CaptureInput]::ClickAt([int]($sx+45*$s),[int]($sy+125*$s))
+    [CaptureInput]::TypeText('Halo ')
+    [CaptureInput]::TypeText('世界')
+    Start-Sleep -Milliseconds 250
+    Save-GalleryScreenshot 'editor-native-text-input.png'
+    [CaptureInput]::Chord(0x0d,[ushort[]]@(0x11)) # Ctrl+Enter commits native EDIT
+    Start-Sleep -Milliseconds 150
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$out=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($out)
+    try{
+        $changed=$false
+        for($y=125;$y -lt 155;$y++){for($x=45;$x -lt 180;$x++){
+            $p=$image.GetPixel($x,$y);if($p.R -gt 160 -and $p.B -lt 170){$changed=$true;break}
+        };if($changed){break}}
+        if(-not $changed){throw 'Text did not appear in full-resolution PNG.'}
+    }finally{$image.Dispose()}
+    if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Text mutated original capture PNG.'}
+    Write-Host 'PASS: native Unicode text input, DirectWrite raster export, source PNG unchanged'
+}
+function Test-Mosaic {
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $preview=New-TestPreview
+    $sourceHash=(Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $preview.Window 'Annotate'
+    $editor=Wait-Editor
+    $bounds=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $sx=[int]($bounds.Left+($bounds.Right-$bounds.Left-350*$s)/2)
+    $sy=[int]($bounds.Top+48*$s+($bounds.Bottom-$bounds.Top-96*$s-200*$s)/2)
+    Click-EditorAction $editor 'Pixelate'
+    $x1=[int]($sx+45*$s);$y1=[int]($sy+65*$s)
+    $x2=[int]($sx+290*$s);$y2=[int]($sy+140*$s)
+    [CaptureInput]::HoldAt($x1,$y1)
+    for($i=1;$i -le 8;$i++){[CaptureInput]::MouseAt([int]($x1+($x2-$x1)*$i/8),[int]($y1+($y2-$y1)*$i/8),0)}
+    [CaptureInput]::DropAt($x2,$y2)
+    Save-GalleryScreenshot 'editor-mosaic-source-based.png'
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$rendered=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($rendered)
+    try {
+        $red=$image.GetPixel(80,90);$green=$image.GetPixel(230,90)
+        if($red.R -le $red.G*2 -or $green.G -le $green.R*2){throw "Mosaic is not derived from red/green screenshot regions: $red / $green"}
+        if($image.GetPixel(20,20).ToArgb() -ne [Drawing.Color]::Blue.ToArgb()){throw 'Mosaic modified pixels outside selection.'}
+    }finally{$image.Dispose()}
+    Click-EditorAction $editor 'Spotlight'
+    $x1=[int]($sx+45*$s);$y1=[int]($sy+65*$s)
+    $x2=[int]($sx+290*$s);$y2=[int]($sy+140*$s)
+    [CaptureInput]::HoldAt($x1,$y1);[CaptureInput]::MouseAt($x2,$y2,0);[CaptureInput]::DropAt($x2,$y2)
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$spotlight=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($spotlight)
+    try {
+        $inside=$image.GetPixel(80,90);$outside=$image.GetPixel(20,20)
+        if($inside.R -le $inside.G*2 -or $outside.B -ge 130){throw "Spotlight export didn't dim outside while retaining focus: $inside / $outside"}
+    }finally{$image.Dispose()}
+    Click-EditorAction $editor 'Counter'
+    [CaptureInput]::ClickAt([int]($sx+305*$s),[int]($sy+90*$s))
+    [CaptureInput]::ClickAt([int]($sx+305*$s),[int]($sy+135*$s))
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$counted=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($counted)
+    try {
+        $first=$image.GetPixel(315,90);$second=$image.GetPixel(315,135)
+        if($first.R -lt 190 -or $second.R -lt 190 -or $first.B -lt 60){throw "Counters did not export as colored badges: $first / $second"}
+    }finally{$image.Dispose()}
+    if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Annotation modified source PNG.'}
+    Write-Host 'PASS: image-derived mosaic, Spotlight and sequential Counter export; original PNG unchanged'
+}
 function Test-Picker {
     Close-AllPreviews;Set-AutoClose 'Never' 'never'
     $preview=New-TestPreview
@@ -1345,23 +1496,18 @@ function Test-Drawing {
     if($bendPixel.R -lt 240 -or $bendPixel.G -lt 200 -or $bendPixel.B -gt 20){throw "Dragging the arrow control handle did not bend the exported arrow: $bendPixel"}
     $straightPixel=& $sample $bent 220 105
     if($straightPixel.R -gt 240 -and $straightPixel.G -gt 200 -and $straightPixel.B -lt 20){throw 'Bent arrow left a baked straight-line ghost.'}
-    Click-EditorAction $editor 'Highlighter'
+    Click-EditorAction $editor 'Highlighter' # deliberately disabled until text-aware highlighting exists
     $a=& $point 5 15;$b=& $point 90 40
     [CaptureInput]::HoldAt($a.X,$a.Y);[CaptureInput]::MouseAt($b.X,$b.Y,0);[CaptureInput]::DropAt($b.X,$b.Y)
-    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$highlighted=Wait-NewShot $before
-    $highlightPixel=& $sample $highlighted 10 20
-    if($highlightPixel.ToArgb() -ne [Drawing.Color]::FromArgb(89,78,166).ToArgb()){
-        Save-GalleryScreenshot 'editor-highlight-failure.png'
-        throw "Manual highlighter was not translucent in the exported PNG: $highlightPixel"
-    }
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));Assert-ClipboardImage $bent
     Click-EditorAction $editor 'Pixelate'
     $a=& $point 300 20;$b=& $point 340 65
     [CaptureInput]::HoldAt($a.X,$a.Y);[CaptureInput]::MouseAt($b.X,$b.Y,0);[CaptureInput]::DropAt($b.X,$b.Y)
     $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$redacted=Wait-NewShot $before
-    Save-GalleryScreenshot 'editor-mosaic-and-highlight.png'
+    Save-GalleryScreenshot 'editor-mosaic-source-based.png'
     $mosaicPixel=& $sample $redacted 320 30
-    if($mosaicPixel.R -lt 55 -or $mosaicPixel.R -gt 145 -or $mosaicPixel.G -lt 55 -or $mosaicPixel.B -lt 55 -or $mosaicPixel.A -ne 255){
-        throw "Opaque mosaic failed to replace source pixels in export: $mosaicPixel"
+    if($mosaicPixel.B -lt 200 -or $mosaicPixel.R -gt 80 -or $mosaicPixel.A -ne 255){
+        throw "Image-derived mosaic failed to preserve screenshot colors: $mosaicPixel"
     }
     Click-EditorAction $editor 'Move'
     $selectArrow=& $point 220 125
@@ -1392,7 +1538,7 @@ function Test-Drawing {
     $newColor=& $sample $recolored ($pad+220) ($pad+125)
     if($newColor.R -ne 255 -or $newColor.G -ne 255 -or $newColor.B -ne 0){throw "Custom picker did not recolor selected arrow: $newColor"}
     if((Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Annotate modified the original capture PNG.'}
-    Write-Host 'PASS: native Rectangle/Pencil/curved Arrow/manual Highlighter/opaque Mosaic, Move and control handle, undo/redo, clipboard/Save/Background, native dark custom color picker, source intact'
+    Write-Host 'PASS: native Rectangle/Pencil/curved Arrow/image-derived Mosaic, disabled smart Highlighter, Move and control handle, undo/redo, clipboard/Save/Background, native dark custom color picker, source intact'
 }
 function Test-Editor {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run EditorOnly with pwsh -Sta.'}
@@ -2042,6 +2188,10 @@ try {
     elseif ($DrawOnly) { Test-Drawing }
     elseif ($HoverOnly) { Test-Hover }
     elseif ($PickerOnly) { Test-Picker }
+    elseif ($MosaicOnly) { Test-Mosaic }
+    elseif ($TextOnly) { Test-Text }
+    elseif ($CropOnly) { Test-Crop }
+    elseif ($ImageOnly) { Test-Image }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }

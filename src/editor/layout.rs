@@ -65,15 +65,19 @@ impl Control {
     pub fn enabled(self) -> bool {
         matches!(
             self,
-            Self::Move
+            Self::Crop
+                | Self::AddImage
+                | Self::Move
                 | Self::Rectangle
                 | Self::Fill
                 | Self::Ellipse
                 | Self::Line
                 | Self::Arrow
                 | Self::Pencil
-                | Self::Highlighter
                 | Self::Pixelate
+                | Self::Spotlight
+                | Self::Counter
+                | Self::Text
                 | Self::Stroke
                 | Self::Background
                 | Self::Color
@@ -88,8 +92,10 @@ impl Control {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Crop => "Crop",
-            Self::AddImage => "Add image",
+            Self::Crop => {
+                "Crop - drag to crop without changing source; click again to undo the last crop"
+            }
+            Self::AddImage => "Add PNG/JPEG/BMP image as an editable overlay",
             Self::Background => "Background",
             Self::Move => "Move / pan (hold middle mouse button)",
             Self::Rectangle => "Rectangle",
@@ -97,17 +103,17 @@ impl Control {
             Self::Ellipse => "Ellipse",
             Self::Line => "Line",
             Self::Arrow => "Arrow",
-            Self::Text => "Text",
+            Self::Text => "Text - Unicode/IME editing; F2 edits a selected text object",
             Self::Pixelate => {
-                "Opaque content-independent mosaic redaction (not blur; original capture remains)"
+                "Image-based mosaic (visual only, not secure for sensitive information)"
             }
-            Self::Spotlight => "Spotlight",
-            Self::Counter => "Counter",
+            Self::Spotlight => "Spotlight - drag to keep an area bright and dim its surroundings",
+            Self::Counter => "Counter - place sequential numbered markers",
             Self::Pencil => "Pencil (smoothed freehand stroke)",
             Self::Highlighter => {
-                "Manual translucent highlight (drag a rectangle; no text snapping)"
+                "Text-aware highlight unavailable - disabled instead of pretending to detect text"
             }
-            Self::Color => "Annotation colors and Windows custom color picker",
+            Self::Color => "Annotation colors and native custom color picker",
             Self::Stroke => "Annotation stroke width",
             Self::Style => "Tool style",
             Self::Save => "Save as... (Ctrl+S)",
@@ -352,9 +358,10 @@ impl Layout {
             h: 112.0,
         })
     }
-    pub fn stroke_at(&self, x: f32) -> Option<f32> {
+    pub fn stroke_at(&self, x: f32, text: bool) -> Option<f32> {
         let r = self.stroke_rect()?;
-        Some(1.0 + ((x - r.x - 18.0) / 180.0).clamp(0.0, 1.0) * 23.0)
+        let (min, range) = if text { (8.0, 64.0) } else { (1.0, 23.0) };
+        Some(min + ((x - r.x - 18.0) / 180.0).clamp(0.0, 1.0) * range)
     }
     pub fn palette_rect(&self) -> Option<Rect> {
         let color = self.rect(Control::Color)?;

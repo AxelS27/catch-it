@@ -6,6 +6,7 @@ mod document;
 mod interaction;
 mod layout;
 mod render;
+mod text_raster;
 
 use crate::{
     drag_drop::{Outcome, PreparedDrag},
@@ -22,7 +23,10 @@ use std::{
     cell::Cell,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 use windows::{
@@ -43,11 +47,19 @@ pub const DRAG: isize = 4;
 pub const ERROR: isize = 5;
 pub const ZOOM_MENU: isize = 6;
 pub const BACKGROUND_TOGGLE: isize = 7;
+pub const ADD_IMAGE: isize = 8;
 const CLASS: PCWSTR = w!("SimpleScreenshot.Editor");
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const ZOOM_VALUES: [f32; 8] = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0];
 const HOVER_TIMER: usize = 51;
 
+struct TextEdit {
+    hwnd: HWND,
+    font: HFONT,
+    brush: HBRUSH,
+    point: Point,
+    index: Option<usize>,
+}
 struct MarkGesture {
     index: usize,
     original: Mark,
@@ -140,6 +152,12 @@ struct WindowState {
     pill_center: f32,
     pill_motion: Option<PillMotion>,
     stroke_width: f32,
+    drawing_stroke_width: f32,
+    text_size: f32,
+    next_counter: u32,
+    crop_mode: bool,
+    crop_drag: Option<Mark>,
+    text_editing: Option<TextEdit>,
     document: Document,
     pending_mark: Option<Mark>,
     moving_mark: Option<MarkGesture>,
@@ -235,6 +253,56 @@ impl WindowState {
         }
         moving
     }
+    fn finish_text(&mut self, commit: bool) {
+        let Some(edit) = self.text_editing.take() else {
+            return;
+        };
+        let value = if commit {
+            unsafe {
+                let len = GetWindowTextLengthW(edit.hwnd).max(0) as usize;
+                let mut buffer = vec![0u16; len + 1];
+                let count = GetWindowTextW(edit.hwnd, &mut buffer).max(0) as usize;
+                String::from_utf16_lossy(&buffer[..count]).replace("\r\n", "\n")
+            }
+        } else {
+            String::new()
+        };
+        unsafe {
+            let _ = windows::Win32::UI::Shell::RemoveWindowSubclass(
+                edit.hwnd,
+                Some(interaction::text_subclass),
+                1,
+            );
+            let _ = DestroyWindow(edit.hwnd);
+            let _ = DeleteObject(HGDIOBJ(edit.font.0));
+            let _ = DeleteObject(HGDIOBJ(edit.brush.0));
+        }
+        if !commit {
+            return;
+        }
+        if let Some(index) = edit.index {
+            if value.trim().is_empty() {
+                self.document.selected = Some(index);
+                self.document.delete_selected();
+            } else {
+                let original = self.document.marks[index].clone();
+                self.document.marks[index].shape = document::Shape::Text(edit.point, value);
+                self.document.edit(index, original);
+            }
+        } else if !value.trim().is_empty() {
+            let mut mark = Mark::from_tool(
+                Control::Text,
+                edit.point,
+                self.drawing_color(),
+                self.text_size,
+            )
+            .expect("Text is an annotation tool");
+            mark.shape = document::Shape::Text(edit.point, value);
+            if let Err(error) = self.document.add(mark) {
+                self.error = Some(format!("{error:#}"));
+            }
+        }
+    }
     fn live_color(&mut self, rgb: u32) {
         self.custom_color = rgb;
         self.selected_color = layout::PRESET_COLORS.len();
@@ -250,8 +318,23 @@ impl WindowState {
             self.document.edit(index, original);
         }
     }
+    fn is_text_property(&self) -> bool {
+        self.active_tool == Control::Text
+            || self.document.selected.is_some_and(|index| {
+                matches!(self.document.marks[index].shape, document::Shape::Text(..))
+            })
+    }
     fn live_stroke(&mut self, width: f32) {
-        self.stroke_width = width.clamp(1.0, 24.0);
+        self.stroke_width = if self.is_text_property() {
+            width.clamp(8.0, 72.0)
+        } else {
+            width.clamp(1.0, 24.0)
+        };
+        if self.is_text_property() {
+            self.text_size = self.stroke_width;
+        } else {
+            self.drawing_stroke_width = self.stroke_width;
+        }
         if let Some(index) = self.document.selected {
             if self.stroke_original.is_none() {
                 self.stroke_original = Some((index, self.document.marks[index].clone()));
@@ -283,6 +366,26 @@ impl WindowState {
     fn ready(&self) -> bool {
         self.image.is_some()
     }
+    fn view_size(&self) -> Option<(u32, u32)> {
+        let source = self.image.as_ref()?;
+        let image = self.composed.as_ref().unwrap_or(source);
+        let (ox, oy) =
+            background::source_origin(source.width, source.height, &self.background).ok()?;
+        Some(
+            self.document
+                .crop_pixels(
+                    image.width,
+                    image.height,
+                    Point {
+                        x: ox as f32,
+                        y: oy as f32,
+                    },
+                )
+                .map_or((image.width, image.height), |(x0, y0, x1, y1)| {
+                    (x1 - x0, y1 - y0)
+                }),
+        )
+    }
     fn point(&self, lparam: LPARAM) -> (f32, f32) {
         (
             (lparam.0 as u16 as i16) as f32 * 96.0 / self.dpi as f32,
@@ -297,6 +400,7 @@ impl WindowState {
         self.pressed = None;
         self.drag_start = None;
         self.pending_mark = None;
+        self.crop_drag = None;
         if let Some(gesture) = self.moving_mark.take() {
             self.document.marks[gesture.index] = gesture.original;
         }
@@ -346,6 +450,12 @@ impl Editor {
             pill_center: 0.0,
             pill_motion: None,
             stroke_width: 3.0,
+            drawing_stroke_width: 3.0,
+            text_size: 20.0,
+            next_counter: 1,
+            crop_mode: false,
+            crop_drag: None,
+            text_editing: None,
             document: Document::default(),
             pending_mark: None,
             moving_mark: None,
@@ -447,6 +557,7 @@ impl Editor {
             .or(self.state.image.as_ref())
     }
     pub fn output(&mut self) -> Result<(&Path, &Raster)> {
+        self.state.finish_text(true);
         let revision = (self.state.background_revision, self.state.document.revision);
         if self.output_revision != revision {
             self.output_path = None;
@@ -536,6 +647,96 @@ impl Editor {
         apply_theme(self.hwnd, self.state.dark);
     }
 
+    pub fn add_image(&mut self) -> Result<()> {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+        use windows::Win32::{
+            System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree},
+            UI::Shell::{
+                Common::COMDLG_FILTERSPEC, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR,
+                FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH,
+            },
+        };
+        use windows::core::HRESULT;
+        let path = unsafe {
+            let dialog: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            dialog.SetTitle(w!("Add image to annotation"))?;
+            dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: w!("PNG or JPEG image"),
+                pszSpec: w!("*.png;*.jpg;*.jpeg;*.bmp"),
+            }])?;
+            dialog.SetOptions(FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_NOCHANGEDIR)?;
+            match dialog.Show(Some(self.hwnd)) {
+                Ok(()) => {}
+                Err(error) if error.code() == HRESULT::from_win32(ERROR_CANCELLED.0) => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error).context("Cannot open Add image dialog"),
+            }
+            let name = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+            let path = PathBuf::from(OsString::from_wide(name.as_wide()));
+            CoTaskMemFree(Some(name.0.cast()));
+            path
+        };
+        let overlay = Arc::new(storage::load_image(&path)?);
+        anyhow::ensure!(
+            self.state
+                .document
+                .asset_bytes()
+                .saturating_add(overlay.pixels.len())
+                <= 128 * 1024 * 1024,
+            "Imported image budget exceeded (128 MiB per editor, including undo history)"
+        );
+        let source = self
+            .state
+            .image
+            .as_ref()
+            .context("Screenshot is still opening")?;
+        let (lo, hi) = self.state.document.crop().unwrap_or((
+            Point::default(),
+            Point {
+                x: source.width as f32,
+                y: source.height as f32,
+            },
+        ));
+        let max_w = (hi.x - lo.x) * 0.65;
+        let max_h = (hi.y - lo.y) * 0.65;
+        let factor = (max_w / overlay.width as f32)
+            .min(max_h / overlay.height as f32)
+            .clamp(0.01, 1.0);
+        let (w, h) = (
+            overlay.width as f32 * factor,
+            overlay.height as f32 * factor,
+        );
+        let at = Point {
+            x: lo.x + (hi.x - lo.x - w) / 2.0,
+            y: lo.y + (hi.y - lo.y - h) / 2.0,
+        };
+        self.state.document.add(Mark {
+            shape: document::Shape::Image(
+                at,
+                Point {
+                    x: at.x + w,
+                    y: at.y + h,
+                },
+                overlay,
+            ),
+            color: 0xffffff,
+            width: 1.0,
+            opacity: 1.0,
+        })?;
+        self.state.active_tool = Control::Move;
+        self.state.pill_motion = None;
+        self.state.pill_center = self
+            .state
+            .layout
+            .rect(Control::Move)
+            .map_or(0.0, |r| r.x + r.w / 2.0);
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+        Ok(())
+    }
     pub fn toggle_background(&mut self) -> Result<()> {
         self.state.background.open = !self.state.background.open;
         self.state.committed_background.open = self.state.background.open;
@@ -894,10 +1095,8 @@ fn resize_state(hwnd: HWND, state: &mut WindowState, width: u32, height: u32) ->
         state.layout.canvas.x += shift;
         state.layout.canvas.w -= shift;
     }
-    if let Some(image) = state.composed.as_ref().or(state.image.as_ref()) {
-        state
-            .view
-            .clamp_pan(state.layout.canvas, image.width, image.height);
+    if let Some((w, h)) = state.view_size() {
+        state.view.clamp_pan(state.layout.canvas, w, h);
     }
     if let Some(renderer) = &state.renderer {
         renderer.resize(width, height, state.dpi)?;
@@ -940,15 +1139,15 @@ fn refresh_background(hwnd: HWND, state: &mut WindowState) -> Result<()> {
         } else {
             None
         };
-        if let Some(image) = composed.as_ref().or(state.image.as_ref()) {
-            if let Some(renderer) = &mut state.renderer {
-                renderer.set_image(image)?;
-            }
-            state
-                .view
-                .clamp_pan(state.layout.canvas, image.width, image.height);
+        if let Some(image) = composed.as_ref().or(state.image.as_ref())
+            && let Some(renderer) = &mut state.renderer
+        {
+            renderer.set_image(image)?;
         }
         state.composed = composed;
+        if let Some((w, h)) = state.view_size() {
+            state.view.clamp_pan(state.layout.canvas, w, h);
+        }
         state.exported = None;
         state.view.fit_limit = if state.background.selected() {
             1.6
