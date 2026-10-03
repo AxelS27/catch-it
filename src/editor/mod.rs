@@ -107,6 +107,18 @@ fn hover_step(levels: &mut Vec<(Control, f32)>, target: Option<Control>, dt: f32
     levels.retain(|(_, level)| *level > 0.0);
     moving
 }
+struct PillMotion {
+    from: f32,
+    to: f32,
+    start: Instant,
+}
+impl PillMotion {
+    fn position(&self, now: Instant) -> (f32, bool) {
+        let t = (now.duration_since(self.start).as_secs_f32() / 0.17).clamp(0.0, 1.0);
+        let eased = t * t * (3.0 - 2.0 * t);
+        (self.from + (self.to - self.from) * eased, t < 1.0)
+    }
+}
 struct WindowState {
     controller: HWND,
     id: usize,
@@ -125,6 +137,8 @@ struct WindowState {
     selected_color: usize,
     custom_color: u32,
     active_tool: Control,
+    pill_center: f32,
+    pill_motion: Option<PillMotion>,
     stroke_width: f32,
     document: Document,
     pending_mark: Option<Mark>,
@@ -172,6 +186,40 @@ impl WindowState {
             .min(0.08);
         self.hover_last_tick = now;
         hover_step(&mut self.hover_levels, self.hover, dt)
+    }
+    fn select_tool(&mut self, hwnd: HWND, control: Control) {
+        if self.active_tool == control {
+            return;
+        }
+        let now = Instant::now();
+        let from = self
+            .pill_motion
+            .as_ref()
+            .map_or(self.pill_center, |motion| motion.position(now).0);
+        self.active_tool = control;
+        if let Some(r) = self.layout.rect(control) {
+            let to = r.x + r.w / 2.0;
+            self.pill_center = from;
+            self.pill_motion = Some(PillMotion {
+                from,
+                to,
+                start: now,
+            });
+            unsafe {
+                let _ = SetTimer(Some(hwnd), HOVER_TIMER, 16, None);
+            }
+        }
+    }
+    fn advance_pill(&mut self) -> bool {
+        let Some(motion) = &self.pill_motion else {
+            return false;
+        };
+        let (center, moving) = motion.position(Instant::now());
+        self.pill_center = center;
+        if !moving {
+            self.pill_motion = None;
+        }
+        moving
     }
     fn drawing_color(&self) -> u32 {
         layout::PRESET_COLORS
@@ -247,6 +295,8 @@ impl Editor {
             selected_color: 4,
             custom_color: 0x006dfd,
             active_tool: Control::Move,
+            pill_center: 0.0,
+            pill_motion: None,
             stroke_width: 3.0,
             document: Document::default(),
             pending_mark: None,
@@ -816,6 +866,11 @@ fn resize_state(hwnd: HWND, state: &mut WindowState, width: u32, height: u32) ->
         width as f32 * 96.0 / state.dpi as f32,
         height as f32 * 96.0 / state.dpi as f32,
     );
+    state.pill_motion = None;
+    state.pill_center = state
+        .layout
+        .rect(state.active_tool)
+        .map_or(0.0, |r| r.x + r.w / 2.0);
     if state.background.open {
         state.background.scroll_y = state
             .background
@@ -954,6 +1009,21 @@ mod tests {
         }
         assert!(levels.is_empty());
         assert!(!hover_step(&mut levels, None, 0.016));
+        let now = Instant::now();
+        let motion = PillMotion {
+            from: 100.0,
+            to: 129.0,
+            start: now,
+        };
+        assert_eq!(motion.position(now), (100.0, true));
+        let halfway = motion
+            .position(now + std::time::Duration::from_millis(85))
+            .0;
+        assert!(halfway > 100.0 && halfway < 129.0);
+        assert_eq!(
+            motion.position(now + std::time::Duration::from_millis(200)),
+            (129.0, false)
+        );
     }
     #[test]
     fn drag_preview_preserves_aspect_alpha_and_original() {

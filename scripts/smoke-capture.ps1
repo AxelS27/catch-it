@@ -1217,9 +1217,14 @@ function Test-Hover {
     Start-Sleep -Milliseconds 240
     Save-GalleryScreenshot 'editor-hover-adjacent.png'
     $bitmap=[Drawing.Bitmap]::new((Join-Path $artifacts 'editor-hover-adjacent.png'))
-    try{$edge=$bitmap.GetPixel([int]($rectX+16*$s),$y)}finally{$bitmap.Dispose()}
+    try{
+        $edge=$bitmap.GetPixel([int]($rectX+16*$s),$y)
+        $left=$bitmap.GetPixel([int]($fillX-11*$s),$y)
+        $right=$bitmap.GetPixel([int]($fillX+11*$s),$y)
+    }finally{$bitmap.Dispose()}
     if($edge.R -gt 30 -or $edge.G -lt 90 -or $edge.B -lt 180){throw "Hover obscures blue active tool: $edge"}
-    Write-Host 'PASS: hovering an adjacent tool retains the complete blue active pill'
+    if($left.ToArgb() -ne $right.ToArgb()){throw "Hover pill is off-center: left=$left right=$right"}
+    Write-Host 'PASS: adjacent hover stays centered on its icon and does not obscure the blue active pill'
 }
 function Test-Drawing {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run DrawOnly with pwsh -Sta.'}

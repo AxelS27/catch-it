@@ -45,6 +45,23 @@ pub enum Control {
     Upload,
 }
 impl Control {
+    pub fn is_drawing_tool(self) -> bool {
+        matches!(
+            self,
+            Self::Move
+                | Self::Rectangle
+                | Self::Fill
+                | Self::Ellipse
+                | Self::Line
+                | Self::Arrow
+                | Self::Text
+                | Self::Pixelate
+                | Self::Spotlight
+                | Self::Counter
+                | Self::Pencil
+                | Self::Highlighter
+        )
+    }
     pub fn enabled(self) -> bool {
         matches!(
             self,

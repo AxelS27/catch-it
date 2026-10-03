@@ -23,6 +23,7 @@ pub struct ChromeState<'a> {
     pub document: &'a Document,
     pub pending: Option<&'a Mark>,
     pub active_tool: Control,
+    pub pill_center: f32,
     pub stroke_width: f32,
     pub dark: bool,
     pub hovered: Option<Control>,
@@ -987,6 +988,7 @@ impl Renderer {
             document,
             pending,
             active_tool,
+            pill_center,
             stroke_width,
             dark,
             hovered,
@@ -1143,6 +1145,48 @@ impl Renderer {
             self.target.PopAxisAlignedClip();
         }
         self.panel(layout, background, dark);
+        // Hover surfaces stay centered on their icons. Draw them before the
+        // sliding selection so an adjacent/fading hover never covers blue.
+        for &(control, r) in &layout.controls {
+            if !control.is_drawing_tool()
+                || control == active_tool
+                || !control.enabled()
+                || image.is_none()
+            {
+                continue;
+            }
+            let strength = hover_levels
+                .iter()
+                .find(|(c, _)| *c == control)
+                .map_or(0.0, |(_, a)| *a);
+            if strength > 0.0 {
+                self.pill_opacity(
+                    Rect {
+                        x: r.x + (r.w - 20.0) / 2.0,
+                        y: r.y + 4.0,
+                        w: 20.0,
+                        h: 24.0,
+                    },
+                    if dark { 0x787883 } else { 0xffffff },
+                    10.0,
+                    strength,
+                );
+            }
+        }
+        if let Some(r) = layout.rect(active_tool)
+            && (image.is_some() || active_tool == Control::Move)
+        {
+            self.pill(
+                Rect {
+                    x: pill_center - 18.0,
+                    y: r.y + 3.5,
+                    w: 36.0,
+                    h: 25.0,
+                },
+                0x007aff,
+                12.5,
+            );
+        }
         for &(control, r) in &layout.controls {
             let enabled = control.enabled()
                 && (image.is_some()
@@ -1175,63 +1219,7 @@ impl Renderer {
                     );
                 }
             } else {
-                let drawing_tool = matches!(
-                    control,
-                    Control::Move
-                        | Control::Rectangle
-                        | Control::Fill
-                        | Control::Ellipse
-                        | Control::Line
-                        | Control::Arrow
-                        | Control::Text
-                        | Control::Pixelate
-                        | Control::Spotlight
-                        | Control::Counter
-                        | Control::Pencil
-                        | Control::Highlighter
-                );
-                if drawing_tool && enabled && active {
-                    self.pill(
-                        Rect {
-                            x: r.x - 4.0,
-                            y: r.y + 3.5,
-                            w: r.w + 8.0,
-                            h: 25.0,
-                        },
-                        0x007aff,
-                        12.5,
-                    );
-                } else if drawing_tool && enabled {
-                    let strength = hover_levels
-                        .iter()
-                        .find(|(c, _)| *c == control)
-                        .map_or(0.0, |(_, a)| *a);
-                    if strength > 0.0 {
-                        // A 24-DIP hover pill cannot paint across an adjacent 36-DIP
-                        // active pill, even while a previous hover fades away.
-                        let neighbor = layout
-                            .rect(active_tool)
-                            .is_some_and(|a| ((r.x + r.w / 2.0) - (a.x + a.w / 2.0)).abs() < 30.5);
-                        let shift = if neighbor {
-                            layout
-                                .rect(active_tool)
-                                .map_or(0.0, |a| if r.x > a.x { 2.0 } else { -2.0 })
-                        } else {
-                            0.0
-                        };
-                        self.pill_opacity(
-                            Rect {
-                                x: r.x + (r.w - 24.0) / 2.0 + shift,
-                                y: r.y + 4.0,
-                                w: 24.0,
-                                h: 24.0,
-                            },
-                            if dark { 0x787883 } else { 0xffffff },
-                            12.0,
-                            strength,
-                        );
-                    }
-                } else if !drawing_tool {
+                if !control.is_drawing_tool() {
                     self.pill(r, background, 14.0);
                 }
             }
@@ -1239,6 +1227,12 @@ impl Renderer {
                 0xffffff
             } else if !enabled {
                 if dark { muted } else { 0x55505b }
+            } else if control.is_drawing_tool() {
+                if ((r.x + r.w / 2.0) - pill_center).abs() < 12.0 {
+                    0xffffff
+                } else {
+                    fg
+                }
             } else if active {
                 0xffffff
             } else {

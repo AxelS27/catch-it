@@ -162,6 +162,7 @@ pub(super) unsafe extern "system" fn window_proc(
                                     document: &s.document,
                                     pending: s.pending_mark.as_ref(),
                                     active_tool: s.active_tool,
+                                    pill_center: s.pill_center,
                                     stroke_width: s.stroke_width,
                                     dark: s.dark,
                                     hovered: s.hover,
@@ -499,7 +500,9 @@ pub(super) unsafe extern "system" fn window_proc(
             }
             WM_TIMER if wparam.0 == HOVER_TIMER => {
                 let s = &mut *ptr;
-                if !s.advance_hover() {
+                let hovering = s.advance_hover();
+                let sliding = s.advance_pill();
+                if !hovering && !sliding {
                     let _ = KillTimer(Some(hwnd), HOVER_TIMER);
                 }
                 let _ = InvalidateRect(Some(hwnd), None, false);
@@ -771,7 +774,7 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
         | Control::Pencil
         | Control::Highlighter
         | Control::Pixelate => {
-            state.active_tool = control;
+            state.select_tool(hwnd, control);
             if control != Control::Move {
                 state.document.selected = None;
             }
