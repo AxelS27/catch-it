@@ -373,7 +373,6 @@ impl App {
             }
             editor::DRAG => editor.run_drag().map(|_| ()),
             editor::ZOOM_MENU => editor.zoom_menu(),
-            editor::COLOR_PICKER => editor.choose_color(),
             _ => Ok(()),
         };
         self.editors.insert(index, editor);

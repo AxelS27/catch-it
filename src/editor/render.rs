@@ -1,10 +1,12 @@
 use super::{
     background::{self, Background, Slider, Style},
+    color_picker::{self, Picker},
     document::{self, Document, Mark, Point, Shape},
     layout::{Control, Layout, PRESET_COLORS, Rect, View},
 };
 use crate::storage::Raster;
 use anyhow::{Context, Result};
+use std::cell::RefCell;
 use windows::{
     Win32::{
         Foundation::HWND,
@@ -30,6 +32,8 @@ pub struct ChromeState<'a> {
     pub hover_levels: &'a [(Control, f32)],
     pub focused: Option<Control>,
     pub palette_open: bool,
+    pub picker: &'a Picker,
+    pub stroke_open: bool,
     pub selected_color: usize,
     pub custom_color: u32,
     pub maximized: bool,
@@ -43,6 +47,7 @@ pub struct Renderer {
     large: IDWriteTextFormat,
     bitmap: Option<ID2D1Bitmap>,
     swatches: Vec<ID2D1Bitmap>,
+    picker_bitmap: RefCell<Option<(u16, ID2D1Bitmap)>>,
 }
 fn rect(r: Rect) -> D2D_RECT_F {
     D2D_RECT_F {
@@ -162,6 +167,7 @@ impl Renderer {
                 target,
                 brush,
                 swatches,
+                picker_bitmap: RefCell::new(None),
                 font: make_font(12.0)?,
                 label,
                 large: make_font(16.0)?,
@@ -559,6 +565,260 @@ impl Renderer {
             );
         }
         self.circle(x, y, 10.0, 0x999399, false);
+    }
+    fn picker(&self, layout: &Layout, picker: &Picker, selected_color: usize) -> Result<()> {
+        let Some(r) = color_picker::rect(layout) else {
+            return Ok(());
+        };
+        self.pill(
+            Rect {
+                x: r.x + 4.0,
+                y: r.y + 6.0,
+                ..r
+            },
+            0x0e0e13,
+            21.0,
+        );
+        self.pill(r, 0x25252d, 20.0);
+        self.rounded_outline(r, 0x595965, 20.0);
+        self.pill(
+            Rect {
+                x: r.x + 8.0,
+                y: r.y + 8.0,
+                w: 43.0,
+                h: 344.0,
+            },
+            0x33333d,
+            15.0,
+        );
+        for (i, swatch) in PRESET_COLORS
+            .iter()
+            .map(Some)
+            .chain(std::iter::once(None))
+            .enumerate()
+        {
+            let (x, y) = (r.x + 29.0, r.y + 22.0 + i as f32 * 30.0);
+            if i == selected_color {
+                self.circle(x, y, 13.0, 0x8ab6a2, true);
+                self.circle(x, y, 11.0, 0x33333d, true);
+            }
+            if let Some(&swatch) = swatch {
+                self.circle(x, y, 9.5, swatch, true);
+                if i == 0 || i == 9 {
+                    self.circle(x, y, 9.5, 0x9898a0, false);
+                }
+            } else {
+                for j in 0..16 {
+                    let a = std::f32::consts::TAU * j as f32 / 16.0;
+                    self.circle(
+                        x + a.cos() * 6.0,
+                        y + a.sin() * 6.0,
+                        3.4,
+                        color_picker::hsv_to_rgb(j as f32 / 16.0, 0.9, 1.0),
+                        true,
+                    );
+                }
+                self.circle(x, y, 3.2, 0xffffff, true);
+            }
+        }
+        let key = (picker.hue * 359.0).round() as u16;
+        if self.picker_bitmap.borrow().as_ref().map(|(h, _)| *h) != Some(key) {
+            let mut pixels = vec![0u8; 252 * 162 * 4];
+            for y in 0..162 {
+                for x in 0..252 {
+                    let rgb = color_picker::hsv_to_rgb(
+                        key as f32 / 359.0,
+                        x as f32 / 251.0,
+                        1.0 - y as f32 / 161.0,
+                    );
+                    let i = (y * 252 + x) * 4;
+                    pixels[i..i + 4].copy_from_slice(&[
+                        (rgb & 255) as u8,
+                        ((rgb >> 8) & 255) as u8,
+                        ((rgb >> 16) & 255) as u8,
+                        255,
+                    ]);
+                }
+            }
+            let bitmap = unsafe {
+                self.target.CreateBitmap(
+                    D2D_SIZE_U {
+                        width: 252,
+                        height: 162,
+                    },
+                    Some(pixels.as_ptr().cast()),
+                    252 * 4,
+                    &D2D1_BITMAP_PROPERTIES {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.0,
+                        dpiY: 96.0,
+                    },
+                )?
+            };
+            *self.picker_bitmap.borrow_mut() = Some((key, bitmap));
+        }
+        if let Some((_, bitmap)) = self.picker_bitmap.borrow().as_ref() {
+            unsafe {
+                self.target.DrawBitmap(
+                    bitmap,
+                    Some(&rect(Rect {
+                        x: r.x + 62.0,
+                        y: r.y + 17.0,
+                        w: 252.0,
+                        h: 162.0,
+                    })),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
+                );
+            }
+        }
+        let (px, py) = (
+            r.x + 62.0 + picker.saturation * 252.0,
+            r.y + 17.0 + (1.0 - picker.value) * 162.0,
+        );
+        self.circle(px, py, 7.0, 0x17171c, true);
+        self.circle(px, py, 6.0, 0xffffff, false);
+        for i in 0..126 {
+            let rgb = color_picker::hsv_to_rgb(i as f32 / 125.0, 1.0, 1.0);
+            self.fill(
+                Rect {
+                    x: r.x + 62.0 + i as f32 * 2.0,
+                    y: r.y + 204.0,
+                    w: 2.0,
+                    h: 15.0,
+                },
+                rgb,
+            );
+        }
+        let hx = r.x + 62.0 + picker.hue * 252.0;
+        self.circle(hx, r.y + 211.5, 9.0, 0x15151a, true);
+        self.circle(hx, r.y + 211.5, 7.0, 0xffffff, false);
+        let field = Rect {
+            x: r.x + 62.0,
+            y: r.y + 242.0,
+            w: 252.0,
+            h: 34.0,
+        };
+        self.pill(field, 0x363640, 9.0);
+        self.rounded_outline(
+            field,
+            if picker.editing_hex {
+                0x2894ff
+            } else {
+                0x595965
+            },
+            9.0,
+        );
+        self.text(
+            &format!(
+                "#{}{}",
+                picker.hex,
+                if picker.editing_hex { "|" } else { "" }
+            ),
+            Rect {
+                x: field.x + 14.0,
+                y: field.y,
+                w: field.w - 20.0,
+                h: field.h,
+            },
+            0xf6f6f8,
+            false,
+        );
+        let rgb = picker.color();
+        for (i, label, value) in [
+            (0, "R", (rgb >> 16) & 255),
+            (1, "G", (rgb >> 8) & 255),
+            (2, "B", rgb & 255),
+        ] {
+            let box_r = Rect {
+                x: r.x + 62.0 + i as f32 * 86.0,
+                y: r.y + 289.0,
+                w: 80.0,
+                h: 28.0,
+            };
+            self.pill(box_r, 0x363640, 8.0);
+            self.text(&format!("{label}  {value}"), box_r, 0xd9d8df, false);
+        }
+        let done = Rect {
+            x: r.x + 228.0,
+            y: r.y + 325.0,
+            w: 86.0,
+            h: 27.0,
+        };
+        self.pill(done, 0x007aff, 13.5);
+        self.text("Done", done, 0xffffff, false);
+        Ok(())
+    }
+    fn stroke_panel(&self, layout: &Layout, width: f32, rgb: u32) {
+        let Some(r) = layout.stroke_rect() else {
+            return;
+        };
+        self.pill(
+            Rect {
+                x: r.x + 3.0,
+                y: r.y + 5.0,
+                ..r
+            },
+            0x0e0e13,
+            17.0,
+        );
+        self.pill(r, 0x25252d, 16.0);
+        self.rounded_outline(r, 0x595965, 16.0);
+        self.text(
+            "Stroke width",
+            Rect {
+                x: r.x + 16.0,
+                y: r.y + 10.0,
+                w: 125.0,
+                h: 22.0,
+            },
+            0xf2f2f5,
+            false,
+        );
+        self.text(
+            &format!("{width:.1} px"),
+            Rect {
+                x: r.x + 150.0,
+                y: r.y + 10.0,
+                w: 60.0,
+                h: 22.0,
+            },
+            0xaab0ba,
+            false,
+        );
+        self.pill(
+            Rect {
+                x: r.x + 18.0,
+                y: r.y + 67.0,
+                w: 180.0,
+                h: 4.0,
+            },
+            0x555561,
+            2.0,
+        );
+        let value = ((width - 1.0) / 23.0).clamp(0.0, 1.0);
+        self.pill(
+            Rect {
+                x: r.x + 18.0,
+                y: r.y + 67.0,
+                w: 180.0 * value,
+                h: 4.0,
+            },
+            0x007aff,
+            2.0,
+        );
+        self.circle(r.x + 18.0 + 180.0 * value, r.y + 69.0, 7.0, 0x007aff, true);
+        self.circle(r.x + 18.0 + 180.0 * value, r.y + 69.0, 4.5, 0xffffff, true);
+        self.line(
+            (r.x + 18.0, r.y + 93.0),
+            (r.x + 198.0, r.y + 93.0),
+            rgb,
+            (width / 2.0).clamp(1.0, 9.0),
+        );
     }
     fn mark(&self, mark: &Mark, origin: Point, scale: f32) {
         let map = |p: Point| (origin.x + p.x * scale, origin.y + p.y * scale);
@@ -995,6 +1255,8 @@ impl Renderer {
             hover_levels,
             focused,
             palette_open,
+            picker,
+            stroke_open,
             selected_color,
             custom_color,
             maximized,
@@ -1334,6 +1596,19 @@ impl Renderer {
         }
         if palette_open {
             self.palette(layout, selected_color, dark);
+        }
+        if stroke_open {
+            self.stroke_panel(
+                layout,
+                stroke_width,
+                PRESET_COLORS
+                    .get(selected_color)
+                    .copied()
+                    .unwrap_or(custom_color),
+            );
+        }
+        if picker.open {
+            self.picker(layout, picker, selected_color)?;
         }
         unsafe {
             self.target

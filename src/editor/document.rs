@@ -427,14 +427,6 @@ impl Document {
         self.marks[index].color = color;
         self.edit(index, previous);
     }
-    pub fn set_width(&mut self, index: usize, width: f32) {
-        if self.marks[index].width == width {
-            return;
-        }
-        let previous = self.marks[index].clone();
-        self.marks[index].width = width;
-        self.edit(index, previous);
-    }
     pub fn delete_selected(&mut self) -> bool {
         let Some(index) = self.selected.take() else {
             return false;

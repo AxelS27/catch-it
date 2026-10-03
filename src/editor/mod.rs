@@ -1,6 +1,7 @@
 //! Activated native image editor. Modal output actions are dispatched by App,
 //! never inside a callback holding WindowState. The source raster remains immutable.
 mod background;
+mod color_picker;
 mod document;
 mod interaction;
 mod layout;
@@ -13,6 +14,7 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use background::Background;
+use color_picker::Picker;
 use document::{Document, Mark, Point};
 use layout::{Control, Layout, View, Zoom};
 use render::Renderer;
@@ -28,10 +30,7 @@ use windows::{
         Foundation::*,
         Graphics::{Dwm::*, Gdi::*},
         System::LibraryLoader::GetModuleHandleW,
-        UI::{
-            Controls::Dialogs::*, Controls::*, HiDpi::*, Input::KeyboardAndMouse::*,
-            WindowsAndMessaging::*,
-        },
+        UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
     },
     core::{BOOL, PCWSTR, w},
 };
@@ -44,36 +43,10 @@ pub const DRAG: isize = 4;
 pub const ERROR: isize = 5;
 pub const ZOOM_MENU: isize = 6;
 pub const BACKGROUND_TOGGLE: isize = 7;
-pub const COLOR_PICKER: isize = 8;
 const CLASS: PCWSTR = w!("SimpleScreenshot.Editor");
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const ZOOM_VALUES: [f32; 8] = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0];
 const HOVER_TIMER: usize = 51;
-
-unsafe extern "system" fn color_dialog_hook(
-    hwnd: HWND,
-    message: u32,
-    _: WPARAM,
-    _: LPARAM,
-) -> usize {
-    if message == WM_INITDIALOG {
-        // The editor is temporarily topmost over floating thumbnails. A stock
-        // common dialog otherwise opens *behind* its owner and looks hung.
-        unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-            );
-            let _ = SetForegroundWindow(hwnd);
-        }
-    }
-    0
-}
 
 struct MarkGesture {
     index: usize,
@@ -156,6 +129,11 @@ struct WindowState {
     focus: Option<Control>,
     pressed: Option<Control>,
     palette_open: bool,
+    picker: Picker,
+    picker_original: Option<(usize, Mark)>,
+    stroke_open: bool,
+    stroke_dragging: bool,
+    stroke_original: Option<(usize, Mark)>,
     selected_color: usize,
     custom_color: u32,
     active_tool: Control,
@@ -257,6 +235,35 @@ impl WindowState {
         }
         moving
     }
+    fn live_color(&mut self, rgb: u32) {
+        self.custom_color = rgb;
+        self.selected_color = layout::PRESET_COLORS.len();
+        if let Some(index) = self.document.selected {
+            if self.picker_original.is_none() {
+                self.picker_original = Some((index, self.document.marks[index].clone()));
+            }
+            self.document.marks[index].color = rgb;
+        }
+    }
+    fn finish_color(&mut self) {
+        if let Some((index, original)) = self.picker_original.take() {
+            self.document.edit(index, original);
+        }
+    }
+    fn live_stroke(&mut self, width: f32) {
+        self.stroke_width = width.clamp(1.0, 24.0);
+        if let Some(index) = self.document.selected {
+            if self.stroke_original.is_none() {
+                self.stroke_original = Some((index, self.document.marks[index].clone()));
+            }
+            self.document.marks[index].width = self.stroke_width;
+        }
+    }
+    fn finish_stroke(&mut self) {
+        if let Some((index, original)) = self.stroke_original.take() {
+            self.document.edit(index, original);
+        }
+    }
     fn drawing_color(&self) -> u32 {
         layout::PRESET_COLORS
             .get(self.selected_color)
@@ -328,6 +335,11 @@ impl Editor {
             focus: None,
             pressed: None,
             palette_open: false,
+            picker: Picker::default(),
+            picker_original: None,
+            stroke_open: false,
+            stroke_dragging: false,
+            stroke_original: None,
             selected_color: 4,
             custom_color: 0x006dfd,
             active_tool: Control::Move,
@@ -524,40 +536,6 @@ impl Editor {
         apply_theme(self.hwnd, self.state.dark);
     }
 
-    pub fn choose_color(&mut self) -> Result<()> {
-        let current = if self.state.selected_color < layout::PRESET_COLORS.len() {
-            layout::PRESET_COLORS[self.state.selected_color]
-        } else {
-            self.state.custom_color
-        };
-        let mut colors = [COLORREF(0); 16];
-        let mut choose = CHOOSECOLORW {
-            lStructSize: std::mem::size_of::<CHOOSECOLORW>() as u32,
-            hwndOwner: self.hwnd,
-            rgbResult: COLORREF(
-                (current & 0xff00) | ((current & 0xff) << 16) | ((current >> 16) & 0xff),
-            ),
-            lpCustColors: colors.as_mut_ptr(),
-            Flags: CC_FULLOPEN | CC_RGBINIT | CC_ENABLEHOOK,
-            lpfnHook: Some(color_dialog_hook),
-            ..Default::default()
-        };
-        if unsafe { ChooseColorW(&mut choose) }.as_bool() {
-            let bgr = choose.rgbResult.0;
-            self.state.custom_color = ((bgr & 0xff) << 16) | (bgr & 0xff00) | ((bgr >> 16) & 0xff);
-            self.state.selected_color = layout::PRESET_COLORS.len();
-            if let Some(index) = self.state.document.selected {
-                self.state.document.recolor(index, self.state.custom_color);
-            }
-            unsafe {
-                let _ = InvalidateRect(Some(self.hwnd), None, false);
-            }
-        } else {
-            let error = unsafe { CommDlgExtendedError() };
-            anyhow::ensure!(error.0 == 0, "Color dialog failed: {}", error.0);
-        }
-        Ok(())
-    }
     pub fn toggle_background(&mut self) -> Result<()> {
         self.state.background.open = !self.state.background.open;
         self.state.committed_background.open = self.state.background.open;

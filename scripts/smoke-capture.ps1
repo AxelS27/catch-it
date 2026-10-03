@@ -13,10 +13,11 @@ param(
     [switch]$EditorOnly,
     [switch]$BackgroundOnly,
     [switch]$DrawOnly,
-    [switch]$HoverOnly
+    [switch]$HoverOnly,
+    [switch]$PickerOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -1201,6 +1202,50 @@ function Test-Background {
     if((Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Background Tool changed the original PNG.'}
     Write-Host 'PASS: native Background panel, gradients/wallpapers/blur, live controls on small windows, auto-balance, Save/Copy output, None reset and original PNG intact'
 }
+function Test-Picker {
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $preview=New-TestPreview
+    $sourceHash=(Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $preview.Window 'Annotate'
+    $editor=Wait-Editor
+    $bounds=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $origin=Editor-ToolOrigin $editor
+    $sx=[int]($bounds.Left+($bounds.Right-$bounds.Left-350*$s)/2)
+    $sy=[int]($bounds.Top+48*$s+($bounds.Bottom-$bounds.Top-96*$s-200*$s)/2)
+    Click-EditorAction $editor 'Rectangle'
+    $aX=[int]($sx+20*$s);$aY=[int]($sy+160*$s)
+    $bX=[int]($sx+120*$s);$bY=[int]($sy+190*$s)
+    [CaptureInput]::HoldAt($aX,$aY);[CaptureInput]::MouseAt($bX,$bY,0);[CaptureInput]::DropAt($bX,$bY)
+    Click-EditorAction $editor 'Move'
+    Click-EditorAction $editor 'Color'
+    $colorX=[int]($bounds.Left+($origin+381)*$s)
+    [CaptureInput]::ClickAt($colorX,[int]($bounds.Top+390*$s))
+    Save-GalleryScreenshot 'editor-custom-picker.png'
+    $pickerX=[int]($bounds.Left+($origin+362-220)*$s)
+    $pickerY=[int]($bounds.Top+52*$s)
+    [CaptureInput]::ClickAt([int]($pickerX+100*$s),[int]($pickerY+258*$s))
+    [CaptureInput]::TypeText('20A0F0')
+    Press-Key 13
+    [CaptureInput]::ClickAt([int]($pickerX+270*$s),[int]($pickerY+339*$s))
+    Click-EditorAction $editor 'Stroke'
+    Save-GalleryScreenshot 'editor-stroke-slider.png'
+    $sliderX=[int]($bounds.Left+($origin+423-108)*$s)
+    $sliderY=[int]($bounds.Top+52*$s)
+    $startX=[int]($sliderX+18*$s);$dragX=[int]($sliderX+105*$s);$trackY=[int]($sliderY+69*$s)
+    [CaptureInput]::HoldAt($startX,$trackY)
+    for($i=1;$i -le 10;$i++){[CaptureInput]::MouseAt([int]($startX+($dragX-$startX)*$i/10),$trackY,0)}
+    [CaptureInput]::DropAt($dragX,$trackY)
+    [CaptureInput]::ClickAt([int]($bounds.Left+50*$s),[int]($bounds.Top+340*$s))
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$rendered=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($rendered)
+    try{
+        $c=$image.GetPixel(60,164)
+        if($c.R -ne 32 -or $c.G -ne 160 -or $c.B -ne 240){throw "Picker or slider did not update selected annotation: $c"}
+    }finally{$image.Dispose()}
+    if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Picker modified original screenshot.'}
+    Write-Host 'PASS: dark custom picker Hex recolors selected mark, live stroke slider updates export, source remains intact'
+}
 function Test-Hover {
     Close-AllPreviews;Set-AutoClose 'Never' 'never'
     $preview=New-TestPreview
@@ -1335,42 +1380,19 @@ function Test-Drawing {
     } finally {$base.Dispose();$outputImage.Dispose()}
     Click-EditorAction $editor 'Color'
     [CaptureInput]::ClickAt($cx,[int]($bounds.Top+390*$s)) # custom color wheel
-    for($i=0;$i -lt 120 -and [CaptureInput]::DialogWindow([uint32]$app.Id) -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
-    $picker=[CaptureInput]::DialogWindow([uint32]$app.Id)
-    if($picker -eq [IntPtr]::Zero){Save-GalleryScreenshot 'color-picker-failure.png';throw 'Native custom color dialog did not open.'}
-    Start-Sleep -Milliseconds 100
-    if([CaptureInput]::GetForegroundWindow() -ne $picker){
-        Save-GalleryScreenshot 'color-picker-behind-editor.png'
-        throw 'Color picker opened behind the topmost editor.'
-    }
-    Save-GalleryScreenshot 'editor-native-color-picker.png'
-    $root=[System.Windows.Automation.AutomationElement]::FromHandle($picker)
-    $cancel=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'Cancel'))
-    if(-not $cancel){throw 'Color dialog Cancel button missing.'}
-    $button=$cancel.Current.BoundingRectangle
-    [CaptureInput]::ClickAt([int]($button.X+$button.Width/2),[int]($button.Y+$button.Height/2))
-    for($i=0;$i -lt 120 -and [CaptureInput]::DialogWindow([uint32]$app.Id) -ne [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
-    if([CaptureInput]::DialogWindow([uint32]$app.Id) -ne [IntPtr]::Zero){throw 'Cancelling color dialog left editor modal.'}
-    Click-EditorAction $editor 'Color'
-    [CaptureInput]::ClickAt($cx,[int]($bounds.Top+390*$s))
-    for($i=0;$i -lt 120 -and [CaptureInput]::DialogWindow([uint32]$app.Id) -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
-    if([CaptureInput]::DialogWindow([uint32]$app.Id) -eq [IntPtr]::Zero){throw 'Custom color dialog could not reopen.'}
-    $picker=[CaptureInput]::DialogWindow([uint32]$app.Id)
-    $pickerBounds=Preview-Rect $picker
-    [CaptureInput]::ClickAt([int]($pickerBounds.Left+45*$s),[int]($pickerBounds.Top+85*$s)) # Windows basic yellow (RGB 255,255,0)
-    $root=[System.Windows.Automation.AutomationElement]::FromHandle($picker)
-    $ok=$root.FindFirst([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty,'OK'))
-    if(-not $ok){throw 'Color dialog OK button missing.'}
-    $button=$ok.Current.BoundingRectangle
-    [CaptureInput]::ClickAt([int]($button.X+$button.Width/2),[int]($button.Y+$button.Height/2))
-    for($i=0;$i -lt 120 -and [CaptureInput]::DialogWindow([uint32]$app.Id) -ne [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
-    if([CaptureInput]::DialogWindow([uint32]$app.Id) -ne [IntPtr]::Zero){throw 'Confirming custom color left editor modal.'}
-    if([CaptureInput]::EditorCount() -ne 1){throw 'Color dialog lost its editor session.'}
+    if([CaptureInput]::DialogWindow([uint32]$app.Id) -ne [IntPtr]::Zero){throw 'Color picker unexpectedly opened the old modal dialog.'}
+    Save-GalleryScreenshot 'editor-custom-picker.png'
+    $pickerX=[int]($bounds.Left+((Editor-ToolOrigin $editor)+362-220)*$s)
+    $pickerY=[int]($bounds.Top+52*$s)
+    [CaptureInput]::ClickAt([int]($pickerX+100*$s),[int]($pickerY+258*$s))
+    [CaptureInput]::TypeText('FFFF00');Press-Key 13
+    [CaptureInput]::ClickAt([int]($pickerX+270*$s),[int]($pickerY+339*$s))
+    if([CaptureInput]::EditorCount() -ne 1){throw 'Color picker lost its editor session.'}
     $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$recolored=Wait-NewShot $before
     $newColor=& $sample $recolored ($pad+220) ($pad+125)
-    if($newColor.R -ne 255 -or $newColor.G -ne 255 -or $newColor.B -ne 0){throw "Native picker did not recolor selected arrow with RGB conversion: $newColor"}
+    if($newColor.R -ne 255 -or $newColor.G -ne 255 -or $newColor.B -ne 0){throw "Custom picker did not recolor selected arrow: $newColor"}
     if((Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Annotate modified the original capture PNG.'}
-    Write-Host 'PASS: native Rectangle/Pencil/curved Arrow/manual Highlighter/opaque Mosaic, Move and control handle, undo/redo, clipboard/Save/Background, native custom color dialog, source intact'
+    Write-Host 'PASS: native Rectangle/Pencil/curved Arrow/manual Highlighter/opaque Mosaic, Move and control handle, undo/redo, clipboard/Save/Background, native dark custom color picker, source intact'
 }
 function Test-Editor {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run EditorOnly with pwsh -Sta.'}
@@ -2019,6 +2041,7 @@ try {
     elseif ($BackgroundOnly) { Test-Background }
     elseif ($DrawOnly) { Test-Drawing }
     elseif ($HoverOnly) { Test-Hover }
+    elseif ($PickerOnly) { Test-Picker }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }

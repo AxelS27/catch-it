@@ -172,6 +172,8 @@ pub(super) unsafe extern "system" fn window_proc(
                                     hover_levels: &s.hover_levels,
                                     focused: s.focus,
                                     palette_open: s.palette_open,
+                                    picker: &s.picker,
+                                    stroke_open: s.stroke_open,
                                     selected_color: s.selected_color,
                                     custom_color: s.custom_color,
                                     maximized: IsZoomed(hwnd).as_bool(),
@@ -199,7 +201,11 @@ pub(super) unsafe extern "system" fn window_proc(
                 if wparam.0 != SIZE_MINIMIZED as usize {
                     let s = &mut *ptr;
                     s.cancel_gesture();
+                    s.finish_color();
+                    s.finish_stroke();
                     s.palette_open = false;
+                    s.picker.open = false;
+                    s.stroke_open = false;
                     if let Err(error) = resize_state(
                         hwnd,
                         s,
@@ -227,7 +233,11 @@ pub(super) unsafe extern "system" fn window_proc(
                 {
                     let s = &mut *ptr;
                     s.cancel_gesture();
+                    s.finish_color();
+                    s.finish_stroke();
                     s.palette_open = false;
+                    s.picker.open = false;
+                    s.stroke_open = false;
                     s.dpi = wparam.0 as u16 as u32;
                 }
                 if GetCapture() == hwnd {
@@ -246,9 +256,16 @@ pub(super) unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_KILLFOCUS | WM_CANCELMODE => {
-                (&mut *ptr).cancel_gesture();
-                (&mut *ptr).palette_open = false;
-                (&mut *ptr).focus = None;
+                let s = &mut *ptr;
+                s.cancel_gesture();
+                s.finish_color();
+                s.finish_stroke();
+                s.picker.open = false;
+                s.picker.dragging = None;
+                s.stroke_open = false;
+                s.stroke_dragging = false;
+                s.palette_open = false;
+                s.focus = None;
                 (&*ptr).cancel_drag.set(true);
                 if GetCapture() == hwnd {
                     let _ = ReleaseCapture();
@@ -257,6 +274,10 @@ pub(super) unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_CAPTURECHANGED => {
+                (&mut *ptr).finish_color();
+                (&mut *ptr).finish_stroke();
+                (&mut *ptr).picker.dragging = None;
+                (&mut *ptr).stroke_dragging = false;
                 (&mut *ptr).cancel_gesture();
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
@@ -265,13 +286,63 @@ pub(super) unsafe extern "system" fn window_proc(
                 let s = &mut *ptr;
                 let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
                 let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+                if s.picker.open {
+                    match wparam.0 as u16 {
+                        0x1b => {
+                            if s.picker.editing_hex {
+                                s.picker.hex = format!("{:06X}", s.picker.color());
+                                s.picker.editing_hex = false;
+                            } else {
+                                s.picker.open = false;
+                                s.finish_color();
+                            }
+                        }
+                        0x0d => {
+                            if s.picker.editing_hex {
+                                if let Some(rgb) = s.picker.commit_hex() {
+                                    s.live_color(rgb);
+                                    s.finish_color();
+                                }
+                            } else {
+                                s.picker.open = false;
+                                s.finish_color();
+                            }
+                        }
+                        0x41 if ctrl && s.picker.editing_hex => s.picker.hex.clear(),
+                        _ => {}
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
+                }
+                if s.stroke_open {
+                    match wparam.0 as u16 {
+                        0x1b | 0x0d => {
+                            s.stroke_open = false;
+                            s.finish_stroke();
+                        }
+                        0x25 | 0x27 => {
+                            let amount = if shift { 0.25 } else { 1.0 };
+                            let next = s.stroke_width
+                                + if wparam.0 as u16 == 0x27 {
+                                    amount
+                                } else {
+                                    -amount
+                                };
+                            s.live_stroke(next);
+                            s.finish_stroke();
+                        }
+                        _ => {}
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
+                }
                 if s.palette_open {
                     match wparam.0 as u16 {
                         0x1b => s.palette_open = false,
                         0x0d => {
                             s.palette_open = false;
                             if s.selected_color == layout::PRESET_COLORS.len() {
-                                s.request(hwnd, COLOR_PICKER);
+                                s.picker.open(s.drawing_color());
                             } else if let Some(index) = s.document.selected {
                                 s.document.recolor(index, s.drawing_color());
                             }
@@ -377,10 +448,86 @@ pub(super) unsafe extern "system" fn window_proc(
                 let _ = InvalidateRect(Some(hwnd), None, false);
                 LRESULT(0)
             }
+            WM_CHAR => {
+                let s = &mut *ptr;
+                if s.picker.open && s.picker.editing_hex {
+                    let ch = char::from_u32(wparam.0 as u32);
+                    match ch {
+                        Some('\u{8}') => {
+                            s.picker.hex.pop();
+                        }
+                        Some(c) if c.is_ascii_hexdigit() && s.picker.hex.len() < 6 => {
+                            s.picker.hex.push(c.to_ascii_uppercase())
+                        }
+                        _ => {}
+                    }
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
+                }
+                DefWindowProcW(hwnd, message, wparam, lparam)
+            }
             WM_LBUTTONDOWN => {
                 let (capture, move_window) = {
                     let s = &mut *ptr;
                     let p = s.point(lparam);
+                    if s.picker.open {
+                        match color_picker::hit(&s.layout, p.0, p.1) {
+                            Some(
+                                region @ (color_picker::Region::Spectrum
+                                | color_picker::Region::Hue),
+                            ) => {
+                                s.picker.dragging = Some(region);
+                                if let Some(rgb) = s.picker.update(region, p.0, p.1, &s.layout) {
+                                    s.live_color(rgb);
+                                }
+                                let _ = SetFocus(Some(hwnd));
+                                SetCapture(hwnd);
+                            }
+                            Some(color_picker::Region::Preset(index))
+                                if index < layout::PRESET_COLORS.len() =>
+                            {
+                                s.finish_color();
+                                s.selected_color = index;
+                                let rgb = s.drawing_color();
+                                s.picker.open(rgb);
+                                if let Some(selected) = s.document.selected {
+                                    s.document.recolor(selected, rgb);
+                                }
+                            }
+                            Some(color_picker::Region::Hex) => {
+                                s.picker.editing_hex = true;
+                                s.picker.hex.clear();
+                                let _ = SetFocus(Some(hwnd));
+                            }
+                            Some(color_picker::Region::Done) | None => {
+                                s.finish_color();
+                                s.picker.open = false;
+                                s.picker.dragging = None;
+                            }
+                            _ => {}
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
+                    if s.stroke_open {
+                        if let Some(r) = s.layout.stroke_rect()
+                            && r.contains(p.0, p.1)
+                        {
+                            if p.1 >= r.y + 43.0 && p.1 <= r.y + 85.0 {
+                                s.stroke_dragging = true;
+                                if let Some(width) = s.layout.stroke_at(p.0) {
+                                    s.live_stroke(width);
+                                }
+                                let _ = SetFocus(Some(hwnd));
+                                SetCapture(hwnd);
+                            }
+                        } else {
+                            s.finish_stroke();
+                            s.stroke_open = false;
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
                     if s.palette_open {
                         SetCapture(hwnd);
                         return LRESULT(0);
@@ -477,6 +624,8 @@ pub(super) unsafe extern "system" fn window_proc(
                 let s = &mut *ptr;
                 let p = s.point(lparam);
                 if !s.palette_open
+                    && !s.picker.open
+                    && !s.stroke_open
                     && s.pressed.is_none()
                     && s.drag_start.is_none()
                     && s.pending_mark.is_none()
@@ -515,7 +664,21 @@ pub(super) unsafe extern "system" fn window_proc(
                 {
                     let s = &mut *ptr;
                     let p = s.point(lparam);
-                    let hit = if s.palette_open {
+                    if let Some(region) = s.picker.dragging {
+                        if let Some(rgb) = s.picker.update(region, p.0, p.1, &s.layout) {
+                            s.live_color(rgb);
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
+                    if s.stroke_dragging {
+                        if let Some(width) = s.layout.stroke_at(p.0) {
+                            s.live_stroke(width);
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
+                    let hit = if s.palette_open || s.picker.open || s.stroke_open {
                         None
                     } else {
                         s.layout.hit(p.0, p.1)
@@ -579,6 +742,29 @@ pub(super) unsafe extern "system" fn window_proc(
                     let s = &mut *ptr;
                     let p = s.point(lparam);
                     s.drag_start = None;
+                    if let Some(region) = s.picker.dragging.take() {
+                        if let Some(rgb) = s.picker.update(region, p.0, p.1, &s.layout) {
+                            s.live_color(rgb);
+                        }
+                        s.finish_color();
+                        if GetCapture() == hwnd {
+                            let _ = ReleaseCapture();
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
+                    if s.stroke_dragging {
+                        s.stroke_dragging = false;
+                        if let Some(width) = s.layout.stroke_at(p.0) {
+                            s.live_stroke(width);
+                        }
+                        s.finish_stroke();
+                        if GetCapture() == hwnd {
+                            let _ = ReleaseCapture();
+                        }
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        return LRESULT(0);
+                    }
                     if let Some(mut mark) = s.pending_mark.take() {
                         if let Some((point, _)) = source_point(s, p) {
                             mark.update(redaction_point(&mark, point, s.image.as_ref()));
@@ -660,7 +846,7 @@ pub(super) unsafe extern "system" fn window_proc(
                                 s.palette_open = false;
                             } else {
                                 s.palette_open = false;
-                                s.request(hwnd, COLOR_PICKER);
+                                s.picker.open(s.drawing_color());
                             }
                         } else {
                             s.palette_open = false;
@@ -694,6 +880,13 @@ pub(super) unsafe extern "system" fn window_proc(
                     point.x as f32 * 96.0 / s.dpi as f32,
                     point.y as f32 * 96.0 / s.dpi as f32,
                 );
+                if (s.picker.open
+                    && color_picker::rect(&s.layout).is_some_and(|r| r.contains(p.0, p.1)))
+                    || (s.stroke_open
+                        && s.layout.stroke_rect().is_some_and(|r| r.contains(p.0, p.1)))
+                {
+                    return LRESULT(0);
+                }
                 if s.background.open
                     && p.0 < background::PANEL_WIDTH
                     && p.1 >= background::PANEL_TOP
@@ -733,7 +926,18 @@ pub(super) unsafe extern "system" fn window_proc(
                             point.y as f32 * 96.0 / s.dpi as f32,
                         )
                         .is_some();
-                let cursor = if s.palette_open || s.background.dragging.is_some() || on_background {
+                let px = point.x as f32 * 96.0 / s.dpi as f32;
+                let py = point.y as f32 * 96.0 / s.dpi as f32;
+                let cursor = if s.picker.open
+                    && color_picker::hit(&s.layout, px, py) == Some(color_picker::Region::Hex)
+                {
+                    IDC_IBEAM
+                } else if s.palette_open
+                    || s.picker.open
+                    || s.stroke_open
+                    || s.background.dragging.is_some()
+                    || on_background
+                {
                     IDC_HAND
                 } else if s.pan_start.is_some() {
                     IDC_SIZEALL
@@ -760,17 +964,16 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
         Control::Save => state.request(hwnd, SAVE),
         Control::Copy => state.request(hwnd, COPY),
         Control::Zoom => state.request(hwnd, ZOOM_MENU),
-        Control::Color => state.palette_open = !state.palette_open,
+        Control::Color => {
+            state.finish_stroke();
+            state.stroke_open = false;
+            state.palette_open = !state.palette_open;
+        }
         Control::Stroke => {
-            state.stroke_width = match state.stroke_width as u32 {
-                2 => 4.0,
-                4 => 8.0,
-                8 => 12.0,
-                _ => 2.0,
-            };
-            if let Some(index) = state.document.selected {
-                state.document.set_width(index, state.stroke_width);
-            }
+            state.finish_color();
+            state.picker.open = false;
+            state.palette_open = false;
+            state.stroke_open = !state.stroke_open;
         }
         Control::Move
         | Control::Rectangle
@@ -786,6 +989,10 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
                 state.document.selected = None;
             }
             state.palette_open = false;
+            state.finish_color();
+            state.finish_stroke();
+            state.picker.open = false;
+            state.stroke_open = false;
         }
         Control::Background => state.request(hwnd, BACKGROUND_TOGGLE),
         Control::Minimize => unsafe {
