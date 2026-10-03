@@ -49,6 +49,7 @@ impl Control {
         matches!(
             self,
             Self::Move
+                | Self::Background
                 | Self::Color
                 | Self::Save
                 | Self::Minimize
@@ -354,12 +355,14 @@ pub enum Zoom {
 pub struct View {
     pub zoom: Zoom,
     pub pan: (f32, f32),
+    pub fit_limit: f32,
 }
 impl Default for View {
     fn default() -> Self {
         Self {
             zoom: Zoom::Fit,
             pan: (0.0, 0.0),
+            fit_limit: 1.0,
         }
     }
 }
@@ -368,7 +371,7 @@ impl View {
         match self.zoom {
             Zoom::Fit => ((canvas.w - 32.0).max(1.0) / width as f32)
                 .min((canvas.h - 32.0).max(1.0) / height as f32)
-                .min(1.0),
+                .min(self.fit_limit),
             Zoom::Scale(s) => s,
         }
     }
@@ -504,6 +507,7 @@ mod tests {
         let mut v = View {
             zoom: Zoom::Scale(1.0),
             pan: (0.0, 0.0),
+            fit_limit: 1.0,
         };
         let anchor = (510.0, 300.0);
         let before = v.image_rect(c, 1600, 1200);

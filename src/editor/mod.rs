@@ -1,5 +1,6 @@
 //! Activated native image editor. Modal output actions are dispatched by App,
 //! never inside a callback holding WindowState. Drawing tools arrive in later slices.
+mod background;
 mod interaction;
 mod layout;
 mod render;
@@ -10,6 +11,7 @@ use crate::{
     theme,
 };
 use anyhow::{Context, Result};
+use background::Background;
 use layout::{Control, Layout, View, Zoom};
 use render::Renderer;
 use std::{
@@ -35,6 +37,7 @@ pub const SAVE: isize = 3;
 pub const DRAG: isize = 4;
 pub const ERROR: isize = 5;
 pub const ZOOM_MENU: isize = 6;
+pub const BACKGROUND_TOGGLE: isize = 7;
 const CLASS: PCWSTR = w!("SimpleScreenshot.Editor");
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const ZOOM_VALUES: [f32; 8] = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0];
@@ -53,6 +56,11 @@ struct WindowState {
     pressed: Option<Control>,
     palette_open: bool,
     selected_color: usize,
+    background: Background,
+    committed_background: Background,
+    composed: Option<Raster>,
+    background_revision: u64,
+    background_pressed: Option<background::Target>,
     pan_start: Option<((f32, f32), (f32, f32))>,
     drag_start: Option<(f32, f32)>,
     error: Option<String>,
@@ -89,6 +97,8 @@ impl WindowState {
         }
         self.pressed = None;
         self.drag_start = None;
+        self.background_pressed = None;
+        self.background.dragging = None;
     }
 }
 
@@ -98,6 +108,8 @@ pub struct Editor {
     path: PathBuf,
     _protection: std::fs::File,
     drag_image: Option<(u32, u32, Vec<u8>)>,
+    output_path: Option<PathBuf>,
+    output_revision: u64,
 }
 impl Editor {
     pub fn create(controller: HWND, source: HWND, path: &Path) -> Result<Self> {
@@ -119,6 +131,11 @@ impl Editor {
             pressed: None,
             palette_open: false,
             selected_color: 4,
+            background: Background::default(),
+            committed_background: Background::default(),
+            composed: None,
+            background_revision: 0,
+            background_pressed: None,
             pan_start: None,
             drag_start: None,
             error: None,
@@ -169,6 +186,8 @@ impl Editor {
                 path: path.to_path_buf(),
                 _protection: protection,
                 drag_image: None,
+                output_path: None,
+                output_revision: 0,
             };
             editor.state.dpi = GetDpiForWindow(hwnd);
             editor.theme();
@@ -202,7 +221,26 @@ impl Editor {
         &self.path
     }
     pub fn image(&self) -> Option<&Raster> {
-        self.state.image.as_ref()
+        self.state.composed.as_ref().or(self.state.image.as_ref())
+    }
+    pub fn output(&mut self) -> Result<(&Path, &Raster)> {
+        if self.output_revision != self.state.background_revision {
+            self.output_path = None;
+            self.output_revision = self.state.background_revision;
+        }
+        if self.output_path.is_none()
+            && let Some(composed) = &self.state.composed
+        {
+            self.output_path = Some(storage::save_png(
+                &composed.pixels,
+                composed.width,
+                composed.height,
+            )?);
+        }
+        Ok((
+            self.output_path.as_deref().unwrap_or(&self.path),
+            self.image().context("Screenshot is still opening")?,
+        ))
     }
     pub fn matches(&self, source: WPARAM) -> bool {
         source.0 == self.state.id
@@ -224,6 +262,9 @@ impl Editor {
             image.width, image.height
         );
         self.state.image = Some(image);
+        if self.state.background.selected() {
+            refresh_background(self.hwnd, &mut self.state)?;
+        }
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
@@ -246,6 +287,41 @@ impl Editor {
     }
     fn theme(&self) {
         apply_theme(self.hwnd, self.state.dark);
+    }
+
+    pub fn toggle_background(&mut self) -> Result<()> {
+        self.state.background.open = !self.state.background.open;
+        self.state.committed_background.open = self.state.background.open;
+        if self.state.background.open && self.state.layout.height < 820.0 {
+            unsafe {
+                let mut bounds = RECT::default();
+                GetWindowRect(self.hwnd, &mut bounds)?;
+                let monitor = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+                let mut info = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                if GetMonitorInfoW(monitor, &mut info).as_bool() {
+                    let desired = (820.0 * self.state.dpi as f32 / 96.0).round() as i32;
+                    let h = desired.min(info.rcWork.bottom - info.rcWork.top);
+                    let top = bounds.top.min(info.rcWork.bottom - h).max(info.rcWork.top);
+                    SetWindowPos(
+                        self.hwnd,
+                        None,
+                        bounds.left,
+                        top,
+                        bounds.right - bounds.left,
+                        h,
+                        SWP_NOACTIVATE | SWP_NOZORDER,
+                    )?;
+                }
+            }
+        }
+        self.update_size()?;
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+        Ok(())
     }
 
     pub fn refresh_theme(&mut self, dark: bool) {
@@ -376,6 +452,11 @@ impl Editor {
                 Zoom::Scale(ZOOM_VALUES.get(index - 1).copied().unwrap_or(1.0))
             },
             pan: (0.0, 0.0),
+            fit_limit: if self.state.background.selected() {
+                1.6
+            } else {
+                1.0
+            },
         };
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
@@ -392,16 +473,24 @@ impl Editor {
         if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
             return Ok(Outcome::Canceled);
         }
-        let (width, height, pixels) = self
-            .drag_image
-            .as_ref()
-            .context("Image is not ready for dragging")?;
+        let composed = self.state.composed.is_some();
+        let (path, image) = self.output()?;
+        let path = path.to_path_buf();
+        let preview = if composed {
+            drag_preview(image)
+        } else {
+            self.drag_image
+                .as_ref()
+                .context("Image is not ready for dragging")?
+                .clone()
+        };
+        let (width, height, pixels) = preview;
         self.state.cancel_drag.set(false);
         let drag = PreparedDrag::new(
-            &self.path,
-            *width,
-            *height,
-            pixels,
+            &path,
+            width,
+            height,
+            &pixels,
             POINT {
                 x: (width / 2) as i32,
                 y: (height / 2) as i32,
@@ -544,7 +633,16 @@ fn resize_state(hwnd: HWND, state: &mut WindowState, width: u32, height: u32) ->
         width as f32 * 96.0 / state.dpi as f32,
         height as f32 * 96.0 / state.dpi as f32,
     );
-    if let Some(image) = &state.image {
+    if state.background.open {
+        state.background.scroll_y = state
+            .background
+            .scroll_y
+            .min(state.background.max_scroll(state.layout.height));
+        let shift = background::PANEL_WIDTH.min((state.layout.canvas.w - 1.0).max(0.0));
+        state.layout.canvas.x += shift;
+        state.layout.canvas.w -= shift;
+    }
+    if let Some(image) = state.composed.as_ref().or(state.image.as_ref()) {
         state
             .view
             .clamp_pan(state.layout.canvas, image.width, image.height);
@@ -557,7 +655,7 @@ fn resize_state(hwnd: HWND, state: &mut WindowState, width: u32, height: u32) ->
             width,
             height,
             state.dpi,
-            state.image.as_ref(),
+            state.composed.as_ref().or(state.image.as_ref()),
         )?);
     }
     for (c, r) in &state.layout.controls {
@@ -580,6 +678,41 @@ fn resize_state(hwnd: HWND, state: &mut WindowState, width: u32, height: u32) ->
         }
     }
     Ok(())
+}
+fn refresh_background(hwnd: HWND, state: &mut WindowState) -> Result<()> {
+    let result = (|| {
+        let composed = if let Some(image) = &state.image
+            && state.background.selected()
+        {
+            Some(background::compose(image, &state.background)?)
+        } else {
+            None
+        };
+        if let Some(image) = composed.as_ref().or(state.image.as_ref()) {
+            if let Some(renderer) = &mut state.renderer {
+                renderer.set_image(image)?;
+            }
+            state
+                .view
+                .clamp_pan(state.layout.canvas, image.width, image.height);
+        }
+        state.composed = composed;
+        state.view.fit_limit = if state.background.selected() {
+            1.6
+        } else {
+            1.0
+        };
+        state.background_revision = state.background_revision.wrapping_add(1);
+        state.committed_background = state.background.clone();
+        Ok(())
+    })();
+    if result.is_err() {
+        state.background = state.committed_background.clone();
+    }
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+    result
 }
 fn drag_preview(image: &Raster) -> (u32, u32, Vec<u8>) {
     let scale = (220.0 / image.width as f32)

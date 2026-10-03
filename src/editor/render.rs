@@ -1,4 +1,7 @@
-use super::layout::{Control, Layout, PRESET_COLORS, Rect, View};
+use super::{
+    background::{self, Background, Slider, Style},
+    layout::{Control, Layout, PRESET_COLORS, Rect, View},
+};
 use crate::storage::Raster;
 use anyhow::{Context, Result};
 use windows::{
@@ -27,8 +30,10 @@ pub struct Renderer {
     target: ID2D1HwndRenderTarget,
     brush: ID2D1SolidColorBrush,
     font: IDWriteTextFormat,
+    label: IDWriteTextFormat,
     large: IDWriteTextFormat,
     bitmap: Option<ID2D1Bitmap>,
+    swatches: Vec<ID2D1Bitmap>,
 }
 fn rect(r: Rect) -> D2D_RECT_F {
     D2D_RECT_F {
@@ -107,10 +112,49 @@ impl Renderer {
                 font.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
                 Ok(font)
             };
+            let label = make_font(12.0)?;
+            label.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING)?;
+            let mut swatches = Vec::with_capacity(background::GRADIENTS.len() + 3);
+            for index in 0..background::GRADIENTS.len() + 3 {
+                let mut pixels = vec![0u8; 38 * 38 * 4];
+                for y in 0..38 {
+                    for x in 0..38 {
+                        let rgb = if index < background::GRADIENTS.len() {
+                            background::gradient_at(index, x as f32 / 37.0, y as f32 / 37.0)
+                        } else {
+                            background::wallpaper_at(
+                                index - background::GRADIENTS.len(),
+                                x as f32 / 37.0,
+                                y as f32 / 37.0,
+                            )
+                        };
+                        let offset = (y * 38 + x) * 4;
+                        pixels[offset..offset + 4].copy_from_slice(&[rgb[2], rgb[1], rgb[0], 255]);
+                    }
+                }
+                swatches.push(target.CreateBitmap(
+                    D2D_SIZE_U {
+                        width: 38,
+                        height: 38,
+                    },
+                    Some(pixels.as_ptr().cast()),
+                    38 * 4,
+                    &D2D1_BITMAP_PROPERTIES {
+                        pixelFormat: D2D1_PIXEL_FORMAT {
+                            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                            alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                        },
+                        dpiX: 96.0,
+                        dpiY: 96.0,
+                    },
+                )?);
+            }
             let mut renderer = Self {
                 target,
                 brush,
+                swatches,
                 font: make_font(12.0)?,
+                label,
                 large: make_font(16.0)?,
                 bitmap: None,
             };
@@ -219,6 +263,20 @@ impl Renderer {
             self.target.DrawText(
                 &chars,
                 if large { &self.large } else { &self.font },
+                &rect(r),
+                &self.brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+    }
+    fn label(&self, text: &str, r: Rect, rgb: u32) {
+        unsafe {
+            self.brush.SetColor(&color(rgb));
+            let chars: Vec<u16> = text.encode_utf16().collect();
+            self.target.DrawText(
+                &chars,
+                &self.label,
                 &rect(r),
                 &self.brush,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
@@ -482,11 +540,324 @@ impl Renderer {
         }
         self.circle(x, y, 10.0, 0x999399, false);
     }
+    fn panel(&self, layout: &Layout, model: &Background, dark: bool) {
+        if !model.open {
+            return;
+        }
+        let top = background::PANEL_TOP;
+        let base = top - model.scroll_y;
+        let bottom = layout.height - background::PANEL_BOTTOM;
+        unsafe {
+            self.target.PushAxisAlignedClip(
+                &rect(Rect {
+                    x: 0.0,
+                    y: top,
+                    w: background::PANEL_WIDTH,
+                    h: (bottom - top).max(0.0),
+                }),
+                D2D1_ANTIALIAS_MODE_ALIASED,
+            );
+        }
+        let surface = if dark { 0x202024 } else { 0xf3f3f5 };
+        let fg = if dark { 0xf2f2f5 } else { 0x202025 };
+        let subtle = if dark { 0x9c9ca3 } else { 0x66666b };
+        self.fill(
+            Rect {
+                x: 0.0,
+                y: top,
+                w: background::PANEL_WIDTH,
+                h: (bottom - top).max(0.0),
+            },
+            surface,
+        );
+        self.line(
+            (background::PANEL_WIDTH - 0.5, top),
+            (background::PANEL_WIDTH - 0.5, bottom),
+            if dark { 0x343439 } else { 0xd7d7da },
+            1.0,
+        );
+        self.label(
+            "Background Tool",
+            Rect {
+                x: 16.0,
+                y: base + 8.0,
+                w: 228.0,
+                h: 27.0,
+            },
+            fg,
+        );
+        self.line(
+            (16.0, base + 38.0),
+            (244.0, base + 38.0),
+            if dark { 0x414145 } else { 0xd5d5d8 },
+            1.0,
+        );
+        let none = Rect {
+            x: 16.0,
+            y: base + 48.0,
+            w: 228.0,
+            h: 32.0,
+        };
+        self.pill(
+            none,
+            if model.style == Style::None {
+                if dark { 0x45454a } else { 0xdedee4 }
+            } else {
+                surface
+            },
+            6.0,
+        );
+        self.label(
+            "None",
+            Rect {
+                x: 25.0,
+                y: none.y,
+                w: 205.0,
+                h: 32.0,
+            },
+            fg,
+        );
+        self.label(
+            "Gradients",
+            Rect {
+                x: 16.0,
+                y: base + 91.0,
+                w: 142.0,
+                h: 28.0,
+            },
+            fg,
+        );
+        self.text(
+            if model.expanded { "⌄" } else { "›" },
+            Rect {
+                x: 217.0,
+                y: base + 91.0,
+                w: 26.0,
+                h: 28.0,
+            },
+            subtle,
+            false,
+        );
+        if model.expanded {
+            for (i, _) in background::GRADIENTS.iter().enumerate() {
+                let x = 16.0 + (i % 5) as f32 * 48.0;
+                let y = base + 122.0 + (i / 5) as f32 * 48.0;
+                unsafe {
+                    self.target.DrawBitmap(
+                        &self.swatches[i],
+                        Some(&rect(Rect {
+                            x,
+                            y,
+                            w: 38.0,
+                            h: 38.0,
+                        })),
+                        1.0,
+                        D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                        None,
+                    );
+                }
+                if model.style == Style::Gradient(i) {
+                    self.rounded_outline(
+                        Rect {
+                            x: x - 2.0,
+                            y: y - 2.0,
+                            w: 42.0,
+                            h: 42.0,
+                        },
+                        0x1596f9,
+                        6.0,
+                    );
+                }
+            }
+        }
+        let offset = if model.expanded { 0.0 } else { -192.0 };
+        self.label(
+            "Wallpapers",
+            Rect {
+                x: 16.0,
+                y: base + 323.0 + offset,
+                w: 228.0,
+                h: 27.0,
+            },
+            fg,
+        );
+        for i in 0..3 {
+            let x = 16.0 + i as f32 * 48.0;
+            let y = base + 352.0 + offset;
+            unsafe {
+                self.target.DrawBitmap(
+                    &self.swatches[background::GRADIENTS.len() + i],
+                    Some(&rect(Rect {
+                        x,
+                        y,
+                        w: 38.0,
+                        h: 38.0,
+                    })),
+                    1.0,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                    None,
+                );
+            }
+            if model.style == Style::Wallpaper(i) {
+                self.rounded_outline(
+                    Rect {
+                        x: x - 2.0,
+                        y: y - 2.0,
+                        w: 42.0,
+                        h: 42.0,
+                    },
+                    0x1596f9,
+                    7.0,
+                );
+            }
+        }
+        self.label(
+            "Blurred",
+            Rect {
+                x: 16.0,
+                y: base + 391.0 + offset,
+                w: 228.0,
+                h: 27.0,
+            },
+            fg,
+        );
+        for i in 0..3 {
+            let x = 16.0 + i as f32 * 48.0;
+            let y = base + 420.0 + offset;
+            let c = [0xdadadc, 0x85858a, 0x303035][i];
+            self.pill(
+                Rect {
+                    x,
+                    y,
+                    w: 38.0,
+                    h: 38.0,
+                },
+                c,
+                5.0,
+            );
+            if model.style == Style::Blurred(i) {
+                self.rounded_outline(
+                    Rect {
+                        x: x - 2.0,
+                        y: y - 2.0,
+                        w: 42.0,
+                        h: 42.0,
+                    },
+                    0x1596f9,
+                    7.0,
+                );
+            }
+        }
+        self.label(
+            "Plain Colors",
+            Rect {
+                x: 16.0,
+                y: base + 466.0 + offset,
+                w: 228.0,
+                h: 27.0,
+            },
+            fg,
+        );
+        for (i, &c) in background::SOLIDS.iter().enumerate() {
+            let x = 29.0 + (i % 9) as f32 * 26.0;
+            let y = base + 505.0 + (i / 9) as f32 * 25.0 + offset;
+            self.circle(x, y, 9.5, c, true);
+            if model.style == Style::Solid(i) {
+                self.circle(x, y, 11.5, 0x1596f9, false);
+            }
+        }
+        self.line(
+            (16.0, base + 559.0 + offset),
+            (244.0, base + 559.0 + offset),
+            if dark { 0x414145 } else { 0xd5d5d8 },
+            1.0,
+        );
+        for (slider, name) in [
+            (Slider::Padding, "Padding"),
+            (Slider::Inset, "Inset"),
+            (Slider::Shadow, "Shadow"),
+            (Slider::Corners, "Corners"),
+        ] {
+            let r = model.slider_rect(slider);
+            self.label(
+                name,
+                Rect {
+                    x: r.x,
+                    y: base + r.y - 31.0 + offset,
+                    w: r.w,
+                    h: 22.0,
+                },
+                fg,
+            );
+            self.pill(
+                Rect {
+                    x: r.x,
+                    y: base + r.y + 7.0 + offset,
+                    w: r.w,
+                    h: 4.0,
+                },
+                if dark { 0x5b5b61 } else { 0xc6c6ca },
+                2.0,
+            );
+            self.pill(
+                Rect {
+                    x: r.x,
+                    y: base + r.y + 7.0 + offset,
+                    w: r.w * model.slider_value(slider),
+                    h: 4.0,
+                },
+                0x1596f9,
+                2.0,
+            );
+            self.circle(
+                r.x + r.w * model.slider_value(slider),
+                base + r.y + 9.0 + offset,
+                7.0,
+                if dark { 0xffffff } else { 0xf8f8fa },
+                true,
+            );
+        }
+        self.label(
+            "Auto-balance",
+            Rect {
+                x: 145.0,
+                y: base + 623.0 + offset,
+                w: 100.0,
+                h: 26.0,
+            },
+            subtle,
+        );
+        self.pill(
+            Rect {
+                x: 212.0,
+                y: base + 647.0 + offset,
+                w: 32.0,
+                h: 19.0,
+            },
+            if model.auto_balance {
+                0x1596f9
+            } else {
+                0x606069
+            },
+            9.0,
+        );
+        self.circle(
+            if model.auto_balance { 234.0 } else { 222.0 },
+            base + 656.5 + offset,
+            7.0,
+            0xffffff,
+            true,
+        );
+        unsafe {
+            self.target.PopAxisAlignedClip();
+        }
+    }
     pub fn draw(
         &self,
         layout: &Layout,
         view: &View,
         image: Option<&Raster>,
+        background: &Background,
         chrome: ChromeState,
     ) -> Result<()> {
         let ChromeState {
@@ -579,7 +950,9 @@ impl Renderer {
                         bitmap,
                         Some(&rect(r)),
                         1.0,
-                        if view.scale(layout.canvas, image.width, image.height) >= 1.0 {
+                        if !background.selected()
+                            && view.scale(layout.canvas, image.width, image.height) >= 1.0
+                        {
                             D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
                         } else {
                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
@@ -595,6 +968,7 @@ impl Renderer {
         unsafe {
             self.target.PopAxisAlignedClip();
         }
+        self.panel(layout, background, dark);
         for &(control, r) in &layout.controls {
             let enabled = control.enabled()
                 && (image.is_some()
@@ -602,7 +976,9 @@ impl Renderer {
                         control,
                         Control::Move | Control::Minimize | Control::Maximize | Control::Close
                     ));
-            let active = control == Control::Move || control == Control::Save;
+            let active = control == Control::Save
+                || (control == Control::Background && background.open)
+                || (control == Control::Move && !background.open);
             let background = if active && enabled {
                 0x007aff
             } else if hovered == Some(control) && enabled {

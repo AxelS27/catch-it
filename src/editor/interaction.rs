@@ -122,7 +122,8 @@ pub(super) unsafe extern "system" fn window_proc(
                             .draw(
                                 &s.layout,
                                 &s.view,
-                                s.image.as_ref(),
+                                s.composed.as_ref().or(s.image.as_ref()),
+                                &s.background,
                                 render::ChromeState {
                                     dark: s.dark,
                                     hovered: s.hover,
@@ -279,15 +280,21 @@ pub(super) unsafe extern "system" fn window_proc(
                     0x53 if ctrl && s.ready() => s.request(hwnd, SAVE),
                     0x43 if ctrl && shift && s.ready() => s.request(hwnd, COPY),
                     0x57 if ctrl => s.request(hwnd, CLOSE),
-                    0x30 if ctrl => s.view = View::default(),
+                    0x30 if ctrl => {
+                        s.view = View {
+                            fit_limit: s.view.fit_limit,
+                            ..View::default()
+                        }
+                    }
                     0x31 if ctrl => {
                         s.view = View {
                             zoom: Zoom::Scale(1.0),
                             pan: (0.0, 0.0),
+                            fit_limit: s.view.fit_limit,
                         }
                     }
                     0xbb | 0xbd if ctrl => {
-                        if let Some(i) = &s.image {
+                        if let Some(i) = s.composed.as_ref().or(s.image.as_ref()) {
                             let scale = s.view.scale(s.layout.canvas, i.width, i.height)
                                 * if wparam.0 == 0xbb { 1.25 } else { 0.8 };
                             let c = s.layout.canvas;
@@ -310,6 +317,25 @@ pub(super) unsafe extern "system" fn window_proc(
                     let s = &mut *ptr;
                     let p = s.point(lparam);
                     if s.palette_open {
+                        SetCapture(hwnd);
+                        return LRESULT(0);
+                    }
+                    if s.background.open
+                        && p.0 < background::PANEL_WIDTH
+                        && p.1 >= layout::TOP
+                        && p.1 < s.layout.height - layout::BOTTOM
+                    {
+                        s.background_pressed = s.background.hit(p.0, p.1);
+                        if let Some(background::Target::Slider(slider)) = s.background_pressed {
+                            s.background.dragging = Some(slider);
+                            if s.background.set_slider(slider, p.0)
+                                && let Err(error) = refresh_background(hwnd, s)
+                            {
+                                s.error = Some(format!("{error:#}"));
+                                s.request(hwnd, ERROR);
+                            }
+                        }
+                        let _ = SetFocus(Some(hwnd));
                         SetCapture(hwnd);
                         return LRESULT(0);
                     }
@@ -383,9 +409,16 @@ pub(super) unsafe extern "system" fn window_proc(
                         s.hover = hit;
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
+                    if let Some(slider) = s.background.dragging
+                        && s.background.set_slider(slider, p.0)
+                        && let Err(error) = refresh_background(hwnd, s)
+                    {
+                        s.error = Some(format!("{error:#}"));
+                        s.request(hwnd, ERROR);
+                    }
                     if let Some((start, pan)) = s.pan_start {
                         s.view.pan = (pan.0 + p.0 - start.0, pan.1 + p.1 - start.1);
-                        if let Some(i) = &s.image {
+                        if let Some(i) = s.composed.as_ref().or(s.image.as_ref()) {
                             s.view.clamp_pan(s.layout.canvas, i.width, i.height);
                         }
                         let _ = InvalidateRect(Some(hwnd), None, false);
@@ -420,6 +453,49 @@ pub(super) unsafe extern "system" fn window_proc(
                     let s = &mut *ptr;
                     let p = s.point(lparam);
                     s.drag_start = None;
+                    if let Some(pressed) = s.background_pressed.take() {
+                        s.background.dragging = None;
+                        if s.background.hit(p.0, p.1) == Some(pressed)
+                            || matches!(pressed, background::Target::Slider(_))
+                        {
+                            match pressed {
+                                background::Target::None => {
+                                    s.background.style = background::Style::None
+                                }
+                                background::Target::Gradient(i) => {
+                                    s.background.style = background::Style::Gradient(i)
+                                }
+                                background::Target::Wallpaper(i) => {
+                                    s.background.style = background::Style::Wallpaper(i)
+                                }
+                                background::Target::Solid(i) => {
+                                    s.background.style = background::Style::Solid(i)
+                                }
+                                background::Target::Blurred(i) => {
+                                    s.background.style = background::Style::Blurred(i)
+                                }
+                                background::Target::AutoBalance => {
+                                    s.background.auto_balance = !s.background.auto_balance
+                                }
+                                background::Target::ToggleGradients => {
+                                    s.background.expanded = !s.background.expanded;
+                                    s.background.scroll_y = s
+                                        .background
+                                        .scroll_y
+                                        .min(s.background.max_scroll(s.layout.height));
+                                }
+                                background::Target::Slider(_) => {}
+                            }
+                            if let Err(error) = refresh_background(hwnd, s) {
+                                s.error = Some(format!("{error:#}"));
+                                s.request(hwnd, ERROR);
+                            }
+                        }
+                        if GetCapture() == hwnd {
+                            let _ = ReleaseCapture();
+                        }
+                        return LRESULT(0);
+                    }
                     if s.palette_open {
                         if let Some(index) = s.layout.palette_hit(p.0, p.1) {
                             if index < layout::PRESET_COLORS.len() {
@@ -458,8 +534,19 @@ pub(super) unsafe extern "system" fn window_proc(
                     point.x as f32 * 96.0 / s.dpi as f32,
                     point.y as f32 * 96.0 / s.dpi as f32,
                 );
+                if s.background.open
+                    && p.0 < background::PANEL_WIDTH
+                    && p.1 >= background::PANEL_TOP
+                    && p.1 < s.layout.height - background::PANEL_BOTTOM
+                {
+                    let delta = (wparam.0 >> 16) as u16 as i16 as f32 / 120.0;
+                    s.background.scroll_y = (s.background.scroll_y - delta * 64.0)
+                        .clamp(0.0, s.background.max_scroll(s.layout.height));
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    return LRESULT(0);
+                }
                 if s.layout.canvas.contains(p.0, p.1)
-                    && let Some(i) = &s.image
+                    && let Some(i) = s.composed.as_ref().or(s.image.as_ref())
                 {
                     let delta = (wparam.0 >> 16) as u16 as i16 as f32 / 120.0;
                     if GetKeyState(VK_CONTROL.0 as i32) < 0 {
@@ -476,7 +563,17 @@ pub(super) unsafe extern "system" fn window_proc(
             }
             WM_SETCURSOR if lparam.0 as u16 as u32 == HTCLIENT => {
                 let s = &*ptr;
-                let cursor = if s.palette_open {
+                let mut point = POINT::default();
+                let _ = GetCursorPos(&mut point);
+                let _ = ScreenToClient(hwnd, &mut point);
+                let on_background = s.background.open
+                    && s.background
+                        .hit(
+                            point.x as f32 * 96.0 / s.dpi as f32,
+                            point.y as f32 * 96.0 / s.dpi as f32,
+                        )
+                        .is_some();
+                let cursor = if s.palette_open || s.background.dragging.is_some() || on_background {
                     IDC_HAND
                 } else if s.pan_start.is_some() {
                     IDC_SIZEALL
@@ -504,6 +601,7 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
         Control::Copy => state.request(hwnd, COPY),
         Control::Zoom => state.request(hwnd, ZOOM_MENU),
         Control::Color => state.palette_open = !state.palette_open,
+        Control::Background => state.request(hwnd, BACKGROUND_TOGGLE),
         Control::Minimize => unsafe {
             let _ = PostMessageW(
                 Some(hwnd),

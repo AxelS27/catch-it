@@ -346,11 +346,12 @@ impl App {
             drop(editor);
             return self.schedule_thumbnail_timer();
         }
+        if action == editor::BACKGROUND_TOGGLE {
+            return self.editors[index].toggle_background();
+        }
         if action == editor::COPY {
-            let editor = &self.editors[index];
-            let image = editor.image().context("Screenshot is still opening")?;
-            let clipboard =
-                clipboard::Image::new(editor.path(), &image.pixels, image.width, image.height)?;
+            let (path, image) = self.editors[index].output()?;
+            let clipboard = clipboard::Image::new(path, &image.pixels, image.width, image.height)?;
             return self.queue_clipboard(clipboard);
         }
         if action == editor::ERROR {
@@ -366,7 +367,10 @@ impl App {
             let _ = KillTimer(Some(self.controller), THUMBNAIL_TIMER);
         }
         let result = match action {
-            editor::SAVE => export::save_as(editor.hwnd(), editor.path()).map(|_| ()),
+            editor::SAVE => {
+                let path = editor.output()?.0.to_path_buf();
+                export::save_as(editor.hwnd(), &path).map(|_| ())
+            }
             editor::DRAG => editor.run_drag().map(|_| ()),
             editor::ZOOM_MENU => editor.zoom_menu(),
             _ => Ok(()),

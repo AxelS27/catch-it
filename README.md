@@ -2,11 +2,11 @@
 
 A lightweight Windows screenshot utility with floating capture previews, file drag/drop, a pending queue, and persistent reference cards. The initial macOS-inspired flow and approved CleanShot-inspired extension are described in [PRD.md](PRD.md). Exact reference parity is not claimed.
 
-## Current milestone: native Annotate editor foundation
+## Current milestone: native Annotate editor and Background Tool slice
 
 The Annotate pencil now opens an activated native editor with the original full-resolution image, video-referenced light toolbar/footer, percentage/Fit zoom, pointer-anchored Ctrl+wheel zoom, middle-button hold-to-pan (left drag does not pan), Copy, native PNG Save As, and copy-only `Drag Me` file output. Source thumbnails pause and reserve their queue slots while editing; other unpinned cards still expire. Reopening the same capture raises its existing editor. Each editor independently protects its source file even after its preview closes. Editors hide during capture without losing zoom, pan, or minimized state.
 
-This is **slice 1, not a complete annotation implementation**. Shape/arrow/text/redaction/crop/background controls are visibly disabled with explanatory tooltips; Upload remains unavailable. Four editors can be open simultaneously; decoded images are bounded to 256 MiB each and the graphics device's bitmap-size limit. The original PNG is never edited or re-encoded by this slice. Save/Copy/drop preserve the editor session.
+This is **not a complete annotation implementation**. Shape/arrow/text/redaction/crop controls remain disabled; Upload remains unavailable. The Background button opens a left sidebar with 20 original, approximate gradients, three original abstract wallpapers, screenshot-based blur, plain colors, Padding/Inset/Shadow/Corners, Auto-balance, and None. Short windows scroll the panel. Preview and PNG Save As/Copy/Drag Me export the same full-resolution composed image. Auto-balance is an original visual-shadow compensation, not a verified CleanShot algorithm. Exact CleanShot preset artwork and custom background import/presets/aspect-ratio/alignment are unavailable; details and evidence are in [docs/backgroundtool-video-reference.md](docs/backgroundtool-video-reference.md). Four editors can be open simultaneously; decoded images are bounded to 256 MiB each and the graphics device's bitmap-size limit. The original capture PNG is never edited or re-encoded. Save/Copy/drop preserve the editor session.
 
 UI/UX evidence, delivery slices, and remaining exact-parity measurements are in [docs/annotation-cleanshot-research.md](docs/annotation-cleanshot-research.md). The supplied `D:\Downloads\markup.mp4` (same SHA-256 as the already researched official video) is the pinned **light** visual baseline. The editor uses the Windows app light/dark appearance; the supplied video remains the light visual baseline. Its compact 1040 x 700-DIP default window (limited to the monitor), lavender-to-neutral chrome, white canvas, tool strip, swatch, and five footer icon positions follow that video. While focused, the editor temporarily rises above topmost preview cards so they cannot cover its footer; it drops back when focus leaves. The tools and contextual property pills are centered together in one custom title-bar row, with utility icons on the left, Save and Windows-style minimize/maximize/close controls on the right, and no visible editor title. Native resizing, title-bar dragging, maximize/restore, and Windows window management remain available. Segoe UI remains a platform substitution; drawing/shape controls and the extra footer actions remain disabled. The video-derived 10-color dropdown opens and changes its toolbar swatch by mouse or keyboard; it does not yet color editable annotations, and its custom-color entry remains unavailable. This is not pixel-perfect Mac chrome: frame scale, material blur, fonts, active arrow state, expanded picker, and stroke/style property menus still need work. Exact installed-version parity and real mixed-DPI visual validation remain pending.
 
@@ -64,7 +64,7 @@ Output directory:
 
 The timer preference is atomically saved in `%LOCALAPPDATA%\SimpleScreenshot\settings.txt` and loaded on startup. The queue and pins are session-only, not a screenshot history/library, and are not restored after restart.
 
-The native editor shell is implemented, but drawing/text/redaction/crop/background tools, resize/opacity/lock controls, and a settings window are not. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
+The native editor shell and a limited Background Tool are implemented, but drawing/text/redaction/crop tools, resize/opacity/lock controls, and a settings window are not. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
 
 ### Provisional UX profile
 
@@ -129,7 +129,16 @@ pwsh -NoProfile -Sta -File ./scripts/smoke-capture.ps1 -Configuration release -E
 
 Uses actual desktop capture and the thumbnail Annotate button, checking activation, custom single-row caption/Windows window controls, one session per capture, full-image pixels, zoom menu, middle-button pan/Escape rollback, Fit/resize, original image clipboard, Save As cancel/Unicode export, OLE drag/Escape, optional accepted Explorer copy, independent source/other-card timeouts, exclusion from new captures, minimized-state preservation, concurrent editors/native close, protection after preview close, and quit during editor Save As. The original PNG and clipboard survive shutdown. Local artifacts include `.pi/capture-smoke/editor-shell.png`.
 
-Passed repeatedly on the available 1080p/96-DPI desktop. Fmt, clippy, 63 unit tests, full capture smoke, ActionsOnly, FifoOnly, and repeated GalleryOnly also passed. Editor unit coverage includes geometry, Fit/aspect, pointer-anchored zoom, pan bounds, alpha premultiplication, bounded decoding, preview output, and source reservation. Real mixed-DPI monitors, installed Mac comparison, and remaining annotation tools are not yet validated. Tests move the actual pointer and open dialogs; do not interact while they run. All test files/settings are isolated under `.pi/`.
+Passed repeatedly on the available 1080p/96-DPI desktop. Fmt, clippy, focused unit tests, full capture smoke, ActionsOnly, FifoOnly, and repeated GalleryOnly also passed. Editor unit coverage includes geometry, Fit/aspect, pointer-anchored zoom, pan bounds, alpha premultiplication, bounded decoding, preview output, and source reservation. Real mixed-DPI monitors, installed Mac comparison, and remaining annotation tools are not yet validated. Tests move the actual pointer and open dialogs; do not interact while they run. All test files/settings are isolated under `.pi/`.
+
+### Focused Background Tool test
+
+```powershell
+cargo build --release
+pwsh -NoProfile -Sta -File ./scripts/smoke-capture.ps1 -Configuration release -BackgroundOnly -DragDrop
+```
+
+Tests the real native sidebar, gradient, wallpaper and blur selections, live controls, short-window scrolling, Auto-balance, output pixel dimensions, Save As, clipboard PNG+DIB, Explorer file drag, None/reset, and untouched source PNG. Test screenshots are in `.pi/capture-smoke/background-gradient.png` and `.pi/capture-smoke/background-scrolled.png`. Like other desktop tests, this moves the real pointer and opens an isolated Explorer folder; do not interact until it exits.
 
 ### Focused Save As / clipboard test
 

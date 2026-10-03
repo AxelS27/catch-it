@@ -10,10 +10,11 @@ param(
     [switch]$ActionsOnly,
     [switch]$QuickAccessOnly,
     [switch]$ThemeOnly,
-    [switch]$EditorOnly
+    [switch]$EditorOnly,
+    [switch]$BackgroundOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -338,7 +339,7 @@ function Wait-Thumbnail([bool]$Visible, [int]$TimeoutMs = 6000) {
     throw "Thumbnail visibility did not become $Visible. Check $artifacts logs."
 }
 function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeight = 200,
-    $Samples = @(@(80,170,'Blue'), @(80,55,'Red'), @(200,55,'Lime')), [string]$Artifact = 'thumbnail.png', [int]$ExpectedCount = 1) {
+    $Samples = @(@(80,170,'Blue'), @(80,55,'Red'), @(200,55,'Lime')), [string]$Artifact = 'thumbnail.png', [int]$ExpectedCount = 1, [int]$ExpectedSlot = 0) {
     $rect = New-Object CaptureInput+Rect
     [void][CaptureInput]::GetWindowRect($Window, [ref]$rect)
     $scale = [CaptureInput]::GetDpiForWindow($Window) / 96.0
@@ -360,7 +361,8 @@ function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeig
             if ($rect.Bottom -gt $reservedTop) { throw 'Thumbnail/shadow collides with the actual taskbar (including auto-hide reveal area).' }
         }
     }
-    if ($rect.Right-$padding -ne $work.Right-[int][Math]::Round(20*$scale) -or $rect.Bottom-$padding -ne $effectiveBottom-[int][Math]::Round(20*$scale)) { throw "Quick Access inset differs: cardRight=$($rect.Right-$padding),cardBottom=$($rect.Bottom-$padding) effectiveWorkRight=$($work.Right),effectiveWorkBottom=$effectiveBottom dpi=$scale." }
+    $expectedBottom=$effectiveBottom-[int][Math]::Round(20*$scale)-$ExpectedSlot*[int][Math]::Round(196*$scale)
+    if ($rect.Right-$padding -ne $work.Right-[int][Math]::Round(20*$scale) -or $rect.Bottom-$padding -ne $expectedBottom) { throw "Quick Access inset differs: cardRight=$($rect.Right-$padding),cardBottom=$($rect.Bottom-$padding) expectedBottom=$expectedBottom dpi=$scale slot=$ExpectedSlot." }
     $cover = [Math]::Max($cardWidth/$ImageWidth, $cardHeight/$ImageHeight)
     $cropLeft = ($ImageWidth-$cardWidth/$cover)/2
     $cropTop = ($ImageHeight-$cardHeight/$cover)/2
@@ -445,7 +447,7 @@ function New-TestPreview([switch]$KeepPreviews) {
     $script:created += $shot
     Assert-Png $shot
     $preview = Wait-NewPreview $beforeWindows
-    [void](Assert-Preview $preview -ExpectedCount $(if($KeepPreviews){0}else{1}))
+    [void](Assert-Preview $preview -ExpectedCount $(if($KeepPreviews){0}else{1}) -ExpectedSlot $(if($KeepPreviews){@($beforeWindows).Count}else{0}))
     return @{ Shot = $shot; Window = $preview; Foreground = [CaptureInput]::GetForegroundWindow() }
 }
 function Wait-DragLog([string]$Text) {
@@ -999,6 +1001,118 @@ function Assert-EditorPalettePixel([int]$X,[int]$Y,[int]$Argb) {
     }
     Save-GalleryScreenshot 'editor-palette-failure.png'
     throw "Palette pixel $X,$Y did not match color $Argb"
+}
+function Test-Background {
+    if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run BackgroundOnly with pwsh -Sta.'}
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $first=New-TestPreview
+    $hash=(Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $first.Window 'Annotate'
+    $editor=Wait-Editor
+    $client=[CaptureInput]::ClientBounds($editor)
+    $s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    [CaptureInput]::ClickAt([int]($client.Left+88*$s),[int]($client.Top+24*$s))
+    Start-Sleep -Milliseconds 300
+    $client=[CaptureInput]::ClientBounds($editor)
+    if($client.Bottom-$client.Top -lt 770*$s){throw 'Background sidebar failed to expand the native editor viewport.'}
+    $at = { param([double]$X,[double]$Y) [CaptureInput]::ClickAt([int]($client.Left+$X*$s),[int]($client.Top+$Y*$s)) }
+    & $at 131 285 # gradient row 3, column 3 in the video
+    Start-Sleep -Milliseconds 250
+    Save-GalleryScreenshot 'background-gradient.png'
+    $before=@(Get-Shots)
+    [void][CaptureInput]::SetForegroundWindow($editor)
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10)) # Ctrl+Shift+C
+    $firstExport=Wait-NewShot $before
+    Assert-ClipboardImage $firstExport
+    $source=[Drawing.Bitmap]::new($first.Shot)
+    $composite=[Drawing.Bitmap]::new($firstExport)
+    try {
+        if($composite.Width -le $source.Width -or $composite.Height -le $source.Height){throw 'Background Copy did not include padding.'}
+        if($composite.GetPixel(0,0).ToArgb() -eq $source.GetPixel(0,0).ToArgb()){throw 'Gradient background did not appear in the output.'}
+        $pad=[int](($composite.Width-$source.Width)/2)
+        if($composite.GetPixel($pad+35,$pad+35).ToArgb() -ne $source.GetPixel(35,35).ToArgb()){throw 'Background output changed the source screenshot interior pixels.'}
+    } finally {$source.Dispose();$composite.Dispose()}
+    $before=@(Get-Shots)
+    & $at 225 660 # near maximum padding on the native sidebar slider
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
+    $secondExport=Wait-NewShot $before
+    $large=[Drawing.Bitmap]::new($secondExport)
+    $small=[Drawing.Bitmap]::new($firstExport)
+    try{if($large.Width -le $small.Width -or $large.Height -le $small.Height){throw 'Padding slider failed to update the exported pixel dimensions.'}}
+    finally{$large.Dispose();$small.Dispose()}
+    $saved=Join-Path $artifacts ('Background export 日本 '+[Guid]::NewGuid().ToString('N')+'.png');$script:created+=$saved
+    Click-EditorAction $editor 'Save';Enter-SavePath $saved
+    Assert-SavedCopy $saved $secondExport
+    if($DragDrop){
+        $folder=Join-Path $artifacts ('Background drop '+[Guid]::NewGuid().ToString('N'))
+        [void](New-Item -ItemType Directory -Force $folder)
+        $shellApp=New-Object -ComObject Shell.Application
+        $existing=@($shellApp.Windows() | ForEach-Object {$_.HWND})
+        $shellApp.Explore($folder)
+        for($i=0;$i -lt 200;$i++){
+            foreach($window in $shellApp.Windows()){
+                try{if($window.Document.Folder.Self.Path -eq $folder){$script:explorerWindow=$window;break}}catch{}
+            }
+            if($script:explorerWindow){break};Start-Sleep -Milliseconds 25
+        }
+        if(-not $script:explorerWindow){throw 'Background drag Explorer folder did not open.'}
+        $script:closeExplorer=$script:explorerWindow.HWND -notin $existing
+        $explorer=[IntPtr]$script:explorerWindow.HWND
+        $screen=[Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        [void][CaptureInput]::MoveWindow($explorer,($screen.Right-720),($screen.Top+60),700,650,$true)
+        [void][CaptureInput]::SetForegroundWindow($explorer);Start-Sleep -Milliseconds 150
+        $bounds=Preview-Rect $explorer
+        $tx=[int]($bounds.Left+($bounds.Right-$bounds.Left)*0.8);$ty=[int]($bounds.Top+($bounds.Bottom-$bounds.Top)*0.6)
+        [void][CaptureInput]::SetForegroundWindow($editor)
+        $bounds=[CaptureInput]::ClientBounds($editor)
+        $x=[int](($bounds.Left+$bounds.Right)/2);$y=[int]($bounds.Bottom-24*$s)
+        [CaptureInput]::HoldAt($x,$y);Start-Sleep -Milliseconds 75
+        [CaptureInput]::MouseAt($tx,$ty,0)
+        for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+        if([CaptureInput]::DragWindow() -eq [IntPtr]::Zero){throw 'Background drag never started.'}
+        Start-Sleep -Milliseconds 200;[CaptureInput]::DropAt($tx,$ty)
+        $copied=Join-Path $folder (Split-Path $secondExport -Leaf);$script:created+=$copied
+        Assert-SavedCopy $copied $secondExport
+        Write-Host 'PASS: Explorer receives the composed full-resolution PNG by native copy-only OLE drag'
+        [void][CaptureInput]::SetForegroundWindow($editor)
+    }
+    $before=@(Get-Shots)
+    & $at 229 704 # Auto-balance compensates for the cast shadow
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
+    $balanced=Wait-NewShot $before
+    if([Convert]::ToBase64String([IO.File]::ReadAllBytes($balanced)) -eq [Convert]::ToBase64String([IO.File]::ReadAllBytes($secondExport))){throw 'Auto-balance did not change the actual export.'}
+    $before=@(Get-Shots)
+    & $at 35 419 # original abstract wallpaper preset
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
+    $wallpaper=Wait-NewShot $before
+    Assert-ClipboardImage $wallpaper
+    $before=@(Get-Shots)
+    & $at 35 488 # screenshot-based blur preset
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
+    $blurred=Wait-NewShot $before
+    Assert-ClipboardImage $blurred
+    [void][CaptureInput]::MoveWindow($editor,450,180,800,460,$true)
+    $client=[CaptureInput]::ClientBounds($editor)
+    [CaptureInput]::WheelAt([int]($client.Left+110*$s),[int]($client.Top+270*$s),-720)
+    Start-Sleep -Milliseconds 100
+    Save-GalleryScreenshot 'background-scrolled.png'
+    $before=@(Get-Shots)
+    [CaptureInput]::ClickAt([int]($client.Left+16*$s),[int]($client.Top+294*$s)) # Padding at minimum after scrolling
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
+    $compact=Wait-NewShot $before
+    $large=[Drawing.Bitmap]::new($blurred);$small=[Drawing.Bitmap]::new($compact)
+    try{if($small.Width -ge $large.Width){throw 'Scroll could not reach the background controls in a short editor window.'}}
+    finally{$small.Dispose();$large.Dispose()}
+    [void][CaptureInput]::MoveWindow($editor,440,190,1040,820,$true)
+    $client=[CaptureInput]::ClientBounds($editor)
+    [CaptureInput]::WheelAt([int]($client.Left+110*$s),[int]($client.Top+270*$s),720)
+    Start-Sleep -Milliseconds 75
+    & $at 70 101 # None restores the original, non-destructive output
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
+    Assert-ClipboardImage $first.Shot
+    if((Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Background Tool changed the original PNG.'}
+    Write-Host 'PASS: native Background panel, gradients/wallpapers/blur, live controls on small windows, auto-balance, Save/Copy output, None reset and original PNG intact'
 }
 function Test-Editor {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run EditorOnly with pwsh -Sta.'}
@@ -1643,6 +1757,7 @@ try {
     if ($QuickAccessOnly) { Test-DragDrop -PreviewOnly }
     elseif ($ThemeOnly) { Test-Theme }
     elseif ($EditorOnly) { Test-Editor }
+    elseif ($BackgroundOnly) { Test-Background }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }
