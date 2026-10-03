@@ -378,8 +378,10 @@ pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
             output[p..p + 4].copy_from_slice(&[rgb[2], rgb[1], rgb[0], 255]);
         }
     }
-    let radius = ((shortest * settings.corners * 0.16).round() as i32)
-        .min(((source.width.min(source.height) - 1) / 2) as i32);
+    // Keep radii fractional. Rounding here made several slider positions produce
+    // identical images, then jump a full pixel when the integer radius changed.
+    let radius = (shortest * settings.corners * 0.16)
+        .min((source.width.min(source.height) - 1) as f32 * 0.5);
     // Compensate for the downward cast shadow so the visual center aligns with the canvas.
     let balanced_y = frame
         - if settings.auto_balance {
@@ -388,26 +390,30 @@ pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
             0
         };
     if settings.shadow > 0.0 {
-        let blur = (shortest * 0.09 * settings.shadow).max(1.0);
-        let offset = (blur * 0.35).round() as i32;
+        let extent = shortest * 0.09 * settings.shadow;
+        let blur = extent.max(0.5);
+        // A nonzero first step used to cast a full-strength shadow because of
+        // the minimum blur radius. Fade opacity in before reaching full blur.
+        let strength = (extent / 3.0).clamp(0.0, 1.0);
+        let offset = extent * 0.35;
         let half_w = (source.width - 1) as f32 * 0.5;
         let half_h = (source.height - 1) as f32 * 0.5;
         for y in 0..height {
             for x in 0..width {
                 let sx = x as i32 - frame as i32;
-                let sy = y as i32 - balanced_y as i32 - offset;
+                let sy = y as f32 - balanced_y as f32 - offset;
                 // Signed distance to the same rounded screenshot outline used below.
                 // Casting a rectangular shadow left square corners when Corners changed.
-                let qx = (sx as f32 - half_w).abs() - (half_w - radius as f32);
-                let qy = (sy as f32 - half_h).abs() - (half_h - radius as f32);
+                let qx = (sx as f32 - half_w).abs() - (half_w - radius);
+                let qy = (sy - half_h).abs() - (half_h - radius);
                 let distance = ((qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt()
                     + qx.max(qy).min(0.0)
-                    - radius as f32)
+                    - radius)
                     .max(0.0);
                 if distance > blur * 2.5 {
                     continue;
                 }
-                let opacity = (0.28 * (1.0 - distance / (blur * 2.5))).clamp(0.0, 0.28);
+                let opacity = (0.28 * strength * (1.0 - distance / (blur * 2.5))).clamp(0.0, 0.28);
                 let p = ((y * width + x) * 4) as usize;
                 for channel in 0..3 {
                     output[p + channel] =
@@ -418,15 +424,16 @@ pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
     }
     for y in 0..source.height {
         for x in 0..source.width {
-            let xx = x as i32;
-            let yy = y as i32;
-            let w = source.width as i32;
-            let h = source.height as i32;
-            let cx = xx.clamp(radius, w - radius - 1);
-            let cy = yy.clamp(radius, h - radius - 1);
-            let coverage = if radius > 0 {
-                (radius as f32 + 0.5 - (((xx - cx).pow(2) + (yy - cy).pow(2)) as f32).sqrt())
-                    .clamp(0.0, 1.0)
+            let xx = x as f32;
+            let yy = y as f32;
+            let cx = xx.clamp(radius, source.width as f32 - radius - 1.0);
+            let cy = yy.clamp(radius, source.height as f32 - radius - 1.0);
+            let coverage = if radius > 0.0 {
+                let edge =
+                    (radius + 0.5 - ((xx - cx).powi(2) + (yy - cy).powi(2)).sqrt()).clamp(0.0, 1.0);
+                // Fade into rounding when radius is less than one output pixel.
+                // At radius zero, an opaque square still covers the entire corner.
+                1.0 - (1.0 - edge) * radius.min(1.0)
             } else {
                 1.0
             };
@@ -455,6 +462,29 @@ pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shadow_fades_in_at_first_slider_step() -> Result<()> {
+        let source = Raster {
+            width: 350,
+            height: 200,
+            pixels: [255, 0, 0, 255].repeat(350 * 200),
+        };
+        let settings = Background {
+            style: Style::Solid(1),
+            shadow: 1.0 / 102.0,
+            corners: 0.0,
+            ..Default::default()
+        };
+        let image = compose(&source, &settings)?;
+        let frame = (image.width - source.width) / 2;
+        let edge =
+            (((frame + source.height) * image.width + frame + source.width / 2) * 4) as usize;
+        assert!(
+            image.pixels[edge] >= 235,
+            "first shadow step should be subtle"
+        );
+        Ok(())
+    }
     #[test]
     fn shadow_follows_rounded_screenshot_corners() -> Result<()> {
         let source = Raster {

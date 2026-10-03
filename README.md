@@ -138,7 +138,7 @@ cargo build --release
 pwsh -NoProfile -Sta -File ./scripts/smoke-capture.ps1 -Configuration release -BackgroundOnly -DragDrop
 ```
 
-Tests the real native sidebar, gradient, wallpaper and blur selections, live controls, short-window scrolling, Auto-balance, rounded-corner shadow shape, output pixel dimensions, Save As, clipboard PNG+DIB, Explorer file drag, None/reset, and untouched source PNG. Test screenshots are in `.pi/capture-smoke/background-gradient.png`, `.pi/capture-smoke/background-scrolled.png`, and `.pi/capture-smoke/background-rounded-shadow.png`. Like other desktop tests, this moves the real pointer and opens an isolated Explorer folder; do not interact until it exits.
+Tests the real native sidebar, gradient, wallpaper and blur selections, live controls, short-window scrolling, Auto-balance, subpixel corner dragging, shadow fade-in and rounded-corner shadow shape, output pixel dimensions, Save As, clipboard PNG+DIB, Explorer file drag, None/reset, and untouched source PNG. Test screenshots are in `.pi/capture-smoke/background-gradient.png`, `.pi/capture-smoke/background-scrolled.png`, and `.pi/capture-smoke/background-rounded-shadow.png`. Like other desktop tests, this moves the real pointer and opens an isolated Explorer folder; do not interact until it exits.
 
 ### Focused Save As / clipboard test
 

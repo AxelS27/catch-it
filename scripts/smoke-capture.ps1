@@ -1068,9 +1068,16 @@ function Test-Background {
         $bounds=[CaptureInput]::ClientBounds($editor)
         $x=[int](($bounds.Left+$bounds.Right)/2);$y=[int]($bounds.Bottom-24*$s)
         [CaptureInput]::HoldAt($x,$y);Start-Sleep -Milliseconds 75
-        [CaptureInput]::MouseAt($tx,$ty,0)
+        for($i=1;$i -le 25;$i++){
+            [CaptureInput]::MouseAt([int]($x+($tx-$x)*$i/25),[int]($y+($ty-$y)*$i/25),0)
+            Start-Sleep -Milliseconds 10
+        }
         for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
-        if([CaptureInput]::DragWindow() -eq [IntPtr]::Zero){throw 'Background drag never started.'}
+        if([CaptureInput]::DragWindow() -eq [IntPtr]::Zero){
+            [CaptureInput]::DropAt($tx,$ty)
+            Save-GalleryScreenshot 'background-drag-failure.png'
+            throw 'Background drag never started after captured multi-step pointer motion.'
+        }
         Start-Sleep -Milliseconds 200;[CaptureInput]::DropAt($tx,$ty)
         $copied=Join-Path $folder (Split-Path $secondExport -Leaf);$script:created+=$copied
         Assert-SavedCopy $copied $secondExport
@@ -1131,6 +1138,39 @@ function Test-Background {
             throw 'Corners rounds the screenshot but leaves its outside drop shadow square.'
         }
     } finally {$square.Dispose();$rounded.Dispose();$original.Dispose()}
+    & $at 16 759 # Shadow off to isolate fractional corner motion
+    & $at 142 759 # Corners at zero
+    $before=@(Get-Shots)
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
+    $zeroCorner=Wait-NewShot $before
+    $cornerX=[int]($client.Left+142*$s);$cornerY=[int]($client.Top+759*$s)
+    [CaptureInput]::HoldAt($cornerX,$cornerY)
+    [CaptureInput]::MouseAt(($cornerX+[int]$s),$cornerY,0)
+    [CaptureInput]::DropAt(($cornerX+[int]$s),$cornerY) # One-pixel drag, not just a click
+    $before=@(Get-Shots)
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
+    $fractionalCorner=Wait-NewShot $before
+    $zero=[Drawing.Bitmap]::new($zeroCorner);$fractional=[Drawing.Bitmap]::new($fractionalCorner)
+    try {
+        $frame=[int](($zero.Width-350)/2)
+        if($zero.GetPixel($frame,$frame).ToArgb() -eq $fractional.GetPixel($frame,$frame).ToArgb()){
+            throw 'Moving Corners by one slider pixel was silently rounded away in the actual preview/export.'
+        }
+    } finally {$zero.Dispose();$fractional.Dispose()}
+    & $at 142 759 # Square corner isolates the shadow intensity
+    & $at 16 759 # No shadow
+    & $at 17 759 # First slider pixel must fade in, not jump to full opacity
+    $before=@(Get-Shots)
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
+    $subpixelShadow=Wait-NewShot $before
+    $shadowImage=[Drawing.Bitmap]::new($subpixelShadow)
+    try {
+        $frame=[int](($shadowImage.Width-350)/2)
+        $edge=$shadowImage.GetPixel($frame+175,$frame+200)
+        if($edge.R -lt 235 -or $edge.G -lt 235 -or $edge.B -lt 235){
+            throw "Shadow jumps from zero to full strength at the first slider pixel: $edge"
+        }
+    } finally {$shadowImage.Dispose()}
     & $at 70 101 # None restores the original, non-destructive output
     [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
     Assert-ClipboardImage $first.Shot
