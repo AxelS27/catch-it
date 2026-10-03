@@ -1163,9 +1163,9 @@ impl Renderer {
                 self.pill_opacity(
                     Rect {
                         x: r.x + (r.w - 20.0) / 2.0,
-                        y: r.y + 4.0,
+                        y: r.y + (r.h - 20.0) / 2.0,
                         w: 20.0,
-                        h: 24.0,
+                        h: 20.0,
                     },
                     if dark { 0x787883 } else { 0xffffff },
                     10.0,
