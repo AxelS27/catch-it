@@ -12,10 +12,11 @@ param(
     [switch]$ThemeOnly,
     [switch]$EditorOnly,
     [switch]$BackgroundOnly,
-    [switch]$DrawOnly
+    [switch]$DrawOnly,
+    [switch]$HoverOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -1200,6 +1201,26 @@ function Test-Background {
     if((Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Background Tool changed the original PNG.'}
     Write-Host 'PASS: native Background panel, gradients/wallpapers/blur, live controls on small windows, auto-balance, Save/Copy output, None reset and original PNG intact'
 }
+function Test-Hover {
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $preview=New-TestPreview
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $preview.Window 'Annotate'
+    $editor=Wait-Editor
+    Click-EditorAction $editor 'Rectangle'
+    $bounds=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $origin=Editor-ToolOrigin $editor
+    $rectX=[int]($bounds.Left+($origin+43)*$s)
+    $fillX=[int]($bounds.Left+($origin+72)*$s)
+    $y=[int]($bounds.Top+24*$s)
+    [CaptureInput]::MouseAt($fillX,$y,0)
+    Start-Sleep -Milliseconds 240
+    Save-GalleryScreenshot 'editor-hover-adjacent.png'
+    $bitmap=[Drawing.Bitmap]::new((Join-Path $artifacts 'editor-hover-adjacent.png'))
+    try{$edge=$bitmap.GetPixel([int]($rectX+16*$s),$y)}finally{$bitmap.Dispose()}
+    if($edge.R -gt 30 -or $edge.G -lt 90 -or $edge.B -lt 180){throw "Hover obscures blue active tool: $edge"}
+    Write-Host 'PASS: hovering an adjacent tool retains the complete blue active pill'
+}
 function Test-Drawing {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run DrawOnly with pwsh -Sta.'}
     Close-AllPreviews;Set-AutoClose 'Never' 'never'
@@ -1980,6 +2001,7 @@ try {
     elseif ($EditorOnly) { Test-Editor }
     elseif ($BackgroundOnly) { Test-Background }
     elseif ($DrawOnly) { Test-Drawing }
+    elseif ($HoverOnly) { Test-Hover }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }

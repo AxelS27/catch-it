@@ -165,6 +165,7 @@ pub(super) unsafe extern "system" fn window_proc(
                                     stroke_width: s.stroke_width,
                                     dark: s.dark,
                                     hovered: s.hover,
+                                    hover_levels: &s.hover_levels,
                                     focused: s.focus,
                                     palette_open: s.palette_open,
                                     selected_color: s.selected_color,
@@ -496,6 +497,14 @@ pub(super) unsafe extern "system" fn window_proc(
                 }
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == HOVER_TIMER => {
+                let s = &mut *ptr;
+                if !s.advance_hover() {
+                    let _ = KillTimer(Some(hwnd), HOVER_TIMER);
+                }
+                let _ = InvalidateRect(Some(hwnd), None, false);
+                LRESULT(0)
+            }
             WM_MOUSEMOVE => {
                 {
                     let s = &mut *ptr;
@@ -505,10 +514,7 @@ pub(super) unsafe extern "system" fn window_proc(
                     } else {
                         s.layout.hit(p.0, p.1)
                     };
-                    if s.hover != hit {
-                        s.hover = hit;
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
+                    s.set_hover(hwnd, hit);
                     if let Some(slider) = s.background.dragging
                         && s.background.set_slider(slider, p.0)
                         && let Err(error) = refresh_background(hwnd, s)
@@ -555,8 +561,7 @@ pub(super) unsafe extern "system" fn window_proc(
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
-                (&mut *ptr).hover = None;
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                (&mut *ptr).set_hover(hwnd, None);
                 LRESULT(0)
             }
             WM_LBUTTONUP => {

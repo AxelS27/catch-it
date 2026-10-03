@@ -21,6 +21,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::atomic::{AtomicUsize, Ordering},
+    time::Instant,
 };
 use windows::{
     Win32::{
@@ -47,6 +48,7 @@ pub const COLOR_PICKER: isize = 8;
 const CLASS: PCWSTR = w!("SimpleScreenshot.Editor");
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const ZOOM_VALUES: [f32; 8] = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0];
+const HOVER_TIMER: usize = 51;
 
 unsafe extern "system" fn color_dialog_hook(
     hwnd: HWND,
@@ -90,6 +92,21 @@ impl MarkGesture {
         mark
     }
 }
+fn hover_step(levels: &mut Vec<(Control, f32)>, target: Option<Control>, dt: f32) -> bool {
+    let blend = 1.0 - (-dt / 0.055).exp();
+    let mut moving = false;
+    for (control, level) in levels.iter_mut() {
+        let goal = if Some(*control) == target { 1.0 } else { 0.0 };
+        *level += (goal - *level) * blend;
+        if (*level - goal).abs() < 0.012 {
+            *level = goal;
+        } else {
+            moving = true;
+        }
+    }
+    levels.retain(|(_, level)| *level > 0.0);
+    moving
+}
 struct WindowState {
     controller: HWND,
     id: usize,
@@ -100,6 +117,8 @@ struct WindowState {
     view: View,
     dark: bool,
     hover: Option<Control>,
+    hover_levels: Vec<(Control, f32)>,
+    hover_last_tick: Instant,
     focus: Option<Control>,
     pressed: Option<Control>,
     palette_open: bool,
@@ -126,6 +145,34 @@ struct WindowState {
     cancel_drag: Rc<Cell<bool>>,
 }
 impl WindowState {
+    fn set_hover(&mut self, hwnd: HWND, hit: Option<Control>) {
+        if self.hover == hit {
+            return;
+        }
+        self.advance_hover();
+        self.hover = hit;
+        if let Some(control) = hit
+            && !self
+                .hover_levels
+                .iter()
+                .any(|(existing, _)| *existing == control)
+        {
+            self.hover_levels.push((control, 0.0));
+        }
+        unsafe {
+            let _ = SetTimer(Some(hwnd), HOVER_TIMER, 16, None);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+    fn advance_hover(&mut self) -> bool {
+        let now = Instant::now();
+        let dt = now
+            .duration_since(self.hover_last_tick)
+            .as_secs_f32()
+            .min(0.08);
+        self.hover_last_tick = now;
+        hover_step(&mut self.hover_levels, self.hover, dt)
+    }
     fn drawing_color(&self) -> u32 {
         layout::PRESET_COLORS
             .get(self.selected_color)
@@ -192,6 +239,8 @@ impl Editor {
             view: View::default(),
             dark,
             hover: None,
+            hover_levels: Vec::new(),
+            hover_last_tick: Instant::now(),
             focus: None,
             pressed: None,
             palette_open: false,
@@ -888,6 +937,24 @@ pub fn register_class() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hover_eases_and_cleans_up_without_an_idle_timer() {
+        let mut levels = vec![(Control::Fill, 0.0)];
+        assert!(hover_step(&mut levels, Some(Control::Fill), 0.016));
+        let first = levels[0].1;
+        assert!(first > 0.0 && first < 1.0);
+        assert!(hover_step(&mut levels, Some(Control::Fill), 0.016));
+        assert!(levels[0].1 > first);
+        for _ in 0..25 {
+            hover_step(&mut levels, Some(Control::Fill), 0.016);
+        }
+        assert_eq!(levels[0].1, 1.0);
+        for _ in 0..25 {
+            hover_step(&mut levels, None, 0.016);
+        }
+        assert!(levels.is_empty());
+        assert!(!hover_step(&mut levels, None, 0.016));
+    }
     #[test]
     fn drag_preview_preserves_aspect_alpha_and_original() {
         let image = Raster {

@@ -26,6 +26,7 @@ pub struct ChromeState<'a> {
     pub stroke_width: f32,
     pub dark: bool,
     pub hovered: Option<Control>,
+    pub hover_levels: &'a [(Control, f32)],
     pub focused: Option<Control>,
     pub palette_open: bool,
     pub selected_color: usize,
@@ -244,8 +245,13 @@ impl Renderer {
         }
     }
     fn pill(&self, r: Rect, rgb: u32, radius: f32) {
+        self.pill_opacity(r, rgb, radius, 1.0);
+    }
+    fn pill_opacity(&self, r: Rect, rgb: u32, radius: f32, opacity: f32) {
         unsafe {
-            self.brush.SetColor(&color(rgb));
+            let mut tint = color(rgb);
+            tint.a = opacity;
+            self.brush.SetColor(&tint);
             self.target.FillRoundedRectangle(
                 &D2D1_ROUNDED_RECT {
                     rect: rect(r),
@@ -984,6 +990,7 @@ impl Renderer {
             stroke_width,
             dark,
             hovered,
+            hover_levels,
             focused,
             palette_open,
             selected_color,
@@ -1183,8 +1190,7 @@ impl Renderer {
                         | Control::Pencil
                         | Control::Highlighter
                 );
-                if drawing_tool && enabled && (active || hovered == Some(control)) {
-                    // The reference uses a short, wide blue pill within the shared strip.
+                if drawing_tool && enabled && active {
                     self.pill(
                         Rect {
                             x: r.x - 4.0,
@@ -1192,9 +1198,39 @@ impl Renderer {
                             w: r.w + 8.0,
                             h: 25.0,
                         },
-                        background,
+                        0x007aff,
                         12.5,
                     );
+                } else if drawing_tool && enabled {
+                    let strength = hover_levels
+                        .iter()
+                        .find(|(c, _)| *c == control)
+                        .map_or(0.0, |(_, a)| *a);
+                    if strength > 0.0 {
+                        // A 24-DIP hover pill cannot paint across an adjacent 36-DIP
+                        // active pill, even while a previous hover fades away.
+                        let neighbor = layout
+                            .rect(active_tool)
+                            .is_some_and(|a| ((r.x + r.w / 2.0) - (a.x + a.w / 2.0)).abs() < 30.5);
+                        let shift = if neighbor {
+                            layout
+                                .rect(active_tool)
+                                .map_or(0.0, |a| if r.x > a.x { 2.0 } else { -2.0 })
+                        } else {
+                            0.0
+                        };
+                        self.pill_opacity(
+                            Rect {
+                                x: r.x + (r.w - 24.0) / 2.0 + shift,
+                                y: r.y + 4.0,
+                                w: 24.0,
+                                h: 24.0,
+                            },
+                            if dark { 0x787883 } else { 0xffffff },
+                            12.0,
+                            strength,
+                        );
+                    }
                 } else if !drawing_tool {
                     self.pill(r, background, 14.0);
                 }
