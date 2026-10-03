@@ -25,6 +25,8 @@ pub enum Shape {
     Pencil(Vec<Point>),
     Rectangle(Point, Point),
     FilledRectangle(Point, Point),
+    Highlighter(Point, Point),
+    Mosaic(Point, Point),
     Ellipse(Point, Point),
     Line(Point, Point),
     Arrow(Point, Point, Point),
@@ -34,6 +36,7 @@ pub struct Mark {
     pub shape: Shape,
     pub color: u32,
     pub width: f32,
+    pub opacity: f32,
 }
 impl Mark {
     pub fn from_tool(tool: Control, start: Point, color: u32, width: f32) -> Option<Self> {
@@ -41,6 +44,8 @@ impl Mark {
             Control::Pencil => Shape::Pencil(vec![start]),
             Control::Rectangle => Shape::Rectangle(start, start),
             Control::Fill => Shape::FilledRectangle(start, start),
+            Control::Highlighter => Shape::Highlighter(start, start),
+            Control::Pixelate => Shape::Mosaic(start, start),
             Control::Ellipse => Shape::Ellipse(start, start),
             Control::Line => Shape::Line(start, start),
             Control::Arrow => Shape::Arrow(start, start, start),
@@ -50,6 +55,11 @@ impl Mark {
             shape,
             color,
             width,
+            opacity: if tool == Control::Highlighter {
+                0.35
+            } else {
+                1.0
+            },
         })
     }
     pub fn update(&mut self, point: Point) {
@@ -65,6 +75,8 @@ impl Mark {
             }
             Shape::Rectangle(_, end)
             | Shape::FilledRectangle(_, end)
+            | Shape::Highlighter(_, end)
+            | Shape::Mosaic(_, end)
             | Shape::Ellipse(_, end)
             | Shape::Line(_, end) => *end = point,
             Shape::Arrow(start, end, control) => {
@@ -112,6 +124,8 @@ impl Mark {
             Shape::Pencil(_) => None,
             Shape::Rectangle(a, b)
             | Shape::FilledRectangle(a, b)
+            | Shape::Highlighter(a, b)
+            | Shape::Mosaic(a, b)
             | Shape::Ellipse(a, b)
             | Shape::Line(a, b) => Some((*a, *b)),
             Shape::Arrow(a, b, _) => Some((*a, *b)),
@@ -163,6 +177,8 @@ impl Mark {
             }
             Shape::Rectangle(a, b)
             | Shape::FilledRectangle(a, b)
+            | Shape::Highlighter(a, b)
+            | Shape::Mosaic(a, b)
             | Shape::Ellipse(a, b)
             | Shape::Line(a, b) => {
                 *a = a.moved(dx, dy);
@@ -217,7 +233,11 @@ impl Mark {
                     };
                 }
             }
-            Shape::Rectangle(a, b) | Shape::FilledRectangle(a, b) | Shape::Ellipse(a, b) => {
+            Shape::Rectangle(a, b)
+            | Shape::FilledRectangle(a, b)
+            | Shape::Highlighter(a, b)
+            | Shape::Mosaic(a, b)
+            | Shape::Ellipse(a, b) => {
                 let lo = Point {
                     x: a.x.min(b.x),
                     y: a.y.min(b.y),
@@ -280,7 +300,7 @@ impl Mark {
                 }
                 false
             }
-            Shape::FilledRectangle(_, _) => true,
+            Shape::FilledRectangle(_, _) | Shape::Highlighter(_, _) | Shape::Mosaic(_, _) => true,
             Shape::Rectangle(_, _) => {
                 (p.x - lo.x).abs() <= r
                     || (p.x - hi.x).abs() <= r
@@ -298,6 +318,39 @@ impl Mark {
                 .sqrt();
                 (distance - 1.0).abs() * rx.min(ry) <= r
             }
+        }
+    }
+}
+/// A content-independent, opaque mosaic. Tiles never sample or retain source pixels.
+/// This protects the *export* region; the original capture file remains untouched.
+pub fn mosaic_tiles(a: Point, b: Point, mut paint: impl FnMut(Point, Point, u32)) {
+    let (x0, x1) = ((a.x.min(b.x).floor() as i32), (a.x.max(b.x).ceil() as i32));
+    let (y0, y1) = ((a.y.min(b.y).floor() as i32), (a.y.max(b.y).ceil() as i32));
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let span = x1.saturating_sub(x0).max(y1.saturating_sub(y0)) as u32;
+    let step = span.div_ceil(96).max(8) as i32;
+    for y in (y0..y1).step_by(step as usize) {
+        for x in (x0..x1).step_by(step as usize) {
+            let mut hash =
+                (x as u32).wrapping_mul(0x9e3779b9) ^ (y as u32).wrapping_mul(0x85ebca6b);
+            hash ^= hash >> 16;
+            hash = hash.wrapping_mul(0x7feb352d);
+            hash ^= hash >> 15;
+            let value = 58 + hash % 73;
+            let tint = (value << 16) | ((value + hash % 6) << 8) | (value + hash % 11);
+            paint(
+                Point {
+                    x: x as f32,
+                    y: y as f32,
+                },
+                Point {
+                    x: x.saturating_add(step).min(x1) as f32,
+                    y: y.saturating_add(step).min(y1) as f32,
+                },
+                tint,
+            );
         }
     }
 }
@@ -520,7 +573,26 @@ fn paint_mark(image: &mut Raster, mark: &Mark, offset: Point) {
                 paint_segment(image, *b, end, mark.width, mark.color, offset);
             }
         }
-        Shape::Rectangle(a, b) | Shape::FilledRectangle(a, b) => {
+        Shape::Mosaic(a, b) => {
+            mosaic_tiles(*a, *b, |lo, hi, rgb| {
+                let x0 = (lo.x + offset.x).floor().max(0.0) as u32;
+                let x1 = (hi.x + offset.x).ceil().min(image.width as f32) as u32;
+                let y0 = (lo.y + offset.y).floor().max(0.0) as u32;
+                let y1 = (hi.y + offset.y).ceil().min(image.height as f32) as u32;
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let i = ((y * image.width + x) * 4) as usize;
+                        image.pixels[i..i + 4].copy_from_slice(&[
+                            (rgb & 255) as u8,
+                            ((rgb >> 8) & 255) as u8,
+                            ((rgb >> 16) & 255) as u8,
+                            255,
+                        ]);
+                    }
+                }
+            });
+        }
+        Shape::Rectangle(a, b) | Shape::FilledRectangle(a, b) | Shape::Highlighter(a, b) => {
             let lo = Point {
                 x: a.x.min(b.x),
                 y: a.y.min(b.y),
@@ -529,7 +601,10 @@ fn paint_mark(image: &mut Raster, mark: &Mark, offset: Point) {
                 x: a.x.max(b.x),
                 y: a.y.max(b.y),
             };
-            if matches!(mark.shape, Shape::FilledRectangle(_, _)) {
+            if matches!(
+                mark.shape,
+                Shape::FilledRectangle(_, _) | Shape::Highlighter(_, _)
+            ) {
                 let (x0, x1) = (
                     ((lo.x + offset.x).floor() as i32).max(0),
                     ((hi.x + offset.x).ceil() as i32).min(image.width as i32),
@@ -544,7 +619,7 @@ fn paint_mark(image: &mut Raster, mark: &Mark, offset: Point) {
                             &mut image.pixels,
                             ((y as u32 * image.width + x as u32) * 4) as usize,
                             mark.color,
-                            1.0,
+                            mark.opacity,
                         );
                     }
                 }
@@ -599,6 +674,67 @@ pub fn flatten(base: &Raster, marks: &[Mark], offset: Point) -> Result<Raster> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mosaic_export_replaces_source_pixels_with_content_independent_opaque_tiles() -> Result<()> {
+        let red = Raster {
+            width: 40,
+            height: 40,
+            pixels: [0, 0, 255, 255].repeat(40 * 40),
+        };
+        let blue = Raster {
+            width: 40,
+            height: 40,
+            pixels: [255, 0, 0, 255].repeat(40 * 40),
+        };
+        let mut mark =
+            Mark::from_tool(Control::Pixelate, Point { x: 4.0, y: 5.0 }, 0xffde00, 3.0).unwrap();
+        mark.update(Point { x: 32.0, y: 33.0 });
+        assert!(mark.finish());
+        let a = flatten(&red, &[mark.clone()], Point::default())?;
+        let b = flatten(&blue, &[mark], Point::default())?;
+        for y in 5..33 {
+            for x in 4..32 {
+                let i = ((y * 40 + x) * 4) as usize;
+                assert_eq!(&a.pixels[i..i + 4], &b.pixels[i..i + 4]);
+                assert_eq!(a.pixels[i + 3], 255);
+                assert_ne!(&a.pixels[i..i + 4], &red.pixels[i..i + 4]);
+            }
+        }
+        assert_eq!(&a.pixels[0..4], &red.pixels[0..4]);
+        assert_eq!(&red.pixels[0..4], &[0, 0, 255, 255]);
+        Ok(())
+    }
+    #[test]
+    fn manual_highlight_blends_without_mutating_the_source() -> Result<()> {
+        let source = Raster {
+            width: 12,
+            height: 12,
+            pixels: [255, 0, 0, 255].repeat(12 * 12),
+        };
+        let mut mark = Mark::from_tool(
+            Control::Highlighter,
+            Point { x: 2.0, y: 2.0 },
+            0xffde00,
+            3.0,
+        )
+        .unwrap();
+        mark.update(Point { x: 10.0, y: 10.0 });
+        assert!(mark.finish());
+        let image = flatten(&source, &[mark.clone()], Point::default())?;
+        assert_eq!(
+            image.pixels[((6 * 12 + 6) * 4)..((6 * 12 + 6) * 4 + 4)],
+            [166, 78, 89, 255]
+        );
+        assert_eq!(image.pixels[0..4], [255, 0, 0, 255]);
+        assert_eq!(
+            source.pixels[((6 * 12 + 6) * 4)..((6 * 12 + 6) * 4 + 4)],
+            [255, 0, 0, 255]
+        );
+        mark.resize_handle(0, Point { x: 1.0, y: 1.0 });
+        assert_eq!(mark.opacity, 0.35);
+        assert_eq!(mark.bounds().0, Point { x: 1.0, y: 1.0 });
+        Ok(())
+    }
     #[test]
     fn selected_handles_resize_shapes_and_curve_arrows_without_baking_pixels() -> Result<()> {
         let mut rectangle = Mark::from_tool(

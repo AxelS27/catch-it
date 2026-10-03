@@ -969,7 +969,9 @@ function Click-EditorAction([IntPtr]$Window,[string]$Action) {
         'Ellipse' {$x=$r.Left+($origin+101)*$s;$y=$r.Top+24*$s}
         'Line' {$x=$r.Left+($origin+130)*$s;$y=$r.Top+24*$s}
         'Arrow' {$x=$r.Left+($origin+159)*$s;$y=$r.Top+24*$s}
+        'Pixelate' {$x=$r.Left+($origin+217)*$s;$y=$r.Top+24*$s}
         'Pencil' {$x=$r.Left+($origin+304)*$s;$y=$r.Top+24*$s}
+        'Highlighter' {$x=$r.Left+($origin+333)*$s;$y=$r.Top+24*$s}
         'Stroke' {$x=$r.Left+($origin+423)*$s;$y=$r.Top+24*$s}
         'Color' {$x=$r.Left+($origin+381)*$s;$y=$r.Top+24*$s}
         default {throw 'Unknown editor action'}
@@ -1260,6 +1262,27 @@ function Test-Drawing {
     if($bendPixel.R -lt 240 -or $bendPixel.G -lt 200 -or $bendPixel.B -gt 20){throw "Dragging the arrow control handle did not bend the exported arrow: $bendPixel"}
     $straightPixel=& $sample $bent 220 105
     if($straightPixel.R -gt 240 -and $straightPixel.G -gt 200 -and $straightPixel.B -lt 20){throw 'Bent arrow left a baked straight-line ghost.'}
+    Click-EditorAction $editor 'Highlighter'
+    $a=& $point 5 15;$b=& $point 90 40
+    [CaptureInput]::HoldAt($a.X,$a.Y);[CaptureInput]::MouseAt($b.X,$b.Y,0);[CaptureInput]::DropAt($b.X,$b.Y)
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$highlighted=Wait-NewShot $before
+    $highlightPixel=& $sample $highlighted 10 20
+    if($highlightPixel.ToArgb() -ne [Drawing.Color]::FromArgb(89,78,166).ToArgb()){
+        Save-GalleryScreenshot 'editor-highlight-failure.png'
+        throw "Manual highlighter was not translucent in the exported PNG: $highlightPixel"
+    }
+    Click-EditorAction $editor 'Pixelate'
+    $a=& $point 300 20;$b=& $point 340 65
+    [CaptureInput]::HoldAt($a.X,$a.Y);[CaptureInput]::MouseAt($b.X,$b.Y,0);[CaptureInput]::DropAt($b.X,$b.Y)
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$redacted=Wait-NewShot $before
+    Save-GalleryScreenshot 'editor-mosaic-and-highlight.png'
+    $mosaicPixel=& $sample $redacted 320 30
+    if($mosaicPixel.R -lt 55 -or $mosaicPixel.R -gt 145 -or $mosaicPixel.G -lt 55 -or $mosaicPixel.B -lt 55 -or $mosaicPixel.A -ne 255){
+        throw "Opaque mosaic failed to replace source pixels in export: $mosaicPixel"
+    }
+    Click-EditorAction $editor 'Move'
+    $selectArrow=& $point 220 125
+    [CaptureInput]::ClickAt($selectArrow.X,$selectArrow.Y)
     Click-EditorAction $editor 'Background'
     $panel=[CaptureInput]::ClientBounds($editor)
     [CaptureInput]::ClickAt([int]($panel.Left+131*$s),[int]($panel.Top+285*$s))
@@ -1309,7 +1332,7 @@ function Test-Drawing {
     $newColor=& $sample $recolored ($pad+220) ($pad+125)
     if($newColor.R -ne 255 -or $newColor.G -ne 255 -or $newColor.B -ne 0){throw "Native picker did not recolor selected arrow with RGB conversion: $newColor"}
     if((Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Annotate modified the original capture PNG.'}
-    Write-Host 'PASS: native Rectangle/Pencil/curved Arrow, Move and control handle, undo/redo, clipboard/Save/Background, native custom color dialog, source intact'
+    Write-Host 'PASS: native Rectangle/Pencil/curved Arrow/manual Highlighter/opaque Mosaic, Move and control handle, undo/redo, clipboard/Save/Background, native custom color dialog, source intact'
 }
 function Test-Editor {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run EditorOnly with pwsh -Sta.'}

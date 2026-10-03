@@ -17,6 +17,17 @@ fn source_point(s: &WindowState, p: (f32, f32)) -> Option<(Point, f32)> {
         scale,
     ))
 }
+fn redaction_point(mark: &Mark, point: Point, source: Option<&Raster>) -> Point {
+    if matches!(mark.shape, document::Shape::Mosaic(..))
+        && let Some(source) = source
+    {
+        return Point {
+            x: point.x.clamp(0.0, source.width as f32),
+            y: point.y.clamp(0.0, source.height as f32),
+        };
+    }
+    point
+}
 fn inside_source(s: &WindowState, p: Point) -> bool {
     s.image.as_ref().is_some_and(|source| {
         p.x >= 0.0 && p.y >= 0.0 && p.x < source.width as f32 && p.y < source.height as f32
@@ -507,10 +518,11 @@ pub(super) unsafe extern "system" fn window_proc(
                     }
                     if let Some((point, _)) = source_point(s, p) {
                         if let Some(mark) = &mut s.pending_mark {
-                            mark.update(point);
+                            mark.update(redaction_point(mark, point, s.image.as_ref()));
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                         if let Some(gesture) = &s.moving_mark {
+                            let point = redaction_point(&gesture.original, point, s.image.as_ref());
                             s.document.marks[gesture.index] = gesture.at(point);
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
@@ -554,7 +566,7 @@ pub(super) unsafe extern "system" fn window_proc(
                     s.drag_start = None;
                     if let Some(mut mark) = s.pending_mark.take() {
                         if let Some((point, _)) = source_point(s, p) {
-                            mark.update(point);
+                            mark.update(redaction_point(&mark, point, s.image.as_ref()));
                         }
                         if mark.finish()
                             && let Err(error) = s.document.add(mark)
@@ -570,6 +582,7 @@ pub(super) unsafe extern "system" fn window_proc(
                     }
                     if let Some(gesture) = s.moving_mark.take() {
                         if let Some((point, _)) = source_point(s, p) {
+                            let point = redaction_point(&gesture.original, point, s.image.as_ref());
                             s.document.marks[gesture.index] = gesture.at(point);
                         }
                         s.document.edit(gesture.index, gesture.original);
@@ -750,7 +763,9 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
         | Control::Ellipse
         | Control::Line
         | Control::Arrow
-        | Control::Pencil => {
+        | Control::Pencil
+        | Control::Highlighter
+        | Control::Pixelate => {
             state.active_tool = control;
             if control != Control::Move {
                 state.document.selected = None;

@@ -55,6 +55,8 @@ impl Control {
                 | Self::Line
                 | Self::Arrow
                 | Self::Pencil
+                | Self::Highlighter
+                | Self::Pixelate
                 | Self::Stroke
                 | Self::Background
                 | Self::Color
@@ -79,11 +81,15 @@ impl Control {
             Self::Line => "Line",
             Self::Arrow => "Arrow",
             Self::Text => "Text",
-            Self::Pixelate => "Pixelate / blur",
+            Self::Pixelate => {
+                "Opaque content-independent mosaic redaction (not blur; original capture remains)"
+            }
             Self::Spotlight => "Spotlight",
             Self::Counter => "Counter",
             Self::Pencil => "Pencil (smoothed freehand stroke)",
-            Self::Highlighter => "Smart highlighter",
+            Self::Highlighter => {
+                "Manual translucent highlight (drag a rectangle; no text snapping)"
+            }
             Self::Color => "Annotation colors and Windows custom color picker",
             Self::Stroke => "Annotation stroke width",
             Self::Style => "Tool style",

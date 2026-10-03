@@ -233,8 +233,13 @@ impl Renderer {
         }
     }
     fn fill(&self, r: Rect, rgb: u32) {
+        self.fill_opacity(r, rgb, 1.0);
+    }
+    fn fill_opacity(&self, r: Rect, rgb: u32, opacity: f32) {
         unsafe {
-            self.brush.SetColor(&color(rgb));
+            let mut tint = color(rgb);
+            tint.a = opacity;
+            self.brush.SetColor(&tint);
             self.target.FillRectangle(&rect(r), &self.brush);
         }
     }
@@ -585,7 +590,27 @@ impl Renderer {
                     segment(*b, end);
                 }
             }
-            Shape::Rectangle(a, b) | Shape::FilledRectangle(a, b) => {
+            Shape::Mosaic(a, b) => {
+                unsafe {
+                    self.target.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+                }
+                document::mosaic_tiles(*a, *b, |lo, hi, rgb| {
+                    self.fill(
+                        Rect {
+                            x: origin.x + lo.x * scale,
+                            y: origin.y + lo.y * scale,
+                            w: (hi.x - lo.x) * scale,
+                            h: (hi.y - lo.y) * scale,
+                        },
+                        rgb,
+                    );
+                });
+                unsafe {
+                    self.target
+                        .SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                }
+            }
+            Shape::Rectangle(a, b) | Shape::FilledRectangle(a, b) | Shape::Highlighter(a, b) => {
                 let lo = Point {
                     x: a.x.min(b.x),
                     y: a.y.min(b.y),
@@ -600,8 +625,11 @@ impl Renderer {
                     w: (hi.x - lo.x) * scale,
                     h: (hi.y - lo.y) * scale,
                 };
-                if matches!(mark.shape, Shape::FilledRectangle(_, _)) {
-                    self.fill(r, mark.color);
+                if matches!(
+                    mark.shape,
+                    Shape::FilledRectangle(_, _) | Shape::Highlighter(_, _)
+                ) {
+                    self.fill_opacity(r, mark.color, mark.opacity);
                 } else {
                     self.line((r.x, r.y), (r.x + r.w, r.y), mark.color, width);
                     self.line((r.x + r.w, r.y), (r.x + r.w, r.y + r.h), mark.color, width);
