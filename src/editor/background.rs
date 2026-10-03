@@ -390,13 +390,20 @@ pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
     if settings.shadow > 0.0 {
         let blur = (shortest * 0.09 * settings.shadow).max(1.0);
         let offset = (blur * 0.35).round() as i32;
+        let half_w = (source.width - 1) as f32 * 0.5;
+        let half_h = (source.height - 1) as f32 * 0.5;
         for y in 0..height {
             for x in 0..width {
                 let sx = x as i32 - frame as i32;
                 let sy = y as i32 - balanced_y as i32 - offset;
-                let dx = (sx.max(0) - sx).max(sx - source.width as i32 + 1).max(0) as f32;
-                let dy = (sy.max(0) - sy).max(sy - source.height as i32 + 1).max(0) as f32;
-                let distance = (dx * dx + dy * dy).sqrt();
+                // Signed distance to the same rounded screenshot outline used below.
+                // Casting a rectangular shadow left square corners when Corners changed.
+                let qx = (sx as f32 - half_w).abs() - (half_w - radius as f32);
+                let qy = (sy as f32 - half_h).abs() - (half_h - radius as f32);
+                let distance = ((qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt()
+                    + qx.max(qy).min(0.0)
+                    - radius as f32)
+                    .max(0.0);
                 if distance > blur * 2.5 {
                     continue;
                 }
@@ -448,6 +455,50 @@ pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shadow_follows_rounded_screenshot_corners() -> Result<()> {
+        let source = Raster {
+            width: 200,
+            height: 120,
+            pixels: [255, 0, 0, 255].repeat(200 * 120),
+        };
+        let square = Background {
+            style: Style::Solid(1),
+            corners: 0.0,
+            shadow: 1.0,
+            ..Default::default()
+        };
+        let rounded = Background {
+            corners: 1.0,
+            ..square.clone()
+        };
+        let a = compose(&source, &square)?;
+        let b = compose(&source, &rounded)?;
+        let frame = (a.width - source.width) / 2;
+        let corner = (((frame - 1) * a.width + frame - 1) * 4) as usize;
+        let center = (((frame - 1) * a.width + frame + source.width / 2) * 4) as usize;
+        assert!(
+            b.pixels[corner] > a.pixels[corner],
+            "rounded shadow corner should fade sooner"
+        );
+        assert_eq!(&a.pixels[center..center + 3], &b.pixels[center..center + 3]);
+        let no_shadow = Background {
+            shadow: 0.0,
+            ..square
+        };
+        assert_eq!(
+            &compose(&source, &no_shadow)?.pixels[corner..corner + 3],
+            &compose(
+                &source,
+                &Background {
+                    corners: 1.0,
+                    ..no_shadow
+                }
+            )?
+            .pixels[corner..corner + 3]
+        );
+        Ok(())
+    }
     #[test]
     fn small_editor_scrolls_to_reach_bottom_controls() {
         let b = Background {

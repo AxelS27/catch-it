@@ -1108,6 +1108,29 @@ function Test-Background {
     $client=[CaptureInput]::ClientBounds($editor)
     [CaptureInput]::WheelAt([int]($client.Left+110*$s),[int]($client.Top+270*$s),720)
     Start-Sleep -Milliseconds 75
+    & $at 55 553 # Solid white makes the outside-of-image shadow measurable
+    & $at 110 759 # Strong shadow
+    & $at 143 759 # Square screenshot corners
+    $before=@(Get-Shots)
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
+    $squareShadow=Wait-NewShot $before
+    & $at 241 759 # Maximum rounding: the shadow should bend too
+    Save-GalleryScreenshot 'background-rounded-shadow.png'
+    $before=@(Get-Shots)
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
+    $roundedShadow=Wait-NewShot $before
+    $square=[Drawing.Bitmap]::new($squareShadow);$rounded=[Drawing.Bitmap]::new($roundedShadow)
+    $original=[Drawing.Bitmap]::new($first.Shot)
+    try {
+        if($square.Width -ne $rounded.Width -or $square.Height -ne $rounded.Height){throw 'Changing Corners changed the background size.'}
+        $frame=[int](($square.Width-$original.Width)/2)
+        $cornerBefore=$square.GetPixel($frame-1,$frame-1)
+        $cornerAfter=$rounded.GetPixel($frame-1,$frame-1)
+        if($cornerBefore.ToArgb() -eq $cornerAfter.ToArgb()){
+            Save-GalleryScreenshot 'background-corner-shadow-failure.png'
+            throw 'Corners rounds the screenshot but leaves its outside drop shadow square.'
+        }
+    } finally {$square.Dispose();$rounded.Dispose();$original.Dispose()}
     & $at 70 101 # None restores the original, non-destructive output
     [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
     Assert-ClipboardImage $first.Shot
