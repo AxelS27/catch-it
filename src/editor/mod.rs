@@ -65,12 +65,33 @@ struct MarkGesture {
     original: Mark,
     start: Point,
     handle: Option<usize>,
+    rotating: bool,
 }
 impl MarkGesture {
     fn at(&self, point: Point) -> Mark {
         let mut mark = self.original.clone();
-        if let Some(handle) = self.handle {
-            mark.resize_handle(handle, point);
+        if self.rotating {
+            let center = self.original.center();
+            let start = (self.start.y - center.y).atan2(self.start.x - center.x);
+            let current = (point.y - center.y).atan2(point.x - center.x);
+            mark.angle = (self.original.angle + current - start).rem_euclid(std::f32::consts::TAU);
+        } else if let Some(handle) = self.handle {
+            let center = self.original.center();
+            let local = document::rotate(point, center, -self.original.angle);
+            let fixed_index = match self.original.shape {
+                document::Shape::Line(..) | document::Shape::Arrow(..) if handle < 2 => {
+                    Some(1 - handle)
+                }
+                document::Shape::Line(..) | document::Shape::Arrow(..) => None,
+                _ => Some((handle + 2) % 4),
+            };
+            let fixed = fixed_index.and_then(|index| self.original.handles().get(index).copied());
+            mark.resize_handle(handle, local);
+            if let (Some(index), Some(before)) = (fixed_index, fixed)
+                && let Some(after) = mark.handles().get(index)
+            {
+                mark.translate(before.x - after.x, before.y - after.y);
+            }
         } else {
             mark.translate(point.x - self.start.x, point.y - self.start.y);
         }
@@ -729,6 +750,7 @@ impl Editor {
             color: 0xffffff,
             width: 1.0,
             opacity: 1.0,
+            angle: 0.0,
         })?;
         self.state.active_tool = Control::Move;
         self.state.pill_motion = None;
@@ -1210,6 +1232,46 @@ pub fn register_class() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rotation_and_resize_are_editable_gestures() {
+        let mut original = Mark::from_tool(
+            Control::Rectangle,
+            Point { x: 20.0, y: 20.0 },
+            0xff0000,
+            3.0,
+        )
+        .unwrap();
+        original.update(Point { x: 80.0, y: 60.0 });
+        let pivot = original.center();
+        let start = Point {
+            x: pivot.x,
+            y: pivot.y - 50.0,
+        };
+        let rotated = MarkGesture {
+            index: 0,
+            original: original.clone(),
+            start,
+            handle: None,
+            rotating: true,
+        }
+        .at(Point {
+            x: pivot.x + 50.0,
+            y: pivot.y,
+        });
+        assert!((rotated.angle - std::f32::consts::FRAC_PI_2).abs() < 0.001);
+        let before = rotated.handles()[2];
+        let corner = rotated.handles()[0];
+        let resized = MarkGesture {
+            index: 0,
+            original: rotated,
+            start: corner,
+            handle: Some(0),
+            rotating: false,
+        }
+        .at(corner.moved(10.0, -10.0));
+        let after = resized.handles()[2];
+        assert!((before.x - after.x).abs() < 0.01 && (before.y - after.y).abs() < 0.01);
+    }
     #[test]
     fn hover_eases_and_cleans_up_without_an_idle_timer() {
         let mut levels = vec![(Control::Fill, 0.0)];

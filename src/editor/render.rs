@@ -942,6 +942,37 @@ impl Renderer {
             .insert(key, bitmap.clone());
         Ok(bitmap)
     }
+    fn draw_mark(
+        &self,
+        mark: &Mark,
+        origin: Point,
+        scale: f32,
+        source: &Raster,
+        source_offset: Point,
+    ) -> Result<()> {
+        if mark.angle.abs() < 0.0001 || !mark.can_rotate() {
+            return self.mark(mark, origin, scale, source, source_offset);
+        }
+        let center = mark.center();
+        let (cx, cy) = (origin.x + center.x * scale, origin.y + center.y * scale);
+        let (s, c) = mark.angle.sin_cos();
+        let matrix = windows_numerics::Matrix3x2 {
+            M11: c,
+            M12: s,
+            M21: -s,
+            M22: c,
+            M31: cx - c * cx + s * cy,
+            M32: cy - s * cx - c * cy,
+        };
+        let mut previous = windows_numerics::Matrix3x2::default();
+        unsafe {
+            self.target.GetTransform(&mut previous);
+            self.target.SetTransform(&matrix)
+        };
+        let result = self.mark(mark, origin, scale, source, source_offset);
+        unsafe { self.target.SetTransform(&previous) };
+        result
+    }
     fn mark(
         &self,
         mark: &Mark,
@@ -1643,11 +1674,11 @@ impl Renderer {
                 }
                 for (index, mark) in document.marks.iter().enumerate() {
                     if editing_text != Some(index) {
-                        self.mark(mark, origin, scale, image, source_offset)?;
+                        self.draw_mark(mark, origin, scale, image, source_offset)?;
                     }
                 }
                 if let Some(mark) = pending {
-                    self.mark(mark, origin, scale, image, source_offset)?;
+                    self.draw_mark(mark, origin, scale, image, source_offset)?;
                 }
                 if let Some(mark) = crop_drag {
                     let (lo, hi) = mark.bounds();
@@ -1751,21 +1782,34 @@ impl Renderer {
                         }
                     }
                 }
+                unsafe {
+                    self.target.PopAxisAlignedClip();
+                }
                 if let Some(index) = document.selected
-                    && active_tool == Control::Move
+                    && editing_text != Some(index)
+                    && pending.is_none()
+                    && !crop_mode
                     && let Some(mark) = document.marks.get(index)
                 {
                     let (lo, hi) = mark.bounds();
-                    self.rounded_outline(
-                        Rect {
-                            x: origin.x + lo.x * scale - 4.0,
-                            y: origin.y + lo.y * scale - 4.0,
-                            w: ((hi.x - lo.x) * scale + 8.0).max(8.0),
-                            h: ((hi.y - lo.y) * scale + 8.0).max(8.0),
-                        },
-                        0x007aff,
-                        3.0,
-                    );
+                    let center = mark.center();
+                    let corners = [
+                        lo,
+                        Point { x: hi.x, y: lo.y },
+                        hi,
+                        Point { x: lo.x, y: hi.y },
+                        lo,
+                    ];
+                    for pair in corners.windows(2) {
+                        let a = document::rotate(pair[0], center, mark.angle);
+                        let b = document::rotate(pair[1], center, mark.angle);
+                        self.line(
+                            (origin.x + a.x * scale, origin.y + a.y * scale),
+                            (origin.x + b.x * scale, origin.y + b.y * scale),
+                            0xf3f5f8,
+                            1.2,
+                        );
+                    }
                     for (i, p) in mark.handles().into_iter().enumerate() {
                         let (x, y) = (origin.x + p.x * scale, origin.y + p.y * scale);
                         self.circle(x, y, 5.0, 0xffffff, true);
@@ -1773,17 +1817,32 @@ impl Renderer {
                             x,
                             y,
                             5.0,
-                            if i == 2 && matches!(mark.shape, Shape::Arrow(_, _, _)) {
+                            if i == 2 && matches!(mark.shape, Shape::Arrow(..)) {
                                 0xf92d3a
                             } else {
-                                0x007aff
+                                0x4c5662
                             },
                             false,
                         );
                     }
-                }
-                unsafe {
-                    self.target.PopAxisAlignedClip();
+                    if let Some(rotation) = mark.rotation_handle(scale) {
+                        let top = document::rotate(
+                            Point {
+                                x: (lo.x + hi.x) / 2.0,
+                                y: lo.y,
+                            },
+                            center,
+                            mark.angle,
+                        );
+                        let (ax, ay) = (origin.x + top.x * scale, origin.y + top.y * scale);
+                        let (rx, ry) =
+                            (origin.x + rotation.x * scale, origin.y + rotation.y * scale);
+                        self.line((ax, ay), (rx, ry + 13.0), 0xb4bdc8, 1.1);
+                        self.circle(rx, ry, 15.0, 0x1b1d23, true);
+                        self.circle(rx, ry, 7.0, 0xffffff, false);
+                        self.line((rx + 3.5, ry - 8.0), (rx + 8.5, ry - 8.0), 0xffffff, 1.8);
+                        self.line((rx + 8.5, ry - 8.0), (rx + 8.5, ry - 3.0), 0xffffff, 1.8);
+                    }
                 }
             }
             self.outline(r, crate::theme::border_rgb(dark), 1.0);

@@ -959,6 +959,37 @@ pub(super) unsafe extern "system" fn window_proc(
                     }
                     if s.layout.canvas.contains(p.0, p.1)
                         && let Some((point, scale)) = source_point(s, p)
+                        && let Some(index) = s.document.selected
+                        && let Some(mark) = s.document.marks.get(index)
+                    {
+                        let rotation = mark.rotation_handle(scale).is_some_and(|target| {
+                            (point.x - target.x).hypot(point.y - target.y) <= 16.0 / scale
+                        });
+                        let handle = mark.handles().iter().position(|target| {
+                            (point.x - target.x).hypot(point.y - target.y) <= 8.0 / scale
+                        });
+                        let local = document::rotate(point, mark.center(), -mark.angle);
+                        let (lo, hi) = mark.bounds();
+                        let within = local.x >= lo.x - 3.0 / scale
+                            && local.x <= hi.x + 3.0 / scale
+                            && local.y >= lo.y - 3.0 / scale
+                            && local.y <= hi.y + 3.0 / scale;
+                        if rotation || handle.is_some() || within {
+                            s.moving_mark = Some(MarkGesture {
+                                index,
+                                original: mark.clone(),
+                                start: point,
+                                handle,
+                                rotating: rotation,
+                            });
+                            let _ = SetFocus(Some(hwnd));
+                            SetCapture(hwnd);
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                            return LRESULT(0);
+                        }
+                    }
+                    if s.layout.canvas.contains(p.0, p.1)
+                        && let Some((point, scale)) = source_point(s, p)
                         && inside_source(s, point)
                     {
                         if s.active_tool == Control::Move {
@@ -986,6 +1017,7 @@ pub(super) unsafe extern "system" fn window_proc(
                                     original: s.document.marks[index].clone(),
                                     start: point,
                                     handle,
+                                    rotating: false,
                                 });
                                 SetCapture(hwnd);
                             }
@@ -1373,6 +1405,37 @@ pub(super) unsafe extern "system" fn window_proc(
                         .is_some();
                 let px = point.x as f32 * 96.0 / s.dpi as f32;
                 let py = point.y as f32 * 96.0 / s.dpi as f32;
+                let edit_cursor = s.document.selected.and_then(|index| {
+                    let mark = s.document.marks.get(index)?;
+                    let (p, scale) = source_point(s, (px, py))?;
+                    if mark
+                        .rotation_handle(scale)
+                        .is_some_and(|h| (p.x - h.x).hypot(p.y - h.y) <= 16.0 / scale)
+                    {
+                        return Some(IDC_CROSS);
+                    }
+                    if let Some(handle) = mark
+                        .handles()
+                        .iter()
+                        .find(|h| (p.x - h.x).hypot(p.y - h.y) <= 8.0 / scale)
+                    {
+                        let c = mark.center();
+                        let (dx, dy) = (handle.x - c.x, handle.y - c.y);
+                        return Some(if dx.abs() < 4.0 / scale {
+                            IDC_SIZENS
+                        } else if dy.abs() < 4.0 / scale {
+                            IDC_SIZEWE
+                        } else if dx * dy >= 0.0 {
+                            IDC_SIZENWSE
+                        } else {
+                            IDC_SIZENESW
+                        });
+                    }
+                    let p = document::rotate(p, mark.center(), -mark.angle);
+                    let (lo, hi) = mark.bounds();
+                    (p.x >= lo.x && p.x <= hi.x && p.y >= lo.y && p.y <= hi.y)
+                        .then_some(IDC_SIZEALL)
+                });
                 let cursor = if s.picker.open
                     && color_picker::hit(&s.layout, px, py) == Some(color_picker::Region::Hex)
                 {
@@ -1405,6 +1468,8 @@ pub(super) unsafe extern "system" fn window_proc(
                         Some((0, 0)) => IDC_SIZEALL,
                         _ => IDC_ARROW,
                     }
+                } else if let Some(edit_cursor) = edit_cursor {
+                    edit_cursor
                 } else if s.hover.is_some_and(|c| {
                     c.enabled()
                         && (s.ready()
@@ -1454,6 +1519,7 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
                     color: 0,
                     width: 1.0,
                     opacity: 1.0,
+                    angle: 0.0,
                 });
                 state.crop_mode = true;
                 state.view.zoom = Zoom::Fit;

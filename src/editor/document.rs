@@ -43,6 +43,15 @@ pub struct Mark {
     pub color: u32,
     pub width: f32,
     pub opacity: f32,
+    pub angle: f32,
+}
+pub fn rotate(point: Point, center: Point, angle: f32) -> Point {
+    let (s, c) = angle.sin_cos();
+    let (x, y) = (point.x - center.x, point.y - center.y);
+    Point {
+        x: center.x + x * c - y * s,
+        y: center.y + x * s + y * c,
+    }
 }
 impl Mark {
     pub fn from_tool(tool: Control, start: Point, color: u32, width: f32) -> Option<Self> {
@@ -70,6 +79,7 @@ impl Mark {
             } else {
                 1.0
             },
+            angle: 0.0,
         })
     }
     pub fn update(&mut self, point: Point) {
@@ -257,7 +267,7 @@ impl Mark {
     }
     pub fn handles(&self) -> Vec<Point> {
         match &self.shape {
-            Shape::Counter(..) | Shape::Text(..) | Shape::Crop(..) => Vec::new(),
+            Shape::Crop(..) => Vec::new(),
             Shape::Line(a, b) => vec![*a, *b],
             Shape::Arrow(a, b, c) => vec![*a, *b, *c],
             _ => {
@@ -270,12 +280,85 @@ impl Mark {
                 ]
             }
         }
+        .into_iter()
+        .map(|point| rotate(point, self.center(), self.angle))
+        .collect()
+    }
+    pub fn center(&self) -> Point {
+        let (lo, hi) = self.bounds();
+        Point {
+            x: (lo.x + hi.x) / 2.0,
+            y: (lo.y + hi.y) / 2.0,
+        }
+    }
+    pub fn can_rotate(&self) -> bool {
+        !matches!(
+            self.shape,
+            Shape::Crop(..) | Shape::Mosaic(..) | Shape::Spotlight(..) | Shape::Highlighter(..)
+        )
+    }
+    pub fn rotation_handle(&self, scale: f32) -> Option<Point> {
+        if !self.can_rotate() {
+            return None;
+        }
+        let (lo, hi) = self.bounds();
+        Some(rotate(
+            Point {
+                x: (lo.x + hi.x) / 2.0,
+                y: lo.y - 36.0 / scale.max(0.05),
+            },
+            self.center(),
+            self.angle,
+        ))
     }
     /// Resize relative to the original mark, not the previous mouse move.
     pub fn resize_handle(&mut self, handle: usize, point: Point) {
         let (old_lo, old_hi) = self.bounds();
         match &mut self.shape {
-            Shape::Counter(center, _) | Shape::Text(center, _) => *center = point,
+            Shape::Counter(center, _) => {
+                let opposite = [
+                    old_hi,
+                    Point {
+                        x: old_lo.x,
+                        y: old_hi.y,
+                    },
+                    old_lo,
+                    Point {
+                        x: old_hi.x,
+                        y: old_lo.y,
+                    },
+                ][handle.min(3)];
+                let radius = (point.x - opposite.x)
+                    .abs()
+                    .max((point.y - opposite.y).abs())
+                    / 2.0;
+                self.width = ((radius - 14.0) * 2.0 + 3.0).clamp(3.0, 72.0);
+                *center = Point {
+                    x: (point.x + opposite.x) / 2.0,
+                    y: (point.y + opposite.y) / 2.0,
+                };
+            }
+            Shape::Text(anchor, text) => {
+                let opposite = [
+                    old_hi,
+                    Point {
+                        x: old_lo.x,
+                        y: old_hi.y,
+                    },
+                    old_lo,
+                    Point {
+                        x: old_hi.x,
+                        y: old_lo.y,
+                    },
+                ][handle.min(3)];
+                let lines = text.lines().count().max(1) as f32;
+                self.width =
+                    (((point.y - opposite.y).abs() - 6.0) / (lines * 1.35)).clamp(8.0, 72.0);
+                *anchor = Point {
+                    x: point.x.min(opposite.x),
+                    y: point.y.min(opposite.y),
+                };
+            }
             Shape::Line(a, b) => {
                 if handle == 0 {
                     *a = point;
@@ -348,6 +431,7 @@ impl Mark {
         }
     }
     pub fn contains(&self, p: Point, tolerance: f32) -> bool {
+        let p = rotate(p, self.center(), -self.angle);
         let (lo, hi) = self.bounds();
         let r = self.width / 2.0 + tolerance;
         if p.x < lo.x - r || p.x > hi.x + r || p.y < lo.y - r || p.y > hi.y + r {
@@ -732,6 +816,9 @@ fn paint_segment(image: &mut Raster, a: Point, b: Point, width: f32, color: u32,
     }
 }
 fn paint_mark(image: &mut Raster, source: &Raster, mark: &Mark, offset: Point) -> Result<()> {
+    if mark.angle.abs() > 0.0001 && mark.can_rotate() {
+        return paint_rotated(image, source, mark, offset);
+    }
     match &mark.shape {
         Shape::Pencil(points) => {
             for pair in points.windows(2) {
@@ -949,6 +1036,110 @@ fn paint_mark(image: &mut Raster, source: &Raster, mark: &Mark, offset: Point) -
     }
     Ok(())
 }
+fn paint_rotated(image: &mut Raster, source: &Raster, mark: &Mark, offset: Point) -> Result<()> {
+    let (lo, hi) = mark.bounds();
+    let padding = mark.width.max(20.0).ceil() + 4.0;
+    let origin = Point {
+        x: (lo.x + offset.x - padding).floor(),
+        y: (lo.y + offset.y - padding).floor(),
+    };
+    let end = Point {
+        x: (hi.x + offset.x + padding).ceil(),
+        y: (hi.y + offset.y + padding).ceil(),
+    };
+    let (w, h) = ((end.x - origin.x) as u32, (end.y - origin.y) as u32);
+    ensure!(
+        w > 0 && h > 0 && u64::from(w) * u64::from(h) <= 64 * 1024 * 1024,
+        "Rotated annotation exceeds the image budget"
+    );
+    let mut tile = Raster {
+        width: w,
+        height: h,
+        pixels: vec![0; w as usize * h as usize * 4],
+    };
+    let mut unrotated = mark.clone();
+    unrotated.angle = 0.0;
+    paint_mark(
+        &mut tile,
+        source,
+        &unrotated,
+        Point {
+            x: offset.x - origin.x,
+            y: offset.y - origin.y,
+        },
+    )?;
+    let center = mark.center().moved(offset.x, offset.y);
+    let corners = [
+        origin,
+        Point {
+            x: end.x,
+            y: origin.y,
+        },
+        end,
+        Point {
+            x: origin.x,
+            y: end.y,
+        },
+    ];
+    let mut bounds = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for corner in corners {
+        let p = rotate(corner, center, mark.angle);
+        bounds.0 = bounds.0.min(p.x);
+        bounds.1 = bounds.1.min(p.y);
+        bounds.2 = bounds.2.max(p.x);
+        bounds.3 = bounds.3.max(p.y);
+    }
+    let (x0, y0) = (
+        (bounds.0.floor().max(0.0) as u32),
+        (bounds.1.floor().max(0.0) as u32),
+    );
+    let (x1, y1) = (
+        (bounds.2.ceil().min(image.width as f32) as u32),
+        (bounds.3.ceil().min(image.height as f32) as u32),
+    );
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let p = rotate(
+                Point {
+                    x: x as f32 + 0.5,
+                    y: y as f32 + 0.5,
+                },
+                center,
+                -mark.angle,
+            );
+            let (sx, sy) = (p.x - origin.x - 0.5, p.y - origin.y - 0.5);
+            let (ix, iy) = (sx.floor() as i32, sy.floor() as i32);
+            let (fx, fy) = (sx - ix as f32, sy - iy as f32);
+            let (mut alpha, mut b, mut g, mut r) = (0.0, 0.0, 0.0, 0.0);
+            for (dy, wy) in [(0, 1.0 - fy), (1, fy)] {
+                for (dx, wx) in [(0, 1.0 - fx), (1, fx)] {
+                    let (px, py) = (ix + dx, iy + dy);
+                    if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+                        continue;
+                    }
+                    let i = ((py as u32 * w + px as u32) * 4) as usize;
+                    let weight = wx * wy * tile.pixels[i + 3] as f32 / 255.0;
+                    alpha += weight;
+                    b += weight * tile.pixels[i] as f32;
+                    g += weight * tile.pixels[i + 1] as f32;
+                    r += weight * tile.pixels[i + 2] as f32;
+                }
+            }
+            if alpha > 0.0 {
+                let rgb = ((r / alpha).round() as u32).min(255) << 16
+                    | ((g / alpha).round() as u32).min(255) << 8
+                    | ((b / alpha).round() as u32).min(255);
+                blend(
+                    &mut image.pixels,
+                    ((y * image.width + x) * 4) as usize,
+                    rgb,
+                    alpha.clamp(0.0, 1.0),
+                );
+            }
+        }
+    }
+    Ok(())
+}
 /// Flatten only on output; preview objects remain editable and the capture stays untouched.
 pub fn flatten(base: &Raster, marks: &[Mark], offset: Point) -> Result<Raster> {
     ensure!(
@@ -1030,6 +1221,72 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn rotated_rectangle_exports_without_baking_or_changing_the_original() -> Result<()> {
+        let base = Raster {
+            width: 64,
+            height: 64,
+            pixels: [255, 0, 0, 255].repeat(64 * 64),
+        };
+        let mut mark = Mark::from_tool(
+            Control::Rectangle,
+            Point { x: 20.0, y: 20.0 },
+            0xff0000,
+            2.0,
+        )
+        .unwrap();
+        mark.update(Point { x: 40.0, y: 30.0 });
+        mark.angle = std::f32::consts::FRAC_PI_2;
+        assert!(mark.contains(Point { x: 35.0, y: 25.0 }, 1.0));
+        let output = flatten(&base, &[mark], Point::default())?;
+        let at = |x: usize, y: usize| &output.pixels[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        assert!(
+            at(35, 25)[2] > 200,
+            "Rotated edge must render at its new position"
+        );
+        assert_eq!(
+            at(30, 20),
+            [255, 0, 0, 255],
+            "Unrotated edge must not remain baked in"
+        );
+        assert_eq!(
+            &base.pixels[(25 * 64 + 35) * 4..(25 * 64 + 35) * 4 + 4],
+            &[255, 0, 0, 255]
+        );
+        Ok(())
+    }
+    #[test]
+    fn rotated_imported_image_keeps_alpha_on_export() -> Result<()> {
+        let base = Raster {
+            width: 20,
+            height: 20,
+            pixels: [0, 255, 0, 255].repeat(400),
+        };
+        let imported = Arc::new(Raster {
+            width: 2,
+            height: 2,
+            pixels: [0, 0, 255, 128].repeat(4),
+        });
+        let mark = Mark {
+            shape: Shape::Image(
+                Point { x: 4.0, y: 6.0 },
+                Point { x: 12.0, y: 10.0 },
+                imported,
+            ),
+            color: 0,
+            width: 1.0,
+            opacity: 1.0,
+            angle: std::f32::consts::FRAC_PI_2,
+        };
+        let result = flatten(&base, &[mark], Point::default())?;
+        let pixel = &result.pixels[(8 * 20 + 8) * 4..(8 * 20 + 8) * 4 + 4];
+        assert!((125..=130).contains(&pixel[2]) && (125..=130).contains(&pixel[1]));
+        assert_eq!(
+            &base.pixels[(8 * 20 + 8) * 4..(8 * 20 + 8) * 4 + 4],
+            &[0, 255, 0, 255]
+        );
+        Ok(())
+    }
+    #[test]
     fn imported_image_alpha_resizes_and_remains_editable() -> Result<()> {
         let base = Raster {
             width: 10,
@@ -1047,6 +1304,7 @@ mod tests {
             color: 0,
             width: 1.0,
             opacity: 1.0,
+            angle: 0.0,
         })?;
         assert_eq!(document.asset_bytes(), 16);
         let result = flatten(&base, &document.marks, Point::default())?;

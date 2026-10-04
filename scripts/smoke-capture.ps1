@@ -18,10 +18,11 @@ param(
     [switch]$MosaicOnly,
     [switch]$TextOnly,
     [switch]$CropOnly,
-    [switch]$ImageOnly
+    [switch]$ImageOnly,
+    [switch]$EditableOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -1249,6 +1250,55 @@ function Test-Image {
     if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Import modified source PNG.'}
     Write-Host 'PASS: native Add Image dialog, transparent imported PNG in full-resolution output, source unchanged'
 }
+function Test-Editable {
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $preview=New-TestPreview
+    $hash=(Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $preview.Window 'Annotate'
+    $editor=Wait-Editor
+    $bounds=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $sx=[int]($bounds.Left+($bounds.Right-$bounds.Left-350*$s)/2)
+    $sy=[int]($bounds.Top+48*$s+($bounds.Bottom-$bounds.Top-96*$s-200*$s)/2)
+    Click-EditorAction $editor 'Rectangle'
+    Click-EditorAction $editor 'Color'
+    $origin=Editor-ToolOrigin $editor
+    [CaptureInput]::ClickAt([int]($bounds.Left+($origin+381)*$s),[int]($bounds.Top+102*$s))
+    [CaptureInput]::HoldAt([int]($sx+40*$s),[int]($sy+145*$s))
+    [CaptureInput]::MouseAt([int]($sx+120*$s),[int]($sy+185*$s),0)
+    [CaptureInput]::DropAt([int]($sx+120*$s),[int]($sy+185*$s))
+    Start-Sleep -Milliseconds 160
+    Save-GalleryScreenshot 'editor-editable-after-placement.png'
+    $screen=[Drawing.Bitmap]::new('.pi/capture-smoke/editor-editable-after-placement.png')
+    try{$p=$screen.GetPixel([int]($sx+40*$s),[int]($sy+145*$s));if($p.R -lt 225 -or $p.G -lt 225 -or $p.B -lt 225){throw "New shape has no edit handle: $p"}}finally{$screen.Dispose()}
+    [CaptureInput]::HoldAt([int]($sx+80*$s),[int]($sy+165*$s))
+    [CaptureInput]::MouseAt([int]($sx+100*$s),[int]($sy+145*$s),0)
+    [CaptureInput]::DropAt([int]($sx+100*$s),[int]($sy+145*$s))
+    [CaptureInput]::HoldAt([int]($sx+140*$s),[int]($sy+165*$s))
+    [CaptureInput]::MouseAt([int]($sx+160*$s),[int]($sy+175*$s),0)
+    [CaptureInput]::DropAt([int]($sx+160*$s),[int]($sy+175*$s))
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$resized=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($resized)
+    try{$p=$image.GetPixel(160,155);if($p.R -lt 210 -or $p.B -gt 110){throw "Shape did not resize directly in drawing mode: $p"}}finally{$image.Dispose()}
+    [CaptureInput]::HoldAt([int]($sx+110*$s),[int]($sy+89*$s))
+    [CaptureInput]::MouseAt([int]($sx+171*$s),[int]($sy+150*$s),0)
+    [CaptureInput]::DropAt([int]($sx+171*$s),[int]($sy+150*$s))
+    Start-Sleep -Milliseconds 120
+    Save-GalleryScreenshot 'editor-editable-rotated.png'
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$rotated=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($rotated)
+    try{
+        $edge=$image.GetPixel(135,150);$ghost=$image.GetPixel(60,145)
+        if($edge.R -lt 190 -or $edge.B -gt 150){throw "Rotated rectangle did not export its new edge: $edge"}
+        if($ghost.B -lt 180 -or $ghost.R -gt 100){throw "Old edge remained after rotation: $ghost"}
+    }finally{$image.Dispose()}
+    [CaptureInput]::Chord(0x5a,[ushort[]]@(0x11))
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$undone=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($undone)
+    try{$p=$image.GetPixel(160,155);if($p.R -lt 210 -or $p.B -gt 110){throw 'Undo did not restore the unrotated rectangle.'}}finally{$image.Dispose()}
+    if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Editing changed source PNG.'}
+    Write-Host 'PASS: new shape stays selected, direct move/resize/rotation, undo and unchanged source'
+}
 function Test-Crop {
     Close-AllPreviews;Set-AutoClose 'Never' 'never'
     $preview=New-TestPreview
@@ -2212,6 +2262,7 @@ try {
     elseif ($TextOnly) { Test-Text }
     elseif ($CropOnly) { Test-Crop }
     elseif ($ImageOnly) { Test-Image }
+    elseif ($EditableOnly) { Test-Editable }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }
