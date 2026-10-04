@@ -149,10 +149,6 @@ struct WindowState {
     selected_color: usize,
     custom_color: u32,
     active_tool: Control,
-    shape_tool: Control,
-    shape_open: bool,
-    shape_popup: Option<layout::ShapePopup>,
-    shape_fill: Option<u32>,
     pill_center: f32,
     pill_motion: Option<PillMotion>,
     stroke_width: f32,
@@ -223,7 +219,7 @@ impl WindowState {
                     (position, velocity)
                 });
         self.active_tool = control;
-        if let Some(r) = self.layout.rect(control.strip_control()) {
+        if let Some(r) = self.layout.rect(control) {
             let to = r.x + r.w / 2.0;
             self.pill_center = from;
             let min = self
@@ -455,10 +451,6 @@ impl Editor {
             selected_color: 4,
             custom_color: 0x006dfd,
             active_tool: Control::Move,
-            shape_tool: Control::Rectangle,
-            shape_open: false,
-            shape_popup: None,
-            shape_fill: None,
             pill_center: 0.0,
             pill_motion: None,
             stroke_width: 3.0,
@@ -735,7 +727,6 @@ impl Editor {
                 overlay,
             ),
             color: 0xffffff,
-            fill: None,
             width: 1.0,
             opacity: 1.0,
         })?;
@@ -1098,7 +1089,7 @@ fn resize_state(hwnd: HWND, state: &mut WindowState, width: u32, height: u32) ->
     state.pill_motion = None;
     state.pill_center = state
         .layout
-        .rect(state.active_tool.strip_control())
+        .rect(state.active_tool)
         .map_or(0.0, |r| r.x + r.w / 2.0);
     if state.background.open {
         state.background.scroll_y = state

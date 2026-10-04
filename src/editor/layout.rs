@@ -36,7 +36,6 @@ pub enum Control {
     AddImage,
     Background,
     Move,
-    Shape,
     Rectangle,
     Fill,
     Ellipse,
@@ -68,7 +67,6 @@ impl Control {
         matches!(
             self,
             Self::Move
-                | Self::Shape
                 | Self::Rectangle
                 | Self::Fill
                 | Self::Ellipse
@@ -82,23 +80,12 @@ impl Control {
                 | Self::Highlighter
         )
     }
-    pub fn strip_control(self) -> Self {
-        if matches!(
-            self,
-            Self::Rectangle | Self::Fill | Self::Ellipse | Self::Line | Self::Arrow
-        ) {
-            Self::Shape
-        } else {
-            self
-        }
-    }
     pub fn enabled(self) -> bool {
         matches!(
             self,
             Self::Crop
                 | Self::AddImage
                 | Self::Move
-                | Self::Shape
                 | Self::Rectangle
                 | Self::Fill
                 | Self::Ellipse
@@ -123,11 +110,12 @@ impl Control {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Crop => "Crop - drag handles, then Apply or Cancel",
+            Self::Crop => {
+                "Crop - drag to crop without changing source; click again to undo the last crop"
+            }
             Self::AddImage => "Add PNG/JPEG/BMP image as an editable overlay",
             Self::Background => "Background",
             Self::Move => "Move / pan (hold middle mouse button)",
-            Self::Shape => "Shapes - choose a shape, fill and outline below",
             Self::Rectangle => "Rectangle",
             Self::Fill => "Filled rectangle",
             Self::Ellipse => "Ellipse",
@@ -161,92 +149,6 @@ impl Control {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ShapePopup {
-    Fill,
-    Outline,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ShapeAction {
-    Tool(Control),
-    Fill,
-    Outline,
-    NoFill,
-    FillColor(usize),
-    Color(usize),
-}
-
-pub fn shape_bar(canvas: Rect) -> Rect {
-    Rect {
-        x: canvas.x + (canvas.w - 428.0) / 2.0,
-        y: canvas.y + 7.0,
-        w: 428.0,
-        h: 48.0,
-    }
-}
-pub fn shape_target(canvas: Rect, action: ShapeAction) -> Rect {
-    let bar = shape_bar(canvas);
-    let (x, w, y, h) = match action {
-        ShapeAction::Tool(Control::Rectangle) => (52.0, 36.0, 3.0, 42.0),
-        ShapeAction::Tool(Control::Ellipse) => (92.0, 36.0, 3.0, 42.0),
-        ShapeAction::Tool(Control::Line) => (132.0, 36.0, 3.0, 42.0),
-        ShapeAction::Tool(Control::Arrow) => (172.0, 36.0, 3.0, 42.0),
-        ShapeAction::Fill => (222.0, 88.0, 3.0, 42.0),
-        ShapeAction::Outline => (316.0, 108.0, 3.0, 42.0),
-        ShapeAction::NoFill => (222.0, 118.0, 52.0, 32.0),
-        ShapeAction::FillColor(i) => (
-            228.0 + (i % 5) as f32 * 21.0,
-            19.0,
-            86.0 + (i / 5) as f32 * 22.0,
-            20.0,
-        ),
-        ShapeAction::Color(i) => (
-            316.0 + (i % 5) as f32 * 21.0,
-            19.0,
-            54.0 + (i / 5) as f32 * 24.0,
-            20.0,
-        ),
-        ShapeAction::Tool(_) => (0.0, 0.0, 0.0, 0.0),
-    };
-    Rect {
-        x: bar.x + x,
-        y: bar.y + y,
-        w,
-        h,
-    }
-}
-pub fn shape_hit(canvas: Rect, p: (f32, f32), popup: Option<ShapePopup>) -> Option<ShapeAction> {
-    if popup == Some(ShapePopup::Fill) {
-        if shape_target(canvas, ShapeAction::NoFill).contains(p.0, p.1) {
-            return Some(ShapeAction::NoFill);
-        }
-        for i in 0..PRESET_COLORS.len() {
-            let action = ShapeAction::FillColor(i);
-            if shape_target(canvas, action).contains(p.0, p.1) {
-                return Some(action);
-            }
-        }
-    }
-    if popup == Some(ShapePopup::Outline) {
-        for i in 0..PRESET_COLORS.len() {
-            let action = ShapeAction::Color(i);
-            if shape_target(canvas, action).contains(p.0, p.1) {
-                return Some(action);
-            }
-        }
-    }
-    [
-        ShapeAction::Tool(Control::Rectangle),
-        ShapeAction::Tool(Control::Ellipse),
-        ShapeAction::Tool(Control::Line),
-        ShapeAction::Tool(Control::Arrow),
-        ShapeAction::Fill,
-        ShapeAction::Outline,
-    ]
-    .into_iter()
-    .find(|action| shape_target(canvas, *action).contains(p.0, p.1))
-}
-
 pub const TOP: f32 = 48.0;
 pub const BOTTOM: f32 = 48.0;
 pub const MIN_WIDTH: f32 = 760.0;
@@ -264,8 +166,10 @@ pub struct Layout {
 }
 impl Layout {
     fn tool_origin(width: f32) -> f32 {
-        // Center the compact drawing strip together with its properties.
-        let span = if width >= 870.0 { 368.0 } else { 232.0 };
+        // Center the drawing strip together with its contextual properties,
+        // as seen in markup.mp4. Reserve utilities at left and Save/window
+        // controls at right. Narrow windows omit the properties instead.
+        let span = if width >= 870.0 { 484.0 } else { 348.0 };
         ((width - span) / 2.0).max(132.0).min(width - 242.0 - span)
     }
     pub fn tool_strip_rect(&self) -> Option<Rect> {
@@ -297,7 +201,11 @@ impl Layout {
         }
         for (i, control) in [
             Control::Move,
-            Control::Shape,
+            Control::Rectangle,
+            Control::Fill,
+            Control::Ellipse,
+            Control::Line,
+            Control::Arrow,
             Control::Text,
             Control::Pixelate,
             Control::Spotlight,
@@ -325,7 +233,7 @@ impl Layout {
             controls.push((
                 control,
                 Rect {
-                    x: tool_origin + 246.0 + i as f32 * 42.0,
+                    x: tool_origin + 362.0 + i as f32 * 42.0,
                     y: 8.0,
                     w: 38.0,
                     h: 32.0,

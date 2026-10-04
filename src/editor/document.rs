@@ -41,7 +41,6 @@ pub enum Shape {
 pub struct Mark {
     pub shape: Shape,
     pub color: u32,
-    pub fill: Option<u32>,
     pub width: f32,
     pub opacity: f32,
 }
@@ -65,7 +64,6 @@ impl Mark {
         Some(Self {
             shape,
             color,
-            fill: None,
             width,
             opacity: if tool == Control::Highlighter {
                 0.35
@@ -896,14 +894,10 @@ fn paint_mark(image: &mut Raster, source: &Raster, mark: &Mark, offset: Point) -
                 x: a.x.max(b.x),
                 y: a.y.max(b.y),
             };
-            let fill = mark.fill.or_else(|| {
-                matches!(
-                    mark.shape,
-                    Shape::FilledRectangle(..) | Shape::Highlighter(..)
-                )
-                .then_some(mark.color)
-            });
-            if let Some(fill) = fill {
+            if matches!(
+                mark.shape,
+                Shape::FilledRectangle(_, _) | Shape::Highlighter(_, _)
+            ) {
                 let (x0, x1) = (
                     ((lo.x + offset.x).floor() as i32).max(0),
                     ((hi.x + offset.x).ceil() as i32).min(image.width as i32),
@@ -917,13 +911,12 @@ fn paint_mark(image: &mut Raster, source: &Raster, mark: &Mark, offset: Point) -
                         blend(
                             &mut image.pixels,
                             ((y as u32 * image.width + x as u32) * 4) as usize,
-                            fill,
+                            mark.color,
                             mark.opacity,
                         );
                     }
                 }
-            }
-            if matches!(mark.shape, Shape::Rectangle(..)) {
+            } else {
                 let p = [
                     lo,
                     Point { x: hi.x, y: lo.y },
@@ -941,29 +934,6 @@ fn paint_mark(image: &mut Raster, source: &Raster, mark: &Mark, offset: Point) -
             let cy = (a.y + b.y) / 2.0;
             let rx = (a.x - b.x).abs() / 2.0;
             let ry = (a.y - b.y).abs() / 2.0;
-            if let Some(fill) = mark.fill
-                && rx >= 1.0
-                && ry >= 1.0
-            {
-                let x0 = (cx - rx + offset.x).floor().max(0.0) as u32;
-                let x1 = (cx + rx + offset.x).ceil().min(image.width as f32) as u32;
-                let y0 = (cy - ry + offset.y).floor().max(0.0) as u32;
-                let y1 = (cy + ry + offset.y).ceil().min(image.height as f32) as u32;
-                for y in y0..y1 {
-                    for x in x0..x1 {
-                        let dx = (x as f32 + 0.5 - offset.x - cx) / rx;
-                        let dy = (y as f32 + 0.5 - offset.y - cy) / ry;
-                        if dx * dx + dy * dy <= 1.0 {
-                            blend(
-                                &mut image.pixels,
-                                ((y * image.width + x) * 4) as usize,
-                                fill,
-                                mark.opacity,
-                            );
-                        }
-                    }
-                }
-            }
             let steps = ((rx + ry) * 2.0).clamp(24.0, 720.0) as usize;
             let mut prev = Point { x: cx + rx, y: cy };
             for i in 1..=steps {
@@ -1060,34 +1030,6 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn shape_fill_and_outline_are_independent_and_keep_source() -> Result<()> {
-        let source = Raster {
-            width: 60,
-            height: 60,
-            pixels: [0, 0, 255, 255].repeat(3600),
-        };
-        let mut rectangle = Mark::from_tool(
-            Control::Rectangle,
-            Point { x: 10.0, y: 10.0 },
-            0x000000,
-            3.0,
-        )
-        .unwrap();
-        rectangle.update(Point { x: 40.0, y: 40.0 });
-        rectangle.fill = Some(0xffde00);
-        let mut oval =
-            Mark::from_tool(Control::Ellipse, Point { x: 5.0, y: 43.0 }, 0x000000, 2.0).unwrap();
-        oval.update(Point { x: 35.0, y: 59.0 });
-        oval.fill = Some(0x00ff00);
-        let output = flatten(&source, &[rectangle, oval], Point::default())?;
-        let pixel = |x: usize, y: usize| &output.pixels[(y * 60 + x) * 4..(y * 60 + x) * 4 + 4];
-        assert_eq!(pixel(20, 20), [0, 222, 255, 255]);
-        assert_eq!(pixel(10, 20), [0, 0, 0, 255]);
-        assert_eq!(pixel(20, 51), [0, 255, 0, 255]);
-        assert_eq!(source.pixels[0..4], [0, 0, 255, 255]);
-        Ok(())
-    }
-    #[test]
     fn imported_image_alpha_resizes_and_remains_editable() -> Result<()> {
         let base = Raster {
             width: 10,
@@ -1103,7 +1045,6 @@ mod tests {
         document.add(Mark {
             shape: Shape::Image(Point { x: 2.0, y: 2.0 }, Point { x: 6.0, y: 6.0 }, imported),
             color: 0,
-            fill: None,
             width: 1.0,
             opacity: 1.0,
         })?;

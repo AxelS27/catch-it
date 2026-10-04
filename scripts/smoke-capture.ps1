@@ -18,11 +18,10 @@ param(
     [switch]$MosaicOnly,
     [switch]$TextOnly,
     [switch]$CropOnly,
-    [switch]$ImageOnly,
-    [switch]$ShapeOnly
+    [switch]$ImageOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $ShapeOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -956,14 +955,12 @@ function Wait-Editor([bool]$Visible=$true) {
 function Editor-ToolOrigin([IntPtr]$Window) {
     $r=[CaptureInput]::ClientBounds($Window);$s=[CaptureInput]::GetDpiForWindow($Window)/96.0
     $width=($r.Right-$r.Left)/$s
-    $span=if($width -ge 870){368.0}else{232.0}
+    $span=if($width -ge 870){484.0}else{348.0}
     return [Math]::Min([Math]::Max(($width-$span)/2,132.0),$width-242.0-$span)
 }
 function Click-EditorAction([IntPtr]$Window,[string]$Action) {
     $r=[CaptureInput]::ClientBounds($Window);$s=[CaptureInput]::GetDpiForWindow($Window)/96.0
     $origin=Editor-ToolOrigin $Window
-    if($script:shapeWindow -ne $Window){$script:shapeWindow=$Window;$script:shapeMenuOpen=$false}
-    if($Action -in @('Rectangle','Ellipse','Line','Arrow') -and -not $script:shapeMenuOpen){Click-EditorAction $Window 'Shape'}
     switch($Action){
         'Save' {$x=$r.Right-186*$s;$y=$r.Top+24*$s}
         'Minimize' {$x=$r.Right-105*$s;$y=$r.Top+24*$s}
@@ -975,24 +972,22 @@ function Click-EditorAction([IntPtr]$Window,[string]$Action) {
         'Crop' {$x=$r.Left+28*$s;$y=$r.Top+24*$s}
         'AddImage' {$x=$r.Left+66*$s;$y=$r.Top+24*$s}
         'Move' {$x=$r.Left+($origin+14)*$s;$y=$r.Top+24*$s}
-        'Shape' {$x=$r.Left+($origin+43)*$s;$y=$r.Top+24*$s}
-        'Rectangle' {$x=$r.Left+(($r.Right-$r.Left)/$s-428)/2*$s+70*$s;$y=$r.Top+79*$s}
-        'Ellipse' {$x=$r.Left+(($r.Right-$r.Left)/$s-428)/2*$s+110*$s;$y=$r.Top+79*$s}
-        'Line' {$x=$r.Left+(($r.Right-$r.Left)/$s-428)/2*$s+150*$s;$y=$r.Top+79*$s}
-        'Arrow' {$x=$r.Left+(($r.Right-$r.Left)/$s-428)/2*$s+190*$s;$y=$r.Top+79*$s}
-        'Text' {$x=$r.Left+($origin+72)*$s;$y=$r.Top+24*$s}
-        'Pixelate' {$x=$r.Left+($origin+101)*$s;$y=$r.Top+24*$s}
-        'Spotlight' {$x=$r.Left+($origin+130)*$s;$y=$r.Top+24*$s}
-        'Counter' {$x=$r.Left+($origin+159)*$s;$y=$r.Top+24*$s}
-        'Pencil' {$x=$r.Left+($origin+188)*$s;$y=$r.Top+24*$s}
-        'Highlighter' {$x=$r.Left+($origin+217)*$s;$y=$r.Top+24*$s}
-        'Stroke' {$x=$r.Left+($origin+307)*$s;$y=$r.Top+24*$s}
-        'Color' {$x=$r.Left+($origin+265)*$s;$y=$r.Top+24*$s}
+        'Rectangle' {$x=$r.Left+($origin+43)*$s;$y=$r.Top+24*$s}
+        'Fill' {$x=$r.Left+($origin+72)*$s;$y=$r.Top+24*$s}
+        'Ellipse' {$x=$r.Left+($origin+101)*$s;$y=$r.Top+24*$s}
+        'Line' {$x=$r.Left+($origin+130)*$s;$y=$r.Top+24*$s}
+        'Arrow' {$x=$r.Left+($origin+159)*$s;$y=$r.Top+24*$s}
+        'Text' {$x=$r.Left+($origin+188)*$s;$y=$r.Top+24*$s}
+        'Pixelate' {$x=$r.Left+($origin+217)*$s;$y=$r.Top+24*$s}
+        'Spotlight' {$x=$r.Left+($origin+246)*$s;$y=$r.Top+24*$s}
+        'Counter' {$x=$r.Left+($origin+275)*$s;$y=$r.Top+24*$s}
+        'Pencil' {$x=$r.Left+($origin+304)*$s;$y=$r.Top+24*$s}
+        'Highlighter' {$x=$r.Left+($origin+333)*$s;$y=$r.Top+24*$s}
+        'Stroke' {$x=$r.Left+($origin+423)*$s;$y=$r.Top+24*$s}
+        'Color' {$x=$r.Left+($origin+381)*$s;$y=$r.Top+24*$s}
         default {throw 'Unknown editor action'}
     }
     [CaptureInput]::ClickAt([int]$x,[int]$y)
-    if($Action -eq 'Shape'){$script:shapeMenuOpen = -not $script:shapeMenuOpen}
-    elseif($Action -notin @('Rectangle','Ellipse','Line','Arrow')){$script:shapeMenuOpen=$false}
 }
 function Assert-EditorPixels([IntPtr]$Window,[string]$Source,[double]$Zoom=1.0) {
     $r=[CaptureInput]::ClientBounds($Window);$s=[CaptureInput]::GetDpiForWindow($Window)/96.0
@@ -1254,47 +1249,6 @@ function Test-Image {
     if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Import modified source PNG.'}
     Write-Host 'PASS: native Add Image dialog, transparent imported PNG in full-resolution output, source unchanged'
 }
-function Test-Shape {
-    Close-AllPreviews;Set-AutoClose 'Never' 'never'
-    $preview=New-TestPreview
-    $hash=(Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash
-    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
-    Click-PreviewAction $preview.Window 'Annotate'
-    $editor=Wait-Editor
-    $bounds=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
-    $sx=[int]($bounds.Left+($bounds.Right-$bounds.Left-350*$s)/2)
-    $sy=[int]($bounds.Top+48*$s+($bounds.Bottom-$bounds.Top-96*$s-200*$s)/2)
-    $barx=$bounds.Left+(($bounds.Right-$bounds.Left)/$s-428)/2*$s
-    $bary=$bounds.Top+55*$s
-    Click-EditorAction $editor 'Shape'
-    Start-Sleep -Milliseconds 200
-    Save-GalleryScreenshot 'editor-shape-menu.png'
-    Click-EditorAction $editor 'Rectangle'
-    [CaptureInput]::ClickAt([int]($barx+266*$s),[int]($bary+24*$s)) # Fill dropdown
-    Save-GalleryScreenshot 'editor-shape-fill-menu.png'
-    [CaptureInput]::ClickAt([int]($barx+(228+3*21+9)*$s),[int]($bary+96*$s)) # Yellow fill
-    [CaptureInput]::ClickAt([int]($barx+369*$s),[int]($bary+24*$s)) # Outline dropdown
-    [CaptureInput]::ClickAt([int]($barx+325*$s),[int]($bary+64*$s)) # Black outline
-    [CaptureInput]::HoldAt([int]($sx+20*$s),[int]($sy+20*$s))
-    [CaptureInput]::MouseAt([int]($sx+90*$s),[int]($sy+90*$s),0)
-    [CaptureInput]::DropAt([int]($sx+90*$s),[int]($sy+90*$s))
-    Click-EditorAction $editor 'Ellipse'
-    [CaptureInput]::HoldAt([int]($sx+190*$s),[int]($sy+50*$s))
-    [CaptureInput]::MouseAt([int]($sx+250*$s),[int]($sy+110*$s),0)
-    [CaptureInput]::DropAt([int]($sx+250*$s),[int]($sy+110*$s))
-    Start-Sleep -Milliseconds 100
-    Save-GalleryScreenshot 'editor-shape-drawn.png'
-    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$out=Wait-NewShot $before
-    $image=[Drawing.Bitmap]::new($out)
-    try{
-        $fill=$image.GetPixel(45,45);$edge=$image.GetPixel(20,45);$oval=$image.GetPixel(220,80)
-        if($fill.R -lt 250 -or $fill.G -lt 200 -or $fill.B -gt 20){throw "Rectangle fill missing: $fill"}
-        if($edge.R -gt 40 -or $edge.G -gt 40 -or $edge.B -gt 40){throw "Independent black outline missing: $edge"}
-        if($oval.R -lt 250 -or $oval.G -lt 200 -or $oval.B -gt 20){throw "Ellipse fill missing: $oval"}
-    }finally{$image.Dispose()}
-    if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Shapes modified original PNG.'}
-    Write-Host 'PASS: nested Shape bar, independent fill/outline menus, rectangle and ellipse export, source unchanged'
-}
 function Test-Crop {
     Close-AllPreviews;Set-AutoClose 'Never' 'never'
     $preview=New-TestPreview
@@ -1434,10 +1388,10 @@ function Test-Picker {
     [CaptureInput]::HoldAt($aX,$aY);[CaptureInput]::MouseAt($bX,$bY,0);[CaptureInput]::DropAt($bX,$bY)
     Click-EditorAction $editor 'Move'
     Click-EditorAction $editor 'Color'
-    $colorX=[int]($bounds.Left+($origin+265)*$s)
+    $colorX=[int]($bounds.Left+($origin+381)*$s)
     [CaptureInput]::ClickAt($colorX,[int]($bounds.Top+390*$s))
     Save-GalleryScreenshot 'editor-custom-picker.png'
-    $pickerX=[int]($bounds.Left+($origin+246-220)*$s)
+    $pickerX=[int]($bounds.Left+($origin+362-220)*$s)
     $pickerY=[int]($bounds.Top+52*$s)
     [CaptureInput]::ClickAt([int]($pickerX+100*$s),[int]($pickerY+258*$s))
     [CaptureInput]::TypeText('20A0F0')
@@ -1445,7 +1399,7 @@ function Test-Picker {
     [CaptureInput]::ClickAt([int]($pickerX+270*$s),[int]($pickerY+339*$s))
     Click-EditorAction $editor 'Stroke'
     Save-GalleryScreenshot 'editor-stroke-slider.png'
-    $sliderX=[int]($bounds.Left+($origin+307-108)*$s)
+    $sliderX=[int]($bounds.Left+($origin+423-108)*$s)
     $sliderY=[int]($bounds.Top+52*$s)
     $startX=[int]($sliderX+18*$s);$dragX=[int]($sliderX+105*$s);$trackY=[int]($sliderY+69*$s)
     [CaptureInput]::HoldAt($startX,$trackY)
@@ -1513,7 +1467,7 @@ function Test-Drawing {
     $sample={param([string]$Path,[int]$X,[int]$Y) $image=[Drawing.Bitmap]::new($Path);try{$image.GetPixel($X,$Y)}finally{$image.Dispose()}}
     Click-EditorAction $editor 'Rectangle'
     Click-EditorAction $editor 'Color'
-    $cx=[int]($bounds.Left+((Editor-ToolOrigin $editor)+265)*$s)
+    $cx=[int]($bounds.Left+((Editor-ToolOrigin $editor)+381)*$s)
     [CaptureInput]::ClickAt($cx,[int]($bounds.Top+102*$s)) # red preset
     $a=& $point 20 160;$b=& $point 120 190
     [CaptureInput]::HoldAt($a.X,$a.Y)
@@ -1592,7 +1546,7 @@ function Test-Drawing {
     [CaptureInput]::ClickAt($cx,[int]($bounds.Top+390*$s)) # custom color wheel
     if([CaptureInput]::DialogWindow([uint32]$app.Id) -ne [IntPtr]::Zero){throw 'Color picker unexpectedly opened the old modal dialog.'}
     Save-GalleryScreenshot 'editor-custom-picker.png'
-    $pickerX=[int]($bounds.Left+((Editor-ToolOrigin $editor)+246-220)*$s)
+    $pickerX=[int]($bounds.Left+((Editor-ToolOrigin $editor)+362-220)*$s)
     $pickerY=[int]($bounds.Top+52*$s)
     [CaptureInput]::ClickAt([int]($pickerX+100*$s),[int]($pickerY+258*$s))
     [CaptureInput]::TypeText('FFFF00');Press-Key 13
@@ -1628,7 +1582,7 @@ function Test-Editor {
     Write-Host 'PASS: real Annotate opens one activated native editor, original full-resolution pixels, drawing tool selection stays in editor'
 
     $bounds=[CaptureInput]::ClientBounds($editor);$scale=[CaptureInput]::GetDpiForWindow($editor)/96.0
-    $colorX=[int]($bounds.Left+((Editor-ToolOrigin $editor)+265)*$scale)
+    $colorX=[int]($bounds.Left+((Editor-ToolOrigin $editor)+381)*$scale)
     $swatchX=[int]($colorX-4*$scale)
     Click-EditorAction $editor 'Color'
     Assert-EditorPalettePixel $colorX ([int]($bounds.Top+102*$scale)) ([Drawing.Color]::FromArgb(249,45,58).ToArgb())
@@ -2256,7 +2210,6 @@ try {
     elseif ($TextOnly) { Test-Text }
     elseif ($CropOnly) { Test-Crop }
     elseif ($ImageOnly) { Test-Image }
-    elseif ($ShapeOnly) { Test-Shape }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }

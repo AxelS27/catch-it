@@ -2,7 +2,7 @@ use super::{
     background::{self, Background, Slider, Style},
     color_picker::{self, Picker},
     document::{self, Document, Mark, Point, Shape},
-    layout::{self, Control, Layout, PRESET_COLORS, Rect, ShapeAction, ShapePopup, View},
+    layout::{self, Control, Layout, PRESET_COLORS, Rect, View},
 };
 use crate::storage::Raster;
 use anyhow::{Context, Result};
@@ -32,9 +32,6 @@ pub struct ChromeState<'a> {
     pub crop_mode: bool,
     pub crop_drag: Option<&'a Mark>,
     pub active_tool: Control,
-    pub shape_open: bool,
-    pub shape_popup: Option<ShapePopup>,
-    pub shape_fill: Option<u32>,
     pub pill_center: f32,
     pub stroke_width: f32,
     pub dark: bool,
@@ -372,28 +369,6 @@ impl Renderer {
                 self.line((x - 4.0, y - 6.0), (x + 4.0, y + 1.0), rgb, 2.0);
                 self.line((x - 4.0, y + 5.0), (x + 4.0, y + 1.0), rgb, 1.5);
                 self.line((x, y + 2.0), (x + 3.0, y + 7.0), rgb, 2.0);
-            }
-            Control::Shape => {
-                self.outline(
-                    Rect {
-                        x: x - 6.0,
-                        y: y - 5.0,
-                        w: 9.0,
-                        h: 9.0,
-                    },
-                    rgb,
-                    1.5,
-                );
-                self.outline(
-                    Rect {
-                        x: x - 2.0,
-                        y: y - 1.0,
-                        w: 9.0,
-                        h: 9.0,
-                    },
-                    rgb,
-                    1.5,
-                );
             }
             Control::Rectangle | Control::Spotlight => {
                 self.outline(square, rgb, 1.6);
@@ -1077,16 +1052,12 @@ impl Renderer {
                     w: (hi.x - lo.x) * scale,
                     h: (hi.y - lo.y) * scale,
                 };
-                if let Some(fill) = mark.fill.or_else(|| {
-                    matches!(
-                        mark.shape,
-                        Shape::FilledRectangle(..) | Shape::Highlighter(..)
-                    )
-                    .then_some(mark.color)
-                }) {
-                    self.fill_opacity(r, fill, mark.opacity);
-                }
-                if matches!(mark.shape, Shape::Rectangle(..)) {
+                if matches!(
+                    mark.shape,
+                    Shape::FilledRectangle(_, _) | Shape::Highlighter(_, _)
+                ) {
+                    self.fill_opacity(r, mark.color, mark.opacity);
+                } else {
                     self.line((r.x, r.y), (r.x + r.w, r.y), mark.color, width);
                     self.line((r.x + r.w, r.y), (r.x + r.w, r.y + r.h), mark.color, width);
                     self.line((r.x + r.w, r.y + r.h), (r.x, r.y + r.h), mark.color, width);
@@ -1096,22 +1067,21 @@ impl Renderer {
             Shape::Ellipse(a, b) => {
                 let x = (a.x + b.x) / 2.0;
                 let y = (a.y + b.y) / 2.0;
-                let ellipse = D2D1_ELLIPSE {
-                    point: Vector2 {
-                        X: origin.x + x * scale,
-                        Y: origin.y + y * scale,
-                    },
-                    radiusX: (a.x - b.x).abs() * scale / 2.0,
-                    radiusY: (a.y - b.y).abs() * scale / 2.0,
-                };
                 unsafe {
                     self.brush.SetColor(&color(mark.color));
-                    if let Some(fill) = mark.fill {
-                        self.brush.SetColor(&color(fill));
-                        self.target.FillEllipse(&ellipse, &self.brush);
-                    }
-                    self.brush.SetColor(&color(mark.color));
-                    self.target.DrawEllipse(&ellipse, &self.brush, width, None);
+                    self.target.DrawEllipse(
+                        &D2D1_ELLIPSE {
+                            point: Vector2 {
+                                X: origin.x + x * scale,
+                                Y: origin.y + y * scale,
+                            },
+                            radiusX: (a.x - b.x).abs() * scale / 2.0,
+                            radiusY: (a.y - b.y).abs() * scale / 2.0,
+                        },
+                        &self.brush,
+                        width,
+                        None,
+                    );
                 }
             }
         }
@@ -1429,171 +1399,6 @@ impl Renderer {
             self.target.PopAxisAlignedClip();
         }
     }
-    fn shape_bar(
-        &self,
-        canvas: Rect,
-        tool: Control,
-        popup: Option<ShapePopup>,
-        fill_color: Option<u32>,
-        outline: u32,
-    ) {
-        let bar = layout::shape_bar(canvas);
-        self.pill(bar, 0x26272e, 10.0);
-        self.outline(bar, 0x393b44, 1.0);
-        let sticker = Rect {
-            x: bar.x + 8.0,
-            y: bar.y + 7.0,
-            w: 32.0,
-            h: 34.0,
-        };
-        self.circle(sticker.x + 16.0, sticker.y + 17.0, 7.0, 0x747781, false);
-        self.circle(sticker.x + 13.0, sticker.y + 15.0, 1.0, 0x747781, true);
-        self.circle(sticker.x + 19.0, sticker.y + 15.0, 1.0, 0x747781, true);
-        self.line(
-            (sticker.x + 13.0, sticker.y + 20.0),
-            (sticker.x + 19.0, sticker.y + 20.0),
-            0x747781,
-            1.0,
-        );
-        self.line(
-            (bar.x + 45.0, bar.y + 11.0),
-            (bar.x + 45.0, bar.y + 37.0),
-            0x41434c,
-            1.0,
-        );
-        for choice in [
-            Control::Rectangle,
-            Control::Ellipse,
-            Control::Line,
-            Control::Arrow,
-        ] {
-            let r = layout::shape_target(canvas, ShapeAction::Tool(choice));
-            if tool == choice || (tool == Control::Fill && choice == Control::Rectangle) {
-                self.pill(r, 0x34434d, 5.0);
-                self.outline(r, 0x65beff, 1.0);
-            }
-            self.icon(choice, r, 0xf0f0f3, outline);
-        }
-        self.line(
-            (bar.x + 214.0, bar.y + 11.0),
-            (bar.x + 214.0, bar.y + 37.0),
-            0x41434c,
-            1.0,
-        );
-        let fill = layout::shape_target(canvas, ShapeAction::Fill);
-        let fillable = matches!(tool, Control::Rectangle | Control::Ellipse | Control::Fill);
-        let out = layout::shape_target(canvas, ShapeAction::Outline);
-        if popup == Some(ShapePopup::Fill) {
-            self.pill(fill, 0x3a3d46, 5.0)
-        }
-        if popup == Some(ShapePopup::Outline) {
-            self.pill(out, 0x3a3d46, 5.0)
-        }
-        self.circle(
-            fill.x + 14.0,
-            fill.y + fill.h / 2.0,
-            7.0,
-            fill_color.unwrap_or(0xbfc2cb),
-            false,
-        );
-        if fill_color.is_none() {
-            self.line(
-                (fill.x + 8.0, fill.y + 28.0),
-                (fill.x + 20.0, fill.y + 14.0),
-                0xbfc2cb,
-                1.5,
-            )
-        }
-        self.text(
-            "Fill",
-            Rect {
-                x: fill.x + 26.0,
-                y: fill.y,
-                w: 42.0,
-                h: fill.h,
-            },
-            if fillable { 0xf1f1f3 } else { 0x777a84 },
-            false,
-        );
-        self.text(
-            "⌄",
-            Rect {
-                x: fill.x + 68.0,
-                y: fill.y,
-                w: 17.0,
-                h: fill.h,
-            },
-            0xc4c4ca,
-            true,
-        );
-        self.circle(out.x + 15.0, out.y + out.h / 2.0, 8.0, outline, true);
-        self.circle(out.x + 15.0, out.y + out.h / 2.0, 4.5, 0x26272e, true);
-        self.text(
-            "Outline",
-            Rect {
-                x: out.x + 27.0,
-                y: out.y,
-                w: 63.0,
-                h: out.h,
-            },
-            0xf1f1f3,
-            false,
-        );
-        self.text(
-            "⌄",
-            Rect {
-                x: out.x + 90.0,
-                y: out.y,
-                w: 16.0,
-                h: out.h,
-            },
-            0xc4c4ca,
-            true,
-        );
-        if let Some(popup) = popup {
-            let panel = match popup {
-                ShapePopup::Fill => Rect {
-                    x: fill.x,
-                    y: bar.y + 50.0,
-                    w: 120.0,
-                    h: 86.0,
-                },
-                ShapePopup::Outline => Rect {
-                    x: out.x - 3.0,
-                    y: bar.y + 50.0,
-                    w: 114.0,
-                    h: 56.0,
-                },
-            };
-            self.pill(panel, 0x282a31, 8.0);
-            self.outline(panel, 0x555965, 1.0);
-            match popup {
-                ShapePopup::Fill => {
-                    let r = layout::shape_target(canvas, ShapeAction::NoFill);
-                    if fill_color.is_none() {
-                        self.pill(r, 0x3a4856, 5.0)
-                    }
-                    self.text("No fill", r, 0xf4f4f5, false);
-                    for (i, rgb) in PRESET_COLORS.iter().enumerate() {
-                        let r = layout::shape_target(canvas, ShapeAction::FillColor(i));
-                        self.circle(r.x + r.w / 2.0, r.y + r.h / 2.0, 7.0, *rgb, true);
-                        if fill_color == Some(*rgb) {
-                            self.circle(r.x + r.w / 2.0, r.y + r.h / 2.0, 8.5, 0xe2e7f0, false)
-                        }
-                    }
-                }
-                ShapePopup::Outline => {
-                    for (i, rgb) in PRESET_COLORS.iter().enumerate() {
-                        let r = layout::shape_target(canvas, ShapeAction::Color(i));
-                        self.circle(r.x + r.w / 2.0, r.y + r.h / 2.0, 7.0, *rgb, true);
-                        if *rgb == outline {
-                            self.circle(r.x + r.w / 2.0, r.y + r.h / 2.0, 8.5, 0xe2e7f0, false)
-                        }
-                    }
-                }
-            }
-        }
-    }
     pub fn draw(
         &self,
         layout: &Layout,
@@ -1610,9 +1415,6 @@ impl Renderer {
             crop_mode,
             crop_drag,
             active_tool,
-            shape_open,
-            shape_popup,
-            shape_fill,
             pill_center,
             stroke_width,
             dark,
@@ -1679,7 +1481,7 @@ impl Renderer {
         if let Some(strip) = layout.tool_strip_rect() {
             self.pill(strip, group, 16.0);
             let first = strip.x + 4.0;
-            for offset in [28.5, 57.5, 115.5, 173.5] {
+            for offset in [28.5, 86.5, 144.5, 231.5, 289.5] {
                 let x = first + offset;
                 self.line(
                     (x, 17.0),
@@ -1950,7 +1752,7 @@ impl Renderer {
         // sliding selection so an adjacent/fading hover never covers blue.
         for &(control, r) in &layout.controls {
             if !control.is_drawing_tool()
-                || control == active_tool.strip_control()
+                || control == active_tool
                 || !control.enabled()
                 || image.is_none()
             {
@@ -1974,7 +1776,7 @@ impl Renderer {
                 );
             }
         }
-        if let Some(r) = layout.rect(active_tool.strip_control())
+        if let Some(r) = layout.rect(active_tool)
             && (image.is_some() || active_tool == Control::Move)
         {
             self.pill(
@@ -1998,7 +1800,7 @@ impl Renderer {
             let active = control == Control::Save
                 || (control == Control::Background && background.open)
                 || (control == Control::Crop && (crop_mode || document.crop().is_some()))
-                || control == active_tool.strip_control();
+                || control == active_tool;
             let background = if active && enabled {
                 0x007aff
             } else if hovered == Some(control) && enabled {
@@ -2137,18 +1939,6 @@ impl Renderer {
                     1.0,
                 );
             }
-        }
-        if shape_open && image.is_some() {
-            self.shape_bar(
-                layout.canvas,
-                active_tool,
-                shape_popup,
-                shape_fill,
-                PRESET_COLORS
-                    .get(selected_color)
-                    .copied()
-                    .unwrap_or(custom_color),
-            );
         }
         if palette_open {
             self.palette(layout, selected_color, dark);

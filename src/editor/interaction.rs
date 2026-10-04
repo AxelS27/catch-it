@@ -524,9 +524,6 @@ pub(super) unsafe extern "system" fn window_proc(
                                     crop_mode: s.crop_mode,
                                     crop_drag: s.crop_drag.as_ref(),
                                     active_tool: s.active_tool,
-                                    shape_open: s.shape_open,
-                                    shape_popup: s.shape_popup,
-                                    shape_fill: s.shape_fill,
                                     pill_center: s.pill_center,
                                     stroke_width: s.stroke_width,
                                     dark: s.dark,
@@ -729,15 +726,6 @@ pub(super) unsafe extern "system" fn window_proc(
                 }
                 match wparam.0 as u16 {
                     0x1b => {
-                        if s.shape_popup.take().is_some() {
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                            return LRESULT(0);
-                        }
-                        if s.shape_open {
-                            s.shape_open = false;
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                            return LRESULT(0);
-                        }
                         s.cancel_gesture();
                         s.crop_mode = false;
                         s.crop_drag = None;
@@ -969,87 +957,6 @@ pub(super) unsafe extern "system" fn window_proc(
                         }
                         return LRESULT(0);
                     }
-                    if s.shape_open {
-                        let bar = layout::shape_bar(s.layout.canvas);
-                        if let Some(action) = layout::shape_hit(s.layout.canvas, p, s.shape_popup) {
-                            use layout::{ShapeAction, ShapePopup};
-                            match action {
-                                ShapeAction::Tool(tool) => {
-                                    s.shape_tool = tool;
-                                    s.select_tool(hwnd, tool);
-                                    s.shape_popup = None;
-                                    s.document.selected = None;
-                                }
-                                ShapeAction::Fill => {
-                                    if !matches!(
-                                        s.active_tool,
-                                        Control::Rectangle | Control::Ellipse
-                                    ) {
-                                        return LRESULT(0);
-                                    }
-                                    s.shape_popup = if s.shape_popup == Some(ShapePopup::Fill) {
-                                        None
-                                    } else {
-                                        Some(ShapePopup::Fill)
-                                    }
-                                }
-                                ShapeAction::Outline => {
-                                    s.shape_popup = if s.shape_popup == Some(ShapePopup::Outline) {
-                                        None
-                                    } else {
-                                        Some(ShapePopup::Outline)
-                                    }
-                                }
-                                ShapeAction::NoFill => {
-                                    set_shape_fill(s, None);
-                                    s.shape_popup = None;
-                                }
-                                ShapeAction::FillColor(i) => {
-                                    set_shape_fill(s, Some(layout::PRESET_COLORS[i]));
-                                    s.shape_popup = None;
-                                }
-                                ShapeAction::Color(i) => {
-                                    s.selected_color = i;
-                                    if let Some(index) = s.document.selected
-                                        && matches!(
-                                            s.document.marks[index].shape,
-                                            document::Shape::Rectangle(..)
-                                                | document::Shape::Ellipse(..)
-                                                | document::Shape::Line(..)
-                                                | document::Shape::Arrow(..)
-                                        )
-                                    {
-                                        s.document.recolor(index, layout::PRESET_COLORS[i]);
-                                    }
-                                    s.shape_popup = None;
-                                }
-                            }
-                            let _ = SetFocus(Some(hwnd));
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                            return LRESULT(0);
-                        }
-                        if bar.contains(p.0, p.1)
-                            || s.shape_popup.is_some_and(|popup| {
-                                let panel = match popup {
-                                    layout::ShapePopup::Fill => layout::shape_target(
-                                        s.layout.canvas,
-                                        layout::ShapeAction::FillColor(9),
-                                    ),
-                                    layout::ShapePopup::Outline => layout::shape_target(
-                                        s.layout.canvas,
-                                        layout::ShapeAction::Color(9),
-                                    ),
-                                };
-                                p.0 >= panel.x - 4.0
-                                    && p.0 < panel.x + panel.w + 4.0
-                                    && p.1 >= bar.y + 50.0
-                                    && p.1 < panel.y + panel.h + 5.0
-                            })
-                        {
-                            return LRESULT(0);
-                        }
-                        s.shape_popup = None;
-                    }
                     if s.layout.canvas.contains(p.0, p.1)
                         && let Some((point, scale)) = source_point(s, p)
                         && inside_source(s, point)
@@ -1096,12 +1003,6 @@ pub(super) unsafe extern "system" fn window_proc(
                         if let Some(mut mark) =
                             Mark::from_tool(s.active_tool, point, s.drawing_color(), s.stroke_width)
                         {
-                            if matches!(
-                                mark.shape,
-                                document::Shape::Rectangle(..) | document::Shape::Ellipse(..)
-                            ) {
-                                mark.fill = s.shape_fill;
-                            }
                             if let document::Shape::Counter(_, ref mut number) = mark.shape {
                                 *number = s.next_counter;
                             }
@@ -1522,19 +1423,6 @@ pub(super) unsafe extern "system" fn window_proc(
         }
     }
 }
-fn set_shape_fill(state: &mut WindowState, fill: Option<u32>) {
-    state.shape_fill = fill;
-    if let Some(index) = state.document.selected
-        && matches!(
-            state.document.marks[index].shape,
-            document::Shape::Rectangle(..) | document::Shape::Ellipse(..)
-        )
-    {
-        let original = state.document.marks[index].clone();
-        state.document.marks[index].fill = fill;
-        state.document.edit(index, original);
-    }
-}
 fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
     if state.crop_mode
         && (control.is_drawing_tool() || matches!(control, Control::AddImage | Control::Background))
@@ -1548,8 +1436,6 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
         Control::Copy => state.request(hwnd, COPY),
         Control::Zoom => state.request(hwnd, ZOOM_MENU),
         Control::Crop => {
-            state.shape_open = false;
-            state.shape_popup = None;
             state.finish_text(true);
             if state.crop_mode {
                 state.crop_mode = false;
@@ -1566,7 +1452,6 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
                 state.crop_drag = Some(Mark {
                     shape: document::Shape::Crop(lo, hi),
                     color: 0,
-                    fill: None,
                     width: 1.0,
                     opacity: 1.0,
                 });
@@ -1579,33 +1464,15 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
             }
         }
         Control::Color => {
-            state.shape_open = false;
-            state.shape_popup = None;
             state.finish_stroke();
             state.stroke_open = false;
             state.palette_open = !state.palette_open;
         }
         Control::Stroke => {
-            state.shape_open = false;
-            state.shape_popup = None;
             state.finish_color();
             state.picker.open = false;
             state.palette_open = false;
             state.stroke_open = !state.stroke_open;
-        }
-        Control::Shape => {
-            if state.shape_open {
-                state.shape_open = false;
-                state.shape_popup = None;
-            } else {
-                state.shape_open = true;
-                state.shape_popup = None;
-                state.select_tool(hwnd, state.shape_tool);
-                state.document.selected = None;
-                state.palette_open = false;
-                state.picker.open = false;
-                state.stroke_open = false;
-            }
         }
         Control::Move
         | Control::Rectangle
@@ -1629,17 +1496,6 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
                 state.drawing_stroke_width
             };
             state.select_tool(hwnd, control);
-            if !matches!(
-                control,
-                Control::Rectangle
-                    | Control::Fill
-                    | Control::Ellipse
-                    | Control::Line
-                    | Control::Arrow
-            ) {
-                state.shape_open = false;
-                state.shape_popup = None;
-            }
             if matches!(control, Control::Counter | Control::Text) {
                 state.selected_color = 8;
             }
