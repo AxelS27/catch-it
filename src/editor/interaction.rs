@@ -180,6 +180,7 @@ pub(super) struct CropGrab {
     start: Point,
     lo: Point,
     hi: Point,
+    min_size: f32,
 }
 fn crop_hit(mark: &Mark, point: Point, tolerance: f32) -> Option<(i8, i8)> {
     let (lo, hi) = mark.bounds();
@@ -218,16 +219,16 @@ fn crop_adjust(grab: CropGrab, point: Point, width: f32, height: f32) -> (Point,
         hi.y += dy;
     } else {
         if grab.edge.0 < 0 {
-            lo.x = (lo.x + dx).clamp(0.0, hi.x - 2.0)
+            lo.x = (lo.x + dx).clamp(0.0, hi.x - grab.min_size.min(hi.x))
         }
         if grab.edge.0 > 0 {
-            hi.x = (hi.x + dx).clamp(lo.x + 2.0, width)
+            hi.x = (hi.x + dx).clamp(lo.x + grab.min_size.min(width - lo.x), width)
         }
         if grab.edge.1 < 0 {
-            lo.y = (lo.y + dy).clamp(0.0, hi.y - 2.0)
+            lo.y = (lo.y + dy).clamp(0.0, hi.y - grab.min_size.min(hi.y))
         }
         if grab.edge.1 > 0 {
-            hi.y = (hi.y + dy).clamp(lo.y + 2.0, height)
+            hi.y = (hi.y + dy).clamp(lo.y + grab.min_size.min(height - lo.y), height)
         }
     }
     (lo, hi)
@@ -948,6 +949,8 @@ pub(super) unsafe extern "system" fn window_proc(
                                 start: point,
                                 lo,
                                 hi,
+                                // Keep the crop visibly sizable at Fit and at small zoom levels.
+                                min_size: (32.0 / scale).ceil().max(32.0),
                             });
                             let _ = SetFocus(Some(hwnd));
                             SetCapture(hwnd);
@@ -1530,5 +1533,37 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
         },
         Control::Close => state.request(hwnd, CLOSE),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+    #[test]
+    fn crop_handles_keep_a_visible_minimum_at_fit_and_zoom_out() {
+        let grab = CropGrab {
+            edge: (1, 1),
+            start: Point { x: 200.0, y: 100.0 },
+            lo: Point { x: 20.0, y: 20.0 },
+            hi: Point { x: 200.0, y: 100.0 },
+            min_size: 32.0,
+        };
+        let (lo, hi) = crop_adjust(grab, Point { x: 20.0, y: 20.0 }, 350.0, 200.0);
+        assert_eq!((hi.x - lo.x, hi.y - lo.y), (32.0, 32.0));
+        let zoomed = CropGrab {
+            min_size: 160.0,
+            ..grab
+        };
+        let (lo, hi) = crop_adjust(zoomed, Point { x: 20.0, y: 20.0 }, 350.0, 200.0);
+        assert_eq!((hi.x - lo.x, hi.y - lo.y), (160.0, 160.0));
+        let small = CropGrab {
+            lo: Point::default(),
+            hi: Point { x: 12.0, y: 8.0 },
+            min_size: 32.0,
+            start: Point { x: 12.0, y: 8.0 },
+            ..grab
+        };
+        let (lo, hi) = crop_adjust(small, Point::default(), 12.0, 8.0);
+        assert_eq!((hi.x - lo.x, hi.y - lo.y), (12.0, 8.0));
     }
 }

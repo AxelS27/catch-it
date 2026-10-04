@@ -1282,8 +1282,18 @@ function Test-Crop {
     Click-EditorAction $editor 'Crop'
     [CaptureInput]::ClickAt([int]($bounds.Right-115*$s),[int]($bounds.Top+76*$s))
     [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));Assert-ClipboardImage $redone
+    Click-EditorAction $editor 'Crop'
+    [CaptureInput]::HoldAt($x2,$y2)
+    [CaptureInput]::MouseAt([int]($x1+5*$s),[int]($y1+5*$s),0)
+    [CaptureInput]::DropAt([int]($x1+5*$s),[int]($y1+5*$s))
+    Start-Sleep -Milliseconds 100
+    Save-GalleryScreenshot 'editor-crop-minimum-pending.png'
+    [CaptureInput]::ClickAt([int]($bounds.Right-40*$s),[int]($bounds.Top+76*$s))
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$minimum=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($minimum)
+    try{if($image.Width -lt 32 -or $image.Height -lt 32){throw "Crop collapsed to $($image.Width)x$($image.Height) pixels."}}finally{$image.Dispose()}
     if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Crop modified source PNG.'}
-    Write-Host 'PASS: crop handle selection, explicit apply/cancel, undo/redo, unchanged original PNG'
+    Write-Host 'PASS: crop handle minimum, explicit apply/cancel, undo/redo, unchanged original PNG'
 }
 function Test-Text {
     Close-AllPreviews;Set-AutoClose 'Never' 'never'
