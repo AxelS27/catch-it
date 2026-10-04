@@ -187,6 +187,9 @@ struct WindowState {
     background: Background,
     committed_background: Background,
     composed: Option<Raster>,
+    drag_source: Option<Raster>,
+    drag_preview: Option<Raster>,
+    preview_geometry: Option<Raster>,
     background_revision: u64,
     background_pressed: Option<background::Target>,
     pan_start: Option<((f32, f32), (f32, f32))>,
@@ -390,7 +393,11 @@ impl WindowState {
     }
     fn view_size(&self) -> Option<(u32, u32)> {
         let source = self.image.as_ref()?;
-        let image = self.composed.as_ref().unwrap_or(source);
+        let image = self
+            .preview_geometry
+            .as_ref()
+            .or(self.composed.as_ref())
+            .unwrap_or(source);
         if self.crop_mode {
             return Some((image.width, image.height));
         }
@@ -489,6 +496,9 @@ impl Editor {
             background: Background::default(),
             committed_background: Background::default(),
             composed: None,
+            drag_source: None,
+            drag_preview: None,
+            preview_geometry: None,
             background_revision: 0,
             background_pressed: None,
             pan_start: None,
@@ -596,6 +606,10 @@ impl Editor {
                 .image
                 .as_ref()
                 .context("Screenshot is still opening")?;
+            // A live drag bitmap is intentionally small and must never reach output.
+            if self.state.background.selected() && self.state.composed.is_none() {
+                self.state.composed = Some(background::compose(source, &self.state.background)?);
+            }
             let base = self.state.composed.as_ref().unwrap_or(source);
             let (x, y) =
                 background::source_origin(source.width, source.height, &self.state.background)?;
@@ -639,7 +653,7 @@ impl Editor {
     pub fn load(&mut self, image: Raster) -> Result<()> {
         self.drag_image = Some(drag_preview(&image));
         if let Some(renderer) = &mut self.state.renderer {
-            renderer.set_image(&image)?;
+            renderer.set_source(&image)?;
         }
         println!(
             "Editor loaded: {} x {} original pixels",
@@ -1128,13 +1142,14 @@ fn resize_state(hwnd: HWND, state: &mut WindowState, width: u32, height: u32) ->
     if let Some(renderer) = &state.renderer {
         renderer.resize(width, height, state.dpi)?;
     } else {
-        state.renderer = Some(Renderer::new(
-            hwnd,
-            width,
-            height,
-            state.dpi,
-            state.composed.as_ref().or(state.image.as_ref()),
-        )?);
+        let mut renderer = Renderer::new(hwnd, width, height, state.dpi, None)?;
+        if let Some(source) = state.image.as_ref() {
+            renderer.set_source(source)?;
+            if let Some(image) = state.drag_preview.as_ref().or(state.composed.as_ref()) {
+                renderer.set_image(image)?;
+            }
+        }
+        state.renderer = Some(renderer);
     }
     for (c, r) in &state.layout.controls {
         unsafe {
@@ -1172,6 +1187,8 @@ fn refresh_background(hwnd: HWND, state: &mut WindowState) -> Result<()> {
             renderer.set_image(image)?;
         }
         state.composed = composed;
+        state.drag_preview = None;
+        state.preview_geometry = None;
         if let Some((w, h)) = state.view_size() {
             state.view.clamp_pan(state.layout.canvas, w, h);
         }
@@ -1187,6 +1204,73 @@ fn refresh_background(hwnd: HWND, state: &mut WindowState) -> Result<()> {
     })();
     if result.is_err() {
         state.background = state.committed_background.clone();
+        state.drag_preview = None;
+        state.preview_geometry = None;
+        state.composed = state.image.as_ref().and_then(|image| {
+            state
+                .background
+                .selected()
+                .then(|| background::compose(image, &state.background).ok())
+                .flatten()
+        });
+        if let Some(renderer) = &mut state.renderer
+            && let Some(image) = state.composed.as_ref().or(state.image.as_ref())
+        {
+            let _ = renderer.set_image(image);
+        }
+    }
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+    result
+}
+/// Preview at a bounded source resolution while the pointer moves; commit exactly once on release.
+fn refresh_background_drag(hwnd: HWND, state: &mut WindowState) -> Result<()> {
+    let result = (|| {
+        let source = state
+            .image
+            .as_ref()
+            .context("Screenshot is still opening")?;
+        let dimensions = background::output_size(source.width, source.height, &state.background)?;
+        let preview = if state.background.selected() {
+            let reduced = state
+                .drag_source
+                .get_or_insert_with(|| background::drag_source(source));
+            Some(background::compose_preview(
+                reduced,
+                source.width.min(source.height),
+                &state.background,
+            )?)
+        } else {
+            None
+        };
+        if let Some(renderer) = &mut state.renderer {
+            renderer.set_image(preview.as_ref().unwrap_or(source))?;
+        }
+        state.preview_geometry = preview.as_ref().map(|_| Raster {
+            width: dimensions.0,
+            height: dimensions.1,
+            pixels: Vec::new(),
+        });
+        state.drag_preview = preview;
+        state.composed = None;
+        state.exported = None;
+        state.view.fit_limit = if state.background.selected() {
+            1.6
+        } else {
+            1.0
+        };
+        state.background_revision = state.background_revision.wrapping_add(1);
+        if let Some((w, h)) = state.view_size() {
+            state.view.clamp_pan(state.layout.canvas, w, h)
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        state.background = state.committed_background.clone();
+        state.background.dragging = None;
+        // Restore both the high-resolution bitmap and its geometry after a failed preview.
+        let _ = refresh_background(hwnd, state);
     }
     unsafe {
         let _ = InvalidateRect(Some(hwnd), None, false);

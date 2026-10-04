@@ -511,7 +511,10 @@ pub(super) unsafe extern "system" fn window_proc(
                             .draw(
                                 &s.layout,
                                 &s.view,
-                                s.composed.as_ref().or(s.image.as_ref()),
+                                s.preview_geometry
+                                    .as_ref()
+                                    .or(s.composed.as_ref())
+                                    .or(s.image.as_ref()),
                                 &s.background,
                                 render::ChromeState {
                                     source: s.image.as_ref(),
@@ -915,7 +918,7 @@ pub(super) unsafe extern "system" fn window_proc(
                         if let Some(background::Target::Slider(slider)) = s.background_pressed {
                             s.background.dragging = Some(slider);
                             if s.background.set_slider(slider, p.0)
-                                && let Err(error) = refresh_background(hwnd, s)
+                                && let Err(error) = refresh_background_drag(hwnd, s)
                             {
                                 s.error = Some(format!("{error:#}"));
                                 s.request(hwnd, ERROR);
@@ -1158,7 +1161,7 @@ pub(super) unsafe extern "system" fn window_proc(
                     }
                     if let Some(slider) = s.background.dragging
                         && s.background.set_slider(slider, p.0)
-                        && let Err(error) = refresh_background(hwnd, s)
+                        && let Err(error) = refresh_background_drag(hwnd, s)
                     {
                         s.error = Some(format!("{error:#}"));
                         s.request(hwnd, ERROR);
@@ -1295,6 +1298,7 @@ pub(super) unsafe extern "system" fn window_proc(
                                 background::Target::AutoBalance => {
                                     s.background.auto_balance = !s.background.auto_balance
                                 }
+                                background::Target::Reset => s.background.reset_adjustments(),
                                 background::Target::ToggleGradients => {
                                     s.background.expanded = !s.background.expanded;
                                     s.background.scroll_y = s
