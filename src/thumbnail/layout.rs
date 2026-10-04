@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 
-use crate::geometry::{ImageCrop, aspect_fill};
+use crate::{
+    geometry::{ImageCrop, aspect_fill},
+    settings::Placement,
+};
 
 /// Physical monitor work area, which can have a negative desktop origin.
 #[derive(Clone, Copy)]
@@ -71,8 +74,16 @@ impl ControlRect {
 }
 
 impl Layout {
-    pub fn stack_capacity(&self, area: WorkArea) -> usize {
-        (1 + (self.y - area.top).max(0) as u32 / self.stack_step()) as usize
+    pub fn stack_capacity(&self, area: WorkArea, placement: Placement) -> usize {
+        let available = if placement.at_top() {
+            (i64::from(area.top) + i64::from(area.height)
+                - i64::from(self.y)
+                - i64::from(self.height))
+            .max(0)
+        } else {
+            i64::from(self.y).saturating_sub(i64::from(area.top)).max(0)
+        };
+        1 + (available as u64 / u64::from(self.stack_step())) as usize
     }
 
     pub fn stack_step(&self) -> u32 {
@@ -119,14 +130,22 @@ impl Layout {
     }
 
     pub fn new(area: WorkArea, dpi: u32, image_width: u32, image_height: u32) -> Result<Self> {
+        Self::placed(area, dpi, image_width, image_height, Placement::BottomRight)
+    }
+
+    pub fn placed(
+        area: WorkArea,
+        dpi: u32,
+        image_width: u32,
+        image_height: u32,
+        placement: Placement,
+    ) -> Result<Self> {
         anyhow::ensure!(
             area.width > 0 && area.height > 0 && dpi > 0 && image_width > 0 && image_height > 0,
             "Invalid thumbnail dimensions or monitor work area"
         );
         let scale = dpi as f32 / 96.0;
-        // The default dock is bottom-right. Keep the physical inset relative
-        // to the capture monitor's usable work area, clear of the taskbar.
-        // Placement and per-edge offsets can become settings in a later slice.
+        // The card keeps a 20-DIP inset from the selected work-area edges.
         let right_margin = (20.0 * scale).round().min(area.width as f32 / 4.0) as u32;
         // Twenty DIPs leaves room for the 14-DIP shadow surface while keeping
         // the card visually close to the taskbar.
@@ -147,8 +166,18 @@ impl Layout {
         let width = (card_width + padding * 2).min(area.width);
         let height = (card_height + padding * 2).min(area.height);
         Ok(Self {
-            x: area.left + (area.width - right_margin - card_width - padding) as i32,
-            y: area.top + (area.height - bottom_margin - card_height - padding) as i32,
+            x: area.left
+                + if placement.at_left() {
+                    (right_margin - padding) as i32
+                } else {
+                    (area.width - right_margin - card_width - padding) as i32
+                },
+            y: area.top
+                + if placement.at_top() {
+                    (bottom_margin - padding) as i32
+                } else {
+                    (area.height - bottom_margin - card_height - padding) as i32
+                },
             width,
             height,
             scale,
@@ -188,13 +217,59 @@ mod tests {
                     height,
                 };
                 let layout = Layout::new(area, dpi, 350, 200)?;
-                let capacity = layout.stack_capacity(area);
+                let capacity = layout.stack_capacity(area, Placement::BottomRight);
                 let top = layout.y - (capacity - 1) as i32 * layout.stack_step() as i32;
                 assert!(capacity >= 1 && top >= area.top);
                 assert!(top - (layout.stack_step() as i32) < area.top);
                 if dpi == 96 && height == 1040 {
                     assert_eq!(capacity, 5);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn all_corners_keep_dpi_insets_and_stack_within_work_area() -> Result<()> {
+        let area = WorkArea {
+            left: -1920,
+            top: -180,
+            width: 1600,
+            height: 900,
+        };
+        for dpi in [96, 120, 144, 192] {
+            for placement in Placement::ALL {
+                let layout = Layout::placed(area, dpi, 350, 200, placement)?;
+                let inset = (20.0 * layout.scale).round() as i32;
+                let card_x = layout.x + (layout.card_left * layout.scale).round() as i32;
+                let card_y = layout.y + (layout.card_top * layout.scale).round() as i32;
+                let card_right = card_x + (layout.card_width * layout.scale).round() as i32;
+                let card_bottom = card_y + (layout.card_height * layout.scale).round() as i32;
+                assert_eq!(
+                    if placement.at_left() {
+                        card_x - area.left
+                    } else {
+                        area.left + area.width as i32 - card_right
+                    },
+                    inset
+                );
+                assert_eq!(
+                    if placement.at_top() {
+                        card_y - area.top
+                    } else {
+                        area.top + area.height as i32 - card_bottom
+                    },
+                    inset
+                );
+                let capacity = layout.stack_capacity(area, placement);
+                let last_y = layout.y
+                    + (if placement.at_top() { 1 } else { -1 })
+                        * (capacity - 1) as i32
+                        * layout.stack_step() as i32;
+                assert!(
+                    last_y >= area.top
+                        && last_y + layout.height as i32 <= area.top + area.height as i32
+                );
             }
         }
         Ok(())

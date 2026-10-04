@@ -22,10 +22,11 @@ param(
     [switch]$EditableOnly,
     [switch]$PolishOnly,
     [switch]$SliderOnly,
-    [switch]$WebDragOnly
+    [switch]$WebDragOnly,
+    [switch]$PlacementOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly -or $PolishOnly -or $SliderOnly -or $WebDragOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly -or $PolishOnly -or $SliderOnly -or $WebDragOnly -or $PlacementOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -366,7 +367,7 @@ function Wait-Thumbnail([bool]$Visible, [int]$TimeoutMs = 6000) {
     throw "Thumbnail visibility did not become $Visible. Check $artifacts logs."
 }
 function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeight = 200,
-    $Samples = @(@(80,170,'Blue'), @(80,55,'Red'), @(200,55,'Lime')), [string]$Artifact = 'thumbnail.png', [int]$ExpectedCount = 1, [int]$ExpectedSlot = 0) {
+    $Samples = @(@(80,170,'Blue'), @(80,55,'Red'), @(200,55,'Lime')), [string]$Artifact = 'thumbnail.png', [int]$ExpectedCount = 1, [int]$ExpectedSlot = 0, [switch]$SkipAnchor) {
     $rect = New-Object CaptureInput+Rect
     [void][CaptureInput]::GetWindowRect($Window, [ref]$rect)
     $scale = [CaptureInput]::GetDpiForWindow($Window) / 96.0
@@ -389,7 +390,7 @@ function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeig
         }
     }
     $expectedBottom=$effectiveBottom-[int][Math]::Round(20*$scale)-$ExpectedSlot*[int][Math]::Round(196*$scale)
-    if ($rect.Right-$padding -ne $work.Right-[int][Math]::Round(20*$scale) -or $rect.Bottom-$padding -ne $expectedBottom) { throw "Quick Access inset differs: cardRight=$($rect.Right-$padding),cardBottom=$($rect.Bottom-$padding) expectedBottom=$expectedBottom dpi=$scale slot=$ExpectedSlot." }
+    if (-not $SkipAnchor -and ($rect.Right-$padding -ne $work.Right-[int][Math]::Round(20*$scale) -or $rect.Bottom-$padding -ne $expectedBottom)) { throw "Quick Access inset differs: cardRight=$($rect.Right-$padding),cardBottom=$($rect.Bottom-$padding) expectedBottom=$expectedBottom dpi=$scale slot=$ExpectedSlot." }
     $cover = [Math]::Max($cardWidth/$ImageWidth, $cardHeight/$ImageHeight)
     $cropLeft = ($ImageWidth-$cardWidth/$cover)/2
     $cropTop = ($ImageHeight-$cardHeight/$cover)/2
@@ -465,7 +466,7 @@ function Wait-NewPreview([IntPtr[]]$Before) {
     }
     throw 'New capture did not publish a new visible preview.'
 }
-function New-TestPreview([switch]$KeepPreviews) {
+function New-TestPreview([switch]$KeepPreviews, [switch]$SkipAnchor) {
     $beforeWindows=[CaptureInput]::ThumbnailWindows($false)
     $before = @(Get-Shots)
     [void](Start-Selection -KeepPreviews:$KeepPreviews)
@@ -474,7 +475,7 @@ function New-TestPreview([switch]$KeepPreviews) {
     $script:created += $shot
     Assert-Png $shot
     $preview = Wait-NewPreview $beforeWindows
-    [void](Assert-Preview $preview -ExpectedCount $(if($KeepPreviews){0}else{1}) -ExpectedSlot $(if($KeepPreviews){@($beforeWindows).Count}else{0}))
+    [void](Assert-Preview $preview -ExpectedCount $(if($KeepPreviews){0}else{1}) -ExpectedSlot $(if($KeepPreviews){@($beforeWindows).Count}else{0}) -SkipAnchor:$SkipAnchor)
     return @{ Shot = $shot; Window = $preview; Foreground = [CaptureInput]::GetForegroundWindow() }
 }
 function Wait-DragLog([string]$Text) {
@@ -697,7 +698,7 @@ function Read-TimerSetting([string]$Path) {
     # Do not lock out the app's atomic settings replacement while polling.
     $stream=[IO.File]::Open($Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
     $reader=[IO.StreamReader]::new($stream)
-    try{return $reader.ReadToEnd().Trim()}finally{$reader.Dispose()}
+    try{return ($reader.ReadToEnd() -split '\r?\n' | Where-Object {$_ -like 'auto_close=*'} | Select-Object -First 1)}finally{$reader.Dispose()}
 }
 function Set-AutoClose([string]$Label, [string]$Value) {
     if($GalleryOnly){
@@ -1043,6 +1044,43 @@ function Assert-EditorPalettePixel([int]$X,[int]$Y,[int]$Argb) {
     }
     Save-GalleryScreenshot 'editor-palette-failure.png'
     throw "Palette pixel $X,$Y did not match color $Argb"
+}
+function Test-Placement {
+    if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run PlacementOnly with pwsh -Sta.'}
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $first=New-TestPreview
+    $hash=(Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash
+    $settings=Join-Path (Split-Path $output -Parent) 'settings.txt'
+    foreach($entry in @(@('top_left',0,0),@('top_right',1,0),@('bottom_left',0,1),@('bottom_right',1,1))){
+        $value=$entry[0]
+        $index=@('top_left','top_right','bottom_left','bottom_right').IndexOf($value)
+        [void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(),0x8012,[IntPtr]$index,[IntPtr]::Zero)
+        $placed=$false
+        for($i=0;$i -lt 100;$i++){
+            $content=if(Test-Path $settings){[IO.File]::ReadAllText($settings)}else{''}
+            $rect=Preview-Rect $first.Window
+            $left=($rect.Left+$rect.Right)/2 -lt [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width/2
+            $top=($rect.Top+$rect.Bottom)/2 -lt [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height/2
+            if($content -match "(?m)^placement=$value$" -and $left -eq ($entry[1] -eq 0) -and $top -eq ($entry[2] -eq 0)){$placed=$true;break}
+            Start-Sleep -Milliseconds 25
+        }
+        if(-not $placed){Save-GalleryScreenshot 'placement-failure.png';throw "Quick Access did not move to $value or persist it."}
+    }
+    [void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(),0x8012,[IntPtr]0,[IntPtr]::Zero)
+    for($i=0;$i -lt 100;$i++){
+        if((Preview-Rect $first.Window).Left -lt 200){break}
+        Start-Sleep -Milliseconds 25
+    }
+    $second=New-TestPreview -KeepPreviews -SkipAnchor
+    if((Preview-Rect $second.Window).Top -le (Preview-Rect $first.Window).Top){throw 'Top corner did not stack new screenshot downward.'}
+    [void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(),0x8012,[IntPtr]2,[IntPtr]::Zero)
+    for($i=0;$i -lt 100;$i++){
+        if((Preview-Rect $second.Window).Top -lt (Preview-Rect $first.Window).Top){break}
+        Start-Sleep -Milliseconds 25
+    }
+    if((Preview-Rect $second.Window).Top -ge (Preview-Rect $first.Window).Top){throw 'Bottom corner did not stack new screenshot upward.'}
+    if((Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Changing position modified original PNG.'}
+    Write-Host 'PASS: four corners, live relocation, top/bottom stack directions, persisted choice, original PNG unchanged'
 }
 function Test-WebDrag {
     $chrome='C:\Program Files\Google\Chrome\Application\chrome.exe'
@@ -2534,7 +2572,8 @@ try {
     Write-Host 'PASS: real app startup cleans expired files, preserves recent/unrelated/locked files'
     Start-Sleep -Milliseconds 350
     if ($Layout) { Test-Layout }
-    if ($QuickAccessOnly) { Test-DragDrop -PreviewOnly }
+    if ($PlacementOnly) { Test-Placement }
+    elseif ($QuickAccessOnly) { Test-DragDrop -PreviewOnly }
     elseif ($ThemeOnly) { Test-Theme }
     elseif ($EditorOnly) { Test-Editor }
     elseif ($BackgroundOnly) { Test-Background }

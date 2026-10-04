@@ -15,7 +15,7 @@ UI/UX evidence, delivery slices, and remaining exact-parity measurements are in 
 Implemented:
 
 - Global `Alt + Shift + S` hotkey.
-- Native notification-area icon with **Take screenshot**, **Auto-close**, **Close all screenshots**, and **Quit**, accessible by mouse or keyboard.
+- Native notification-area icon with **Take screenshot**, **Auto-close**, **Quick Access position**, **Close all screenshots**, and **Quit**, accessible by mouse or keyboard.
 - Release builds run as a Windows GUI/background application, without a console window. Debug builds keep console diagnostics.
 - Tray registration is restored when Explorer sends `TaskbarCreated`; shutdown explicitly removes the icon.
 - Capture/quit hotkeys work inside the native tray menu. Worker completions and thumbnail lifecycle messages are deferred safely across nested menu/OLE loops.
@@ -30,7 +30,7 @@ Implemented:
 - Unique filenames and atomic publication of complete PNG files.
 - GPU capture session reused on a sleeping worker, without idle frame polling.
 - Capture and save errors are reported rather than silently ignored.
-- Floating preview in the capture monitor's bottom-right usable area, above the actual shell taskbar even when Windows reports an incorrect work area. Reserve taskbar thickness for auto-hide reveal too.
+- Floating preview in the capture monitor's usable area, defaulting to bottom-right. The tray offers top-left, top-right, bottom-left, and bottom-right; changing it repositions surviving cards immediately and applies to the next capture. All corners keep a 20-DIP card inset and avoid the actual shell taskbar, including its auto-hide reveal area.
 - Fixed 260 x 184 logical-pixel rounded card with a subtle shadow; screenshot content fills the card using a centered cover crop, preserving aspect ratio without stretching or letterboxing. Preview cropping never changes the saved PNG. Only DPI or a very small available work area changes the card size.
 - Rasterize the card once before composing its shadow, avoiding the Direct2D layer-reuse error reproduced with full-screen captures.
 - DirectComposition slide/fade animations, without per-frame CPU repainting. The card outline is black in Windows dark app mode and white in light app mode; custom colors/gradients are not implemented yet.
@@ -41,7 +41,7 @@ Implemented:
 - Copy the original screenshot automatically after each successful capture/save, including when the preview queue is full of pins. Publish both the original registered `PNG` bytes and a full-resolution native `CF_DIBV5` image, never a preview crop or file path. Copy can recopy any surviving older screenshot without dismissing it or taking focus. A busy clipboard retries on a 50 ms event timer for up to two seconds, then reports failure with the source PNG and preview intact; Copy allows retry. No recurring clipboard timer after success or failure.
 - Save opens Windows' native PNG Save As dialog. Cancel preserves the card; success dismisses an unpinned card and keeps a pin in place. All card clocks pause during the dialog. Unicode/spaced paths and native overwrite confirmation are supported. Export copies the exact original PNG bytes to a private file in the chosen folder, then atomically publishes it; failure preserves the existing target and source PNG. Quit safely cancels an active dialog.
 - Right-click opens pin/unpin, close, and close-all actions. Windows client-area animation preference is respected.
-- Bounded session-only FIFO preview queue. Each monitor's bottom-right stack fits as many fixed cards as its usable height allows, oldest at the bottom and newest at the top. Overflow permanently removes the oldest unpinned thumbnail and releases its window/resources, without deleting its PNG. At capacity, older unpinned cards are evicted before new previews are inserted. No hidden backlog, wheel browsing, or older/newer paging; removed thumbnails never reappear after another dismissal or capture.
+- Bounded session-only FIFO preview queue. Each monitor's chosen-corner stack fits as many fixed cards as its usable height allows, growing downward from the top corners or upward from the bottom corners. Overflow permanently removes the oldest unpinned thumbnail and releases its window/resources, without deleting its PNG. At capacity, older unpinned cards are evicted before new previews are inserted. No hidden backlog, wheel browsing, or older/newer paging; removed thumbnails never reappear after another dismissal or capture.
 - Pins remain always on top in the same chronological stack, not a separate column. Pin/unpin does not reorder a card; removing a lower card compacts those above it without losing pin state. Pins reserve stack slots and never auto-expire or get evicted by new captures. If every slot is pinned, new PNGs are still saved but their previews cannot enter the full queue. Pins use the same fixed cover card, not a movable/resizable reference window.
 - Hide all surviving cards and pins before desktop capture; pause their clocks until selection cancellation or PNG publication restores them. Captures do not contain older previews. Capture hiding is temporary, unlike permanent overflow eviction.
 - Timer options: 5 seconds (default), 15 seconds, 30 seconds, 5 minutes, 10 minutes, and Never. A changed interval starts a fresh budget; hidden/hovered/dragged cards pause their remaining budget. Unpin starts a fresh selected interval.
@@ -62,7 +62,7 @@ Output directory:
 %LOCALAPPDATA%\SimpleScreenshot\Temp\
 ```
 
-The timer preference is atomically saved in `%LOCALAPPDATA%\SimpleScreenshot\settings.txt` and loaded on startup. The queue and pins are session-only, not a screenshot history/library, and are not restored after restart.
+The auto-close and Quick Access position preferences are atomically saved together in `%LOCALAPPDATA%\SimpleScreenshot\settings.txt` and loaded on startup. Older timer-only settings default to bottom-right. The queue and pins are session-only, not a screenshot history/library, and are not restored after restart.
 
 The native editor shell, basic drawing, and a limited Background Tool are implemented; text, redaction, crop, additional arrow styles, opacity/lock controls, and a settings window remain pending. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
 
@@ -97,11 +97,11 @@ cargo run --release
 1. Place the pointer on the monitor to capture.
 2. Press `Alt + Shift + S`.
 3. Drag to select a region, then release to save.
-4. The preview appears in the bottom-right corner without taking keyboard focus.
+4. The preview appears in your chosen corner (bottom-right by default) without taking keyboard focus.
 5. Every new screenshot automatically copies its original image to the clipboard. Hover for Copy, Save, pin, and close; Copy restores an older image, and Save chooses a PNG destination. Annotate opens the native editor; Upload remains disabled. Drag a card's background into Explorer or a compatible terminal to copy its file. Overflow permanently evicts the oldest unpinned thumbnail; there is no preview history.
 6. Pin a card to keep it beyond the timer, in its existing stack position. Unpin preserves capture order and starts a fresh timeout. Closing or successfully dragging an unpinned card compacts the stack without changing surviving pins. Closing cards never deletes their PNGs.
 
-Debug or redirected console diagnostics include saved file paths. Use **Auto-close** in the tray to choose a timeout or Never; **Close all screenshots** closes pending cards and pins.
+Debug or redirected console diagnostics include saved file paths. Use **Auto-close** in the tray to choose a timeout or Never and **Quick Access position** to choose a corner; **Close all screenshots** closes pending cards and pins.
 
 Use the notification-area icon (possibly under **Show Hidden Icons**) to take a screenshot or quit. Left-click, right-click, or keyboard activation opens the native menu. `Ctrl + Alt + Q` remains available as a development exit shortcut. If either shortcut is already registered by another application, startup reports an error.
 
@@ -117,6 +117,14 @@ cargo build --release
 ```
 
 Unit tests cover selection direction, clamping, empty regions, crop boundaries, display-rotation transforms, invalid PNG buffers, and a real WIC PNG round trip through a Unicode filename containing spaces. Thumbnail tests cover layout at 100%, 125%, 150%, and 200% scaling, negative monitor origins, extreme aspect ratios, rounded hit testing, hover/drag/capture-hidden timing, pin/unpin lifecycles, Never, interval changes, interrupted dismissal, disabled motion, distinct DPI-scaled controls, permanent queue eviction/no-resurrection, chronological pin placement/compaction, screen-derived capacity, and persisted settings. Drag tests check actual COM source behavior, STA affinity, unchanged premultiplied card-pixel upload, invalid drag buffers, system thresholds, and native `CF_HDROP` paths with spaces and Unicode.
+
+### Focused Quick Access placement test
+
+```powershell
+./scripts/smoke-capture.ps1 -Configuration release -PlacementOnly
+```
+
+Uses an isolated app instance to check all four corners, live movement of existing cards, stack direction, persistence, and unchanged source PNGs. The native tray submenu and checked choice have separate unit coverage; this focused desktop check sends the same controller action directly because Windows shell icon discovery can be unreliable in remote sessions.
 
 ### Focused browser drag test
 
