@@ -373,6 +373,7 @@ impl App {
             }
             editor::DRAG => editor.run_drag().map(|_| ()),
             editor::ZOOM_MENU => editor.zoom_menu(),
+            editor::ADD_IMAGE => editor.add_image(),
             _ => Ok(()),
         };
         self.editors.insert(index, editor);

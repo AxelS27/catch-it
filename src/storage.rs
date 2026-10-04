@@ -40,6 +40,7 @@ pub fn temp_directory() -> Result<PathBuf> {
 }
 
 /// Full-resolution, straight-alpha BGRA pixels. UI rendering premultiplies separately.
+#[derive(Debug, PartialEq)]
 pub struct Raster {
     pub width: u32,
     pub height: u32,
@@ -47,6 +48,10 @@ pub struct Raster {
 }
 
 pub fn load_png(path: &std::path::Path) -> Result<Raster> {
+    load_image(path)
+}
+
+pub fn load_image(path: &std::path::Path) -> Result<Raster> {
     let _protection = protect_png(path)?;
     let _com = ComApartment::new()?;
     let filename: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();

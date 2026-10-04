@@ -1,9 +1,12 @@
 //! Activated native image editor. Modal output actions are dispatched by App,
-//! never inside a callback holding WindowState. Drawing tools arrive in later slices.
+//! never inside a callback holding WindowState. The source raster remains immutable.
 mod background;
+mod color_picker;
+mod document;
 mod interaction;
 mod layout;
 mod render;
+mod text_raster;
 
 use crate::{
     drag_drop::{Outcome, PreparedDrag},
@@ -12,13 +15,19 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use background::Background;
+use color_picker::Picker;
+use document::{Document, Mark, Point};
 use layout::{Control, Layout, View, Zoom};
 use render::Renderer;
 use std::{
     cell::Cell,
     path::{Path, PathBuf},
     rc::Rc,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Instant,
 };
 use windows::{
     Win32::{
@@ -38,10 +47,106 @@ pub const DRAG: isize = 4;
 pub const ERROR: isize = 5;
 pub const ZOOM_MENU: isize = 6;
 pub const BACKGROUND_TOGGLE: isize = 7;
+pub const ADD_IMAGE: isize = 8;
 const CLASS: PCWSTR = w!("SimpleScreenshot.Editor");
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const ZOOM_VALUES: [f32; 8] = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0];
+const HOVER_TIMER: usize = 51;
 
+struct TextEdit {
+    hwnd: HWND,
+    font: HFONT,
+    brush: HBRUSH,
+    point: Point,
+    index: Option<usize>,
+}
+struct MarkGesture {
+    index: usize,
+    original: Mark,
+    start: Point,
+    handle: Option<usize>,
+    rotating: bool,
+}
+impl MarkGesture {
+    fn at(&self, point: Point) -> Mark {
+        let mut mark = self.original.clone();
+        if self.rotating {
+            let center = self.original.center();
+            let start = (self.start.y - center.y).atan2(self.start.x - center.x);
+            let current = (point.y - center.y).atan2(point.x - center.x);
+            mark.angle = (self.original.angle + current - start).rem_euclid(std::f32::consts::TAU);
+        } else if let Some(handle) = self.handle {
+            let center = self.original.center();
+            let local = document::rotate(point, center, -self.original.angle);
+            let fixed_index = match self.original.shape {
+                document::Shape::Line(..) | document::Shape::Arrow(..) if handle < 2 => {
+                    Some(1 - handle)
+                }
+                document::Shape::Line(..) | document::Shape::Arrow(..) => None,
+                _ => Some((handle + 2) % 4),
+            };
+            let fixed = fixed_index.and_then(|index| self.original.handles().get(index).copied());
+            mark.resize_handle(handle, local);
+            if let (Some(index), Some(before)) = (fixed_index, fixed)
+                && let Some(after) = mark.handles().get(index)
+            {
+                mark.translate(before.x - after.x, before.y - after.y);
+            }
+        } else {
+            mark.translate(point.x - self.start.x, point.y - self.start.y);
+        }
+        mark
+    }
+}
+fn hover_step(levels: &mut Vec<(Control, f32)>, target: Option<Control>, dt: f32) -> bool {
+    let blend = 1.0 - (-dt / 0.055).exp();
+    let mut moving = false;
+    for (control, level) in levels.iter_mut() {
+        let goal = if Some(*control) == target { 1.0 } else { 0.0 };
+        *level += (goal - *level) * blend;
+        if (*level - goal).abs() < 0.012 {
+            *level = goal;
+        } else {
+            moving = true;
+        }
+    }
+    levels.retain(|(_, level)| *level > 0.0);
+    moving
+}
+struct PillMotion {
+    from: f32,
+    velocity: f32,
+    to: f32,
+    min: f32,
+    max: f32,
+    start: Instant,
+}
+impl PillMotion {
+    fn position(&self, now: Instant) -> (f32, f32, bool) {
+        // Damped spring: continuous position/velocity on rapid tool changes,
+        // gentle overshoot in the middle, no overshoot beyond the tool strip.
+        const FREQUENCY: f32 = 14.0;
+        const DAMPING: f32 = 0.62;
+        let t = now.duration_since(self.start).as_secs_f32().min(0.65);
+        let decay = DAMPING * FREQUENCY;
+        let wave = FREQUENCY * (1.0 - DAMPING * DAMPING).sqrt();
+        let a = self.from - self.to;
+        let b = (self.velocity + decay * a) / wave;
+        let (s, c) = (wave * t).sin_cos();
+        let envelope = (-decay * t).exp();
+        let displacement = envelope * (a * c + b * s);
+        let velocity = envelope * (-decay * (a * c + b * s) + wave * (b * c - a * s));
+        let unclamped = self.to + displacement;
+        let x = unclamped.clamp(self.min, self.max);
+        let v = if x != unclamped { 0.0 } else { velocity };
+        let moving = t < 0.65 && ((x - self.to).abs() > 0.15 || v.abs() > 1.5);
+        (
+            if moving { x } else { self.to },
+            if moving { v } else { 0.0 },
+            moving,
+        )
+    }
+}
 struct WindowState {
     controller: HWND,
     id: usize,
@@ -52,10 +157,33 @@ struct WindowState {
     view: View,
     dark: bool,
     hover: Option<Control>,
+    hover_levels: Vec<(Control, f32)>,
+    hover_last_tick: Instant,
     focus: Option<Control>,
     pressed: Option<Control>,
     palette_open: bool,
+    picker: Picker,
+    picker_original: Option<(usize, Mark)>,
+    stroke_open: bool,
+    stroke_dragging: bool,
+    stroke_original: Option<(usize, Mark)>,
     selected_color: usize,
+    custom_color: u32,
+    active_tool: Control,
+    pill_center: f32,
+    pill_motion: Option<PillMotion>,
+    stroke_width: f32,
+    drawing_stroke_width: f32,
+    text_size: f32,
+    next_counter: u32,
+    crop_mode: bool,
+    crop_drag: Option<Mark>,
+    crop_grab: Option<interaction::CropGrab>,
+    text_editing: Option<TextEdit>,
+    document: Document,
+    pending_mark: Option<Mark>,
+    moving_mark: Option<MarkGesture>,
+    exported: Option<Raster>,
     background: Background,
     committed_background: Background,
     composed: Option<Raster>,
@@ -71,6 +199,182 @@ struct WindowState {
     cancel_drag: Rc<Cell<bool>>,
 }
 impl WindowState {
+    fn set_hover(&mut self, hwnd: HWND, hit: Option<Control>) {
+        if self.hover == hit {
+            return;
+        }
+        self.advance_hover();
+        self.hover = hit;
+        if let Some(control) = hit
+            && !self
+                .hover_levels
+                .iter()
+                .any(|(existing, _)| *existing == control)
+        {
+            self.hover_levels.push((control, 0.0));
+        }
+        unsafe {
+            let _ = SetTimer(Some(hwnd), HOVER_TIMER, 10, None);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+    }
+    fn advance_hover(&mut self) -> bool {
+        let now = Instant::now();
+        let dt = now
+            .duration_since(self.hover_last_tick)
+            .as_secs_f32()
+            .min(0.08);
+        self.hover_last_tick = now;
+        hover_step(&mut self.hover_levels, self.hover, dt)
+    }
+    fn select_tool(&mut self, hwnd: HWND, control: Control) {
+        if self.active_tool == control {
+            return;
+        }
+        let now = Instant::now();
+        let (from, velocity) =
+            self.pill_motion
+                .as_ref()
+                .map_or((self.pill_center, 0.0), |motion| {
+                    let (position, velocity, _) = motion.position(now);
+                    (position, velocity)
+                });
+        self.active_tool = control;
+        if let Some(r) = self.layout.rect(control) {
+            let to = r.x + r.w / 2.0;
+            self.pill_center = from;
+            let min = self
+                .layout
+                .rect(Control::Move)
+                .map_or(to, |r| r.x + r.w / 2.0);
+            let max = self
+                .layout
+                .rect(Control::Highlighter)
+                .map_or(to, |r| r.x + r.w / 2.0);
+            self.pill_motion = Some(PillMotion {
+                from,
+                velocity,
+                to,
+                min,
+                max,
+                start: now,
+            });
+            unsafe {
+                let _ = SetTimer(Some(hwnd), HOVER_TIMER, 10, None);
+            }
+        }
+    }
+    fn advance_pill(&mut self) -> bool {
+        let Some(motion) = &self.pill_motion else {
+            return false;
+        };
+        let (center, _, moving) = motion.position(Instant::now());
+        self.pill_center = center;
+        if !moving {
+            self.pill_motion = None;
+        }
+        moving
+    }
+    fn finish_text(&mut self, commit: bool) {
+        let Some(edit) = self.text_editing.take() else {
+            return;
+        };
+        let value = if commit {
+            unsafe {
+                let len = GetWindowTextLengthW(edit.hwnd).max(0) as usize;
+                let mut buffer = vec![0u16; len + 1];
+                let count = GetWindowTextW(edit.hwnd, &mut buffer).max(0) as usize;
+                String::from_utf16_lossy(&buffer[..count]).replace("\r\n", "\n")
+            }
+        } else {
+            String::new()
+        };
+        unsafe {
+            let _ = windows::Win32::UI::Shell::RemoveWindowSubclass(
+                edit.hwnd,
+                Some(interaction::text_subclass),
+                1,
+            );
+            let _ = DestroyWindow(edit.hwnd);
+            let _ = DeleteObject(HGDIOBJ(edit.font.0));
+            let _ = DeleteObject(HGDIOBJ(edit.brush.0));
+        }
+        if !commit {
+            return;
+        }
+        if let Some(index) = edit.index {
+            if value.trim().is_empty() {
+                self.document.selected = Some(index);
+                self.document.delete_selected();
+            } else {
+                let original = self.document.marks[index].clone();
+                self.document.marks[index].shape = document::Shape::Text(edit.point, value);
+                self.document.edit(index, original);
+            }
+        } else if !value.trim().is_empty() {
+            let mut mark = Mark::from_tool(
+                Control::Text,
+                edit.point,
+                self.drawing_color(),
+                self.text_size,
+            )
+            .expect("Text is an annotation tool");
+            mark.shape = document::Shape::Text(edit.point, value);
+            if let Err(error) = self.document.add(mark) {
+                self.error = Some(format!("{error:#}"));
+            }
+        }
+    }
+    fn live_color(&mut self, rgb: u32) {
+        self.custom_color = rgb;
+        self.selected_color = layout::PRESET_COLORS.len();
+        if let Some(index) = self.document.selected {
+            if self.picker_original.is_none() {
+                self.picker_original = Some((index, self.document.marks[index].clone()));
+            }
+            self.document.marks[index].color = rgb;
+        }
+    }
+    fn finish_color(&mut self) {
+        if let Some((index, original)) = self.picker_original.take() {
+            self.document.edit(index, original);
+        }
+    }
+    fn is_text_property(&self) -> bool {
+        self.active_tool == Control::Text
+            || self.document.selected.is_some_and(|index| {
+                matches!(self.document.marks[index].shape, document::Shape::Text(..))
+            })
+    }
+    fn live_stroke(&mut self, width: f32) {
+        self.stroke_width = if self.is_text_property() {
+            width.clamp(8.0, 72.0)
+        } else {
+            width.clamp(1.0, 24.0)
+        };
+        if self.is_text_property() {
+            self.text_size = self.stroke_width;
+        } else {
+            self.drawing_stroke_width = self.stroke_width;
+        }
+        if let Some(index) = self.document.selected {
+            if self.stroke_original.is_none() {
+                self.stroke_original = Some((index, self.document.marks[index].clone()));
+            }
+            self.document.marks[index].width = self.stroke_width;
+        }
+    }
+    fn finish_stroke(&mut self) {
+        if let Some((index, original)) = self.stroke_original.take() {
+            self.document.edit(index, original);
+        }
+    }
+    fn drawing_color(&self) -> u32 {
+        layout::PRESET_COLORS
+            .get(self.selected_color)
+            .copied()
+            .unwrap_or(self.custom_color)
+    }
     fn request(&self, _hwnd: HWND, action: isize) {
         unsafe {
             let _ = PostMessageW(
@@ -83,6 +387,29 @@ impl WindowState {
     }
     fn ready(&self) -> bool {
         self.image.is_some()
+    }
+    fn view_size(&self) -> Option<(u32, u32)> {
+        let source = self.image.as_ref()?;
+        let image = self.composed.as_ref().unwrap_or(source);
+        if self.crop_mode {
+            return Some((image.width, image.height));
+        }
+        let (ox, oy) =
+            background::source_origin(source.width, source.height, &self.background).ok()?;
+        Some(
+            self.document
+                .crop_pixels(
+                    image.width,
+                    image.height,
+                    Point {
+                        x: ox as f32,
+                        y: oy as f32,
+                    },
+                )
+                .map_or((image.width, image.height), |(x0, y0, x1, y1)| {
+                    (x1 - x0, y1 - y0)
+                }),
+        )
     }
     fn point(&self, lparam: LPARAM) -> (f32, f32) {
         (
@@ -97,6 +424,11 @@ impl WindowState {
         }
         self.pressed = None;
         self.drag_start = None;
+        self.pending_mark = None;
+        self.crop_grab = None;
+        if let Some(gesture) = self.moving_mark.take() {
+            self.document.marks[gesture.index] = gesture.original;
+        }
         self.background_pressed = None;
         self.background.dragging = None;
     }
@@ -109,7 +441,7 @@ pub struct Editor {
     _protection: std::fs::File,
     drag_image: Option<(u32, u32, Vec<u8>)>,
     output_path: Option<PathBuf>,
-    output_revision: u64,
+    output_revision: (u64, u64),
 }
 impl Editor {
     pub fn create(controller: HWND, source: HWND, path: &Path) -> Result<Self> {
@@ -127,10 +459,33 @@ impl Editor {
             view: View::default(),
             dark,
             hover: None,
+            hover_levels: Vec::new(),
+            hover_last_tick: Instant::now(),
             focus: None,
             pressed: None,
             palette_open: false,
-            selected_color: 4,
+            picker: Picker::default(),
+            picker_original: None,
+            stroke_open: false,
+            stroke_dragging: false,
+            stroke_original: None,
+            selected_color: 1,
+            custom_color: 0x006dfd,
+            active_tool: Control::Move,
+            pill_center: 0.0,
+            pill_motion: None,
+            stroke_width: 3.0,
+            drawing_stroke_width: 3.0,
+            text_size: 20.0,
+            next_counter: 1,
+            crop_mode: false,
+            crop_drag: None,
+            crop_grab: None,
+            text_editing: None,
+            document: Document::default(),
+            pending_mark: None,
+            moving_mark: None,
+            exported: None,
             background: Background::default(),
             committed_background: Background::default(),
             composed: None,
@@ -187,7 +542,7 @@ impl Editor {
                 _protection: protection,
                 drag_image: None,
                 output_path: None,
-                output_revision: 0,
+                output_revision: (0, 0),
             };
             editor.state.dpi = GetDpiForWindow(hwnd);
             editor.theme();
@@ -221,15 +576,44 @@ impl Editor {
         &self.path
     }
     pub fn image(&self) -> Option<&Raster> {
-        self.state.composed.as_ref().or(self.state.image.as_ref())
+        self.state
+            .exported
+            .as_ref()
+            .or(self.state.composed.as_ref())
+            .or(self.state.image.as_ref())
     }
     pub fn output(&mut self) -> Result<(&Path, &Raster)> {
-        if self.output_revision != self.state.background_revision {
+        self.state.finish_text(true);
+        let revision = (self.state.background_revision, self.state.document.revision);
+        if self.output_revision != revision {
             self.output_path = None;
-            self.output_revision = self.state.background_revision;
+            self.state.exported = None;
+            self.output_revision = revision;
+        }
+        if !self.state.document.marks.is_empty() && self.state.exported.is_none() {
+            let source = self
+                .state
+                .image
+                .as_ref()
+                .context("Screenshot is still opening")?;
+            let base = self.state.composed.as_ref().unwrap_or(source);
+            let (x, y) =
+                background::source_origin(source.width, source.height, &self.state.background)?;
+            self.state.exported = Some(document::flatten(
+                base,
+                &self.state.document.marks,
+                Point {
+                    x: x as f32,
+                    y: y as f32,
+                },
+            )?);
         }
         if self.output_path.is_none()
-            && let Some(composed) = &self.state.composed
+            && let Some(composed) = self
+                .state
+                .exported
+                .as_ref()
+                .or(self.state.composed.as_ref())
         {
             self.output_path = Some(storage::save_png(
                 &composed.pixels,
@@ -289,6 +673,97 @@ impl Editor {
         apply_theme(self.hwnd, self.state.dark);
     }
 
+    pub fn add_image(&mut self) -> Result<()> {
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+        use windows::Win32::{
+            System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree},
+            UI::Shell::{
+                Common::COMDLG_FILTERSPEC, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR,
+                FileOpenDialog, IFileOpenDialog, SIGDN_FILESYSPATH,
+            },
+        };
+        use windows::core::HRESULT;
+        let path = unsafe {
+            let dialog: IFileOpenDialog =
+                CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            dialog.SetTitle(w!("Add image to annotation"))?;
+            dialog.SetFileTypes(&[COMDLG_FILTERSPEC {
+                pszName: w!("PNG or JPEG image"),
+                pszSpec: w!("*.png;*.jpg;*.jpeg;*.bmp"),
+            }])?;
+            dialog.SetOptions(FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_NOCHANGEDIR)?;
+            match dialog.Show(Some(self.hwnd)) {
+                Ok(()) => {}
+                Err(error) if error.code() == HRESULT::from_win32(ERROR_CANCELLED.0) => {
+                    return Ok(());
+                }
+                Err(error) => return Err(error).context("Cannot open Add image dialog"),
+            }
+            let name = dialog.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+            let path = PathBuf::from(OsString::from_wide(name.as_wide()));
+            CoTaskMemFree(Some(name.0.cast()));
+            path
+        };
+        let overlay = Arc::new(storage::load_image(&path)?);
+        anyhow::ensure!(
+            self.state
+                .document
+                .asset_bytes()
+                .saturating_add(overlay.pixels.len())
+                <= 128 * 1024 * 1024,
+            "Imported image budget exceeded (128 MiB per editor, including undo history)"
+        );
+        let source = self
+            .state
+            .image
+            .as_ref()
+            .context("Screenshot is still opening")?;
+        let (lo, hi) = self.state.document.crop().unwrap_or((
+            Point::default(),
+            Point {
+                x: source.width as f32,
+                y: source.height as f32,
+            },
+        ));
+        let max_w = (hi.x - lo.x) * 0.65;
+        let max_h = (hi.y - lo.y) * 0.65;
+        let factor = (max_w / overlay.width as f32)
+            .min(max_h / overlay.height as f32)
+            .clamp(0.01, 1.0);
+        let (w, h) = (
+            overlay.width as f32 * factor,
+            overlay.height as f32 * factor,
+        );
+        let at = Point {
+            x: lo.x + (hi.x - lo.x - w) / 2.0,
+            y: lo.y + (hi.y - lo.y - h) / 2.0,
+        };
+        self.state.document.add(Mark {
+            shape: document::Shape::Image(
+                at,
+                Point {
+                    x: at.x + w,
+                    y: at.y + h,
+                },
+                overlay,
+            ),
+            color: 0xffffff,
+            width: 1.0,
+            opacity: 1.0,
+            angle: 0.0,
+        })?;
+        self.state.active_tool = Control::Move;
+        self.state.pill_motion = None;
+        self.state.pill_center = self
+            .state
+            .layout
+            .rect(Control::Move)
+            .map_or(0.0, |r| r.x + r.w / 2.0);
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+        Ok(())
+    }
     pub fn toggle_background(&mut self) -> Result<()> {
         self.state.background.open = !self.state.background.open;
         self.state.committed_background.open = self.state.background.open;
@@ -473,7 +948,7 @@ impl Editor {
         if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
             return Ok(Outcome::Canceled);
         }
-        let composed = self.state.composed.is_some();
+        let composed = self.state.background.selected() || !self.state.document.marks.is_empty();
         let (path, image) = self.output()?;
         let path = path.to_path_buf();
         let preview = if composed {
@@ -633,6 +1108,11 @@ fn resize_state(hwnd: HWND, state: &mut WindowState, width: u32, height: u32) ->
         width as f32 * 96.0 / state.dpi as f32,
         height as f32 * 96.0 / state.dpi as f32,
     );
+    state.pill_motion = None;
+    state.pill_center = state
+        .layout
+        .rect(state.active_tool)
+        .map_or(0.0, |r| r.x + r.w / 2.0);
     if state.background.open {
         state.background.scroll_y = state
             .background
@@ -642,10 +1122,8 @@ fn resize_state(hwnd: HWND, state: &mut WindowState, width: u32, height: u32) ->
         state.layout.canvas.x += shift;
         state.layout.canvas.w -= shift;
     }
-    if let Some(image) = state.composed.as_ref().or(state.image.as_ref()) {
-        state
-            .view
-            .clamp_pan(state.layout.canvas, image.width, image.height);
+    if let Some((w, h)) = state.view_size() {
+        state.view.clamp_pan(state.layout.canvas, w, h);
     }
     if let Some(renderer) = &state.renderer {
         renderer.resize(width, height, state.dpi)?;
@@ -688,15 +1166,16 @@ fn refresh_background(hwnd: HWND, state: &mut WindowState) -> Result<()> {
         } else {
             None
         };
-        if let Some(image) = composed.as_ref().or(state.image.as_ref()) {
-            if let Some(renderer) = &mut state.renderer {
-                renderer.set_image(image)?;
-            }
-            state
-                .view
-                .clamp_pan(state.layout.canvas, image.width, image.height);
+        if let Some(image) = composed.as_ref().or(state.image.as_ref())
+            && let Some(renderer) = &mut state.renderer
+        {
+            renderer.set_image(image)?;
         }
         state.composed = composed;
+        if let Some((w, h)) = state.view_size() {
+            state.view.clamp_pan(state.layout.canvas, w, h);
+        }
+        state.exported = None;
         state.view.fit_limit = if state.background.selected() {
             1.6
         } else {
@@ -753,6 +1232,96 @@ pub fn register_class() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rotation_and_resize_are_editable_gestures() {
+        let mut original = Mark::from_tool(
+            Control::Rectangle,
+            Point { x: 20.0, y: 20.0 },
+            0xff0000,
+            3.0,
+        )
+        .unwrap();
+        original.update(Point { x: 80.0, y: 60.0 });
+        let pivot = original.center();
+        let start = Point {
+            x: pivot.x,
+            y: pivot.y - 50.0,
+        };
+        let rotated = MarkGesture {
+            index: 0,
+            original: original.clone(),
+            start,
+            handle: None,
+            rotating: true,
+        }
+        .at(Point {
+            x: pivot.x + 50.0,
+            y: pivot.y,
+        });
+        assert!((rotated.angle - std::f32::consts::FRAC_PI_2).abs() < 0.001);
+        let before = rotated.handles()[2];
+        let corner = rotated.handles()[0];
+        let resized = MarkGesture {
+            index: 0,
+            original: rotated,
+            start: corner,
+            handle: Some(0),
+            rotating: false,
+        }
+        .at(corner.moved(10.0, -10.0));
+        let after = resized.handles()[2];
+        assert!((before.x - after.x).abs() < 0.01 && (before.y - after.y).abs() < 0.01);
+    }
+    #[test]
+    fn hover_eases_and_cleans_up_without_an_idle_timer() {
+        let mut levels = vec![(Control::Fill, 0.0)];
+        assert!(hover_step(&mut levels, Some(Control::Fill), 0.016));
+        let first = levels[0].1;
+        assert!(first > 0.0 && first < 1.0);
+        assert!(hover_step(&mut levels, Some(Control::Fill), 0.016));
+        assert!(levels[0].1 > first);
+        for _ in 0..25 {
+            hover_step(&mut levels, Some(Control::Fill), 0.016);
+        }
+        assert_eq!(levels[0].1, 1.0);
+        for _ in 0..25 {
+            hover_step(&mut levels, None, 0.016);
+        }
+        assert!(levels.is_empty());
+        assert!(!hover_step(&mut levels, None, 0.016));
+        let now = Instant::now();
+        let motion = PillMotion {
+            from: 100.0,
+            velocity: 0.0,
+            to: 129.0,
+            min: 90.0,
+            max: 150.0,
+            start: now,
+        };
+        assert_eq!(motion.position(now), (100.0, 0.0, true));
+        let (middle, velocity, _) = motion.position(now + std::time::Duration::from_millis(85));
+        assert!(middle > 100.0 && middle < 129.0 && velocity > 0.0);
+        let (overshoot, _, _) = motion.position(now + std::time::Duration::from_millis(285));
+        assert!(overshoot > 130.0 && overshoot < 134.0);
+        assert_eq!(
+            motion.position(now + std::time::Duration::from_millis(700)),
+            (129.0, 0.0, false)
+        );
+        let retarget = PillMotion {
+            from: middle,
+            velocity,
+            to: 105.0,
+            min: 90.0,
+            max: 150.0,
+            start: now + std::time::Duration::from_millis(85),
+        };
+        assert!((retarget.position(retarget.start).0 - middle).abs() < 0.001);
+        let edge = PillMotion {
+            to: 150.0,
+            ..motion
+        };
+        assert!(edge.position(now + std::time::Duration::from_millis(285)).0 <= 150.0);
+    }
     #[test]
     fn drag_preview_preserves_aspect_alpha_and_original() {
         let image = Raster {

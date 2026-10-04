@@ -6,6 +6,24 @@ pub struct Rect {
     pub w: f32,
     pub h: f32,
 }
+pub fn crop_actions(canvas: Rect) -> (Rect, Rect) {
+    let y = canvas.y + 12.0;
+    let x = canvas.x + canvas.w - 150.0;
+    (
+        Rect {
+            x,
+            y,
+            w: 68.0,
+            h: 32.0,
+        },
+        Rect {
+            x: x + 76.0,
+            y,
+            w: 68.0,
+            h: 32.0,
+        },
+    )
+}
 impl Rect {
     pub fn contains(self, x: f32, y: f32) -> bool {
         x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
@@ -45,10 +63,40 @@ pub enum Control {
     Upload,
 }
 impl Control {
-    pub fn enabled(self) -> bool {
+    pub fn is_drawing_tool(self) -> bool {
         matches!(
             self,
             Self::Move
+                | Self::Rectangle
+                | Self::Fill
+                | Self::Ellipse
+                | Self::Line
+                | Self::Arrow
+                | Self::Text
+                | Self::Pixelate
+                | Self::Spotlight
+                | Self::Counter
+                | Self::Pencil
+                | Self::Highlighter
+        )
+    }
+    pub fn enabled(self) -> bool {
+        matches!(
+            self,
+            Self::Crop
+                | Self::AddImage
+                | Self::Move
+                | Self::Rectangle
+                | Self::Fill
+                | Self::Ellipse
+                | Self::Line
+                | Self::Arrow
+                | Self::Pencil
+                | Self::Pixelate
+                | Self::Spotlight
+                | Self::Counter
+                | Self::Text
+                | Self::Stroke
                 | Self::Background
                 | Self::Color
                 | Self::Save
@@ -62,8 +110,10 @@ impl Control {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::Crop => "Crop",
-            Self::AddImage => "Add image",
+            Self::Crop => {
+                "Crop - drag to crop without changing source; click again to undo the last crop"
+            }
+            Self::AddImage => "Add PNG/JPEG/BMP image as an editable overlay",
             Self::Background => "Background",
             Self::Move => "Move / pan (hold middle mouse button)",
             Self::Rectangle => "Rectangle",
@@ -71,14 +121,18 @@ impl Control {
             Self::Ellipse => "Ellipse",
             Self::Line => "Line",
             Self::Arrow => "Arrow",
-            Self::Text => "Text",
-            Self::Pixelate => "Pixelate / blur",
-            Self::Spotlight => "Spotlight",
-            Self::Counter => "Counter",
-            Self::Pencil => "Pencil",
-            Self::Highlighter => "Smart highlighter",
-            Self::Color => "Color presets (custom picker not available yet)",
-            Self::Stroke => "Stroke size",
+            Self::Text => "Text - Unicode/IME editing; F2 edits a selected text object",
+            Self::Pixelate => {
+                "Image-based mosaic (visual only, not secure for sensitive information)"
+            }
+            Self::Spotlight => "Spotlight - drag to keep an area bright and dim its surroundings",
+            Self::Counter => "Counter - place sequential numbered markers",
+            Self::Pencil => "Pencil (smoothed freehand stroke)",
+            Self::Highlighter => {
+                "Text-aware highlight unavailable - disabled instead of pretending to detect text"
+            }
+            Self::Color => "Annotation colors and native custom color picker",
+            Self::Stroke => "Annotation stroke width",
             Self::Style => "Tool style",
             Self::Save => "Save as... (Ctrl+S)",
             Self::Minimize => "Minimize window",
@@ -313,14 +367,28 @@ impl Layout {
             controls,
         }
     }
+    pub fn stroke_rect(&self) -> Option<Rect> {
+        let control = self.rect(Control::Stroke)?;
+        Some(Rect {
+            x: (control.x + control.w / 2.0 - 152.0).clamp(8.0, (self.width - 312.0).max(8.0)),
+            y: TOP + 4.0,
+            w: 304.0,
+            h: 152.0,
+        })
+    }
+    pub fn stroke_at(&self, x: f32, text: bool) -> Option<f32> {
+        let r = self.stroke_rect()?;
+        let (min, range) = if text { (8.0, 64.0) } else { (1.0, 23.0) };
+        Some(min + ((x - r.x - 18.0) / 268.0).clamp(0.0, 1.0) * range)
+    }
     pub fn palette_rect(&self) -> Option<Rect> {
         let color = self.rect(Control::Color)?;
         Some(Rect {
-            x: (color.x + color.w / 2.0 - 24.0)
-                .min(self.width - 48.0)
+            x: (color.x + color.w / 2.0 - 27.0)
+                .min(self.width - 54.0)
                 .max(0.0),
             y: TOP + 2.0,
-            w: 48.0,
+            w: 54.0,
             h: 360.0,
         })
     }
