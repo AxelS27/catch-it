@@ -1,7 +1,7 @@
 //! Bounded FIFO preview queue. Overflow permanently drops the oldest unpinned
 //! thumbnail, never its PNG. Pins stay in chronological bottom-to-top order.
 use crate::{
-    settings::AutoClose,
+    settings::{AutoClose, Placement},
     thumbnail::{self, Thumbnail},
 };
 use anyhow::Result;
@@ -20,14 +20,16 @@ pub struct Gallery {
     items: Vec<Thumbnail>, // newest first; pins keep their chronological stack position
     capturing: bool,
     timeout: AutoClose,
+    placement: Placement,
 }
 
 impl Gallery {
-    pub fn new(timeout: AutoClose) -> Self {
+    pub fn new(timeout: AutoClose, placement: Placement) -> Self {
         Self {
             items: Vec::new(),
             capturing: false,
             timeout,
+            placement,
         }
     }
     pub fn len(&self) -> usize {
@@ -35,6 +37,16 @@ impl Gallery {
     }
     pub fn timeout(&self) -> AutoClose {
         self.timeout
+    }
+    pub fn placement(&self) -> Placement {
+        self.placement
+    }
+    pub fn set_placement(&mut self, placement: Placement) -> Result<()> {
+        self.placement = placement;
+        for item in &mut self.items {
+            item.set_placement(placement);
+        }
+        self.reflow()
     }
     pub fn clear(&mut self) {
         self.items.clear();

@@ -26,7 +26,7 @@ use windows::{
     core::{BOOL, w},
 };
 
-use crate::settings::AutoClose;
+use crate::settings::{AutoClose, Placement};
 use crate::{
     drag_drop::{Outcome, PreparedDrag, preview_pixels},
     geometry::Point,
@@ -69,6 +69,7 @@ struct WindowState {
     pinned: bool,
     pressed_control: Option<Control>,
     area: WorkArea,
+    placement: Placement,
 }
 
 pub struct Thumbnail {
@@ -96,6 +97,7 @@ impl Thumbnail {
         compositor: Rc<Compositor>,
         image: SavedScreenshot,
         timeout: AutoClose,
+        placement: Placement,
     ) -> Result<Self> {
         let mut motion_enabled = BOOL(1);
         unsafe {
@@ -130,6 +132,7 @@ impl Thumbnail {
             pinned: false,
             pressed_control: None,
             area,
+            placement,
         });
         unsafe {
             // Create hidden on the capture monitor, then ask Windows for its actual
@@ -169,7 +172,8 @@ impl Thumbnail {
             let dpi = GetDpiForWindow(hwnd);
             thumbnail.state.drag_width = GetSystemMetricsForDpi(SM_CXDRAG, dpi).max(1);
             thumbnail.state.drag_height = GetSystemMetricsForDpi(SM_CYDRAG, dpi).max(1);
-            thumbnail.state.layout = Layout::new(area, dpi, image.width, image.height)?;
+            thumbnail.state.layout =
+                Layout::placed(area, dpi, image.width, image.height, placement)?;
             let layout = thumbnail.state.layout;
             thumbnail.base = layout;
             SetWindowPos(
@@ -213,7 +217,28 @@ impl Thumbnail {
         self.visible
     }
     pub fn capacity(&self) -> usize {
-        self.base.stack_capacity(self.state.area)
+        self.base
+            .stack_capacity(self.state.area, self.state.placement)
+    }
+    pub fn set_placement(&mut self, placement: Placement) {
+        let before = self.state.placement;
+        if before == placement {
+            return;
+        }
+        let area = self.state.area;
+        if before.at_left() != placement.at_left() {
+            self.base.x = area.left
+                + (i64::from(area.width)
+                    - i64::from(self.base.x - area.left)
+                    - i64::from(self.base.width)) as i32;
+        }
+        if before.at_top() != placement.at_top() {
+            self.base.y = area.top
+                + (i64::from(area.height)
+                    - i64::from(self.base.y - area.top)
+                    - i64::from(self.base.height)) as i32;
+        }
+        self.state.placement = placement;
     }
     fn step(&self) -> u32 {
         self.base.stack_step()
@@ -300,7 +325,15 @@ impl Thumbnail {
     }
 
     pub fn show_slot(&mut self, slot: usize) -> Result<()> {
-        self.position(self.base.x, self.base.y - slot as i32 * self.step() as i32)?;
+        let step = slot as i32 * self.step() as i32;
+        self.position(
+            self.base.x,
+            if self.state.placement.at_top() {
+                self.base.y + step
+            } else {
+                self.base.y - step
+            },
+        )?;
         self.show()
     }
 

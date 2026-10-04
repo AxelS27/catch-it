@@ -202,6 +202,7 @@ impl App {
                     Rc::clone(&self.compositor),
                     image,
                     self.gallery.timeout(),
+                    self.gallery.placement(),
                 )?;
                 self.gallery.insert(preview)?;
                 self.capture_hidden(false)?;
@@ -428,7 +429,7 @@ impl App {
         let had_items = self.gallery.len() > 0;
         self.gallery.clear();
         if let Some(tray) = &self.tray {
-            tray.update(self.gallery.timeout(), 0);
+            tray.update(self.gallery.timeout(), self.gallery.placement(), 0);
         }
         had_items
     }
@@ -438,7 +439,11 @@ impl App {
             let _ = KillTimer(Some(self.controller), THUMBNAIL_TIMER);
         }
         if let Some(tray) = &self.tray {
-            tray.update(self.gallery.timeout(), self.gallery.len());
+            tray.update(
+                self.gallery.timeout(),
+                self.gallery.placement(),
+                self.gallery.len(),
+            );
         }
         if let Some(delay) = self.gallery.next_wake() {
             let millis = delay
@@ -498,8 +503,25 @@ impl App {
         let Some(timeout) = settings::AutoClose::ALL.get(index).copied() else {
             return Ok(());
         };
-        timeout.save()?;
+        settings::Settings {
+            auto_close: timeout,
+            placement: self.gallery.placement(),
+        }
+        .save()?;
         self.gallery.configure(timeout)?;
+        self.schedule_thumbnail_timer()
+    }
+
+    fn configure_placement(&mut self, index: usize) -> Result<()> {
+        let Some(placement) = settings::Placement::ALL.get(index).copied() else {
+            return Ok(());
+        };
+        settings::Settings {
+            auto_close: self.gallery.timeout(),
+            placement,
+        }
+        .save()?;
+        self.gallery.set_placement(placement)?;
         self.schedule_thumbnail_timer()
     }
 }
@@ -579,6 +601,7 @@ unsafe extern "system" fn controller_proc(
             | thumbnail::ANNOTATE
             | editor::ACTION
             | tray::SET_TIMEOUT_REQUEST
+            | tray::SET_PLACEMENT_REQUEST
             | tray::CLOSE_ALL_REQUEST
     ) || (message == WM_TIMER && matches!(wparam.0, THUMBNAIL_TIMER | CLIPBOARD_TIMER))
     {
@@ -658,6 +681,7 @@ fn run() -> Result<()> {
     }
     let initial_monitor = unsafe { MonitorFromPoint(pointer, MONITOR_DEFAULTTONEAREST) }.0 as isize;
     let worker = worker::Worker::new(controller, initial_monitor, sender);
+    let preferences = settings::Settings::load();
     let mut app = App {
         controller,
         tray: None,
@@ -665,7 +689,7 @@ fn run() -> Result<()> {
         worker,
         pending: false,
         overlay: None,
-        gallery: gallery::Gallery::new(settings::AutoClose::load()),
+        gallery: gallery::Gallery::new(preferences.auto_close, preferences.placement),
         compositor,
         started: Instant::now(),
         clipboard: None,
@@ -688,7 +712,11 @@ fn run() -> Result<()> {
         )
         .context("Prototype exit shortcut Ctrl + Alt + Q is unavailable")?;
     }
-    app.tray = Some(tray::Tray::new(controller, app.gallery.timeout())?);
+    app.tray = Some(tray::Tray::new(
+        controller,
+        app.gallery.timeout(),
+        app.gallery.placement(),
+    )?);
     println!("Simple Screenshot - running in the notification area");
     println!("Alt + Shift + S: select a region on the monitor under the pointer");
     println!("Esc / right-click: cancel. Ctrl + Alt + Q: quit.");
@@ -744,6 +772,7 @@ fn run() -> Result<()> {
                 editor::ACTION => app.editor_action(message.wParam, message.lParam.0),
                 WM_TIMER if message.wParam.0 == CLIPBOARD_TIMER => app.publish_clipboard(),
                 tray::SET_TIMEOUT_REQUEST => app.configure_timeout(message.wParam.0),
+                tray::SET_PLACEMENT_REQUEST => app.configure_placement(message.wParam.0),
                 tray::CLOSE_ALL_REQUEST => {
                     app.clear_thumbnail();
                     Ok(())

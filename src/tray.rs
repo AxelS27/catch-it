@@ -1,5 +1,5 @@
 //! Native notification-area icon and menu. No polling or App borrows in modal loops.
-use crate::settings::AutoClose;
+use crate::settings::{AutoClose, Placement};
 use anyhow::Result;
 use std::cell::Cell;
 use windows::{
@@ -15,25 +15,28 @@ pub const CAPTURE_REQUEST: u32 = WM_APP + 7;
 pub const QUIT_REQUEST: u32 = WM_APP + 8;
 pub const SET_TIMEOUT_REQUEST: u32 = WM_APP + 12;
 pub const CLOSE_ALL_REQUEST: u32 = WM_APP + 13;
+pub const SET_PLACEMENT_REQUEST: u32 = WM_APP + 18;
 const ICON_ID: u32 = 1;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1; // NINF_KEY
 const CAPTURE_ITEM: usize = 1;
 const QUIT_ITEM: usize = 2;
 const CLOSE_ALL_ITEM: usize = 3;
 const TIMER_BASE: usize = 100;
+const PLACEMENT_BASE: usize = 120;
 
 pub struct Tray {
     hwnd: HWND,
     icon: HICON,
     taskbar_created: u32,
     timeout: Cell<AutoClose>,
+    placement: Cell<Placement>,
     count: Cell<usize>,
 }
 
 impl Tray {
     /// The controller must be a hidden top-level window, not HWND_MESSAGE,
     /// so it receives Explorer's TaskbarCreated broadcast.
-    pub fn new(hwnd: HWND, timeout: AutoClose) -> Result<Box<Self>> {
+    pub fn new(hwnd: HWND, timeout: AutoClose, placement: Placement) -> Result<Box<Self>> {
         let pixels = icon_pixels();
         let mask = [0u8; 128]; // 32 x 32 monochrome AND mask, alpha supplies transparency.
         let icon = unsafe { CreateIcon(None, 32, 32, 1, 32, mask.as_ptr(), pixels.as_ptr()) }?;
@@ -42,6 +45,7 @@ impl Tray {
             icon,
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             timeout: Cell::new(timeout),
+            placement: Cell::new(placement),
             count: Cell::new(0),
         });
         anyhow::ensure!(
@@ -56,8 +60,9 @@ impl Tray {
         Ok(tray)
     }
 
-    pub fn update(&self, timeout: AutoClose, count: usize) {
+    pub fn update(&self, timeout: AutoClose, placement: Placement, count: usize) {
         self.timeout.set(timeout);
+        self.placement.set(placement);
         self.count.set(count);
     }
 
@@ -68,6 +73,9 @@ impl Tray {
             CLOSE_ALL_ITEM => (CLOSE_ALL_REQUEST, 0),
             id if (TIMER_BASE..TIMER_BASE + AutoClose::ALL.len()).contains(&id) => {
                 (SET_TIMEOUT_REQUEST, id - TIMER_BASE)
+            }
+            id if (PLACEMENT_BASE..PLACEMENT_BASE + Placement::ALL.len()).contains(&id) => {
+                (SET_PLACEMENT_REQUEST, id - PLACEMENT_BASE)
             }
             _ => return Ok(false),
         };
@@ -155,7 +163,7 @@ impl Tray {
                 GetCursorPos(&mut point)?;
             }
         }
-        let menu = Menu::new(self.timeout.get(), self.count.get())?;
+        let menu = Menu::new(self.timeout.get(), self.placement.get(), self.count.get())?;
         let previous = unsafe { GetForegroundWindow() };
         // Required by the shell for outside-click/Escape dismissal of tray menus.
         unsafe {
@@ -200,7 +208,7 @@ impl Drop for Tray {
 
 struct Menu(HMENU);
 impl Menu {
-    fn new(timeout: AutoClose, count: usize) -> Result<Self> {
+    fn new(timeout: AutoClose, placement: Placement, count: usize) -> Result<Self> {
         let menu = Self(unsafe { CreatePopupMenu() }?);
         unsafe {
             AppendMenuW(
@@ -226,6 +234,28 @@ impl Menu {
             }
             AppendMenuW(menu.0, MF_POPUP, timers.0.0 as usize, w!("Auto-close"))?;
             std::mem::forget(timers); // parent menu owns and destroys its submenu
+            let positions = Self(CreatePopupMenu()?);
+            for (index, choice) in Placement::ALL.into_iter().enumerate() {
+                let label: Vec<u16> = choice.label().encode_utf16().chain(Some(0)).collect();
+                AppendMenuW(
+                    positions.0,
+                    MF_STRING
+                        | if placement == choice {
+                            MF_CHECKED
+                        } else {
+                            MF_UNCHECKED
+                        },
+                    PLACEMENT_BASE + index,
+                    PCWSTR(label.as_ptr()),
+                )?;
+            }
+            AppendMenuW(
+                menu.0,
+                MF_POPUP,
+                positions.0.0 as usize,
+                w!("Quick Access position"),
+            )?;
+            std::mem::forget(positions);
             let label: Vec<u16> = format!("Close all screenshots ({count})")
                 .encode_utf16()
                 .chain(Some(0))
@@ -329,15 +359,21 @@ mod tests {
     }
 
     #[test]
-    fn native_menu_has_timer_submenu_checked_choice_and_close_all() -> Result<()> {
-        let menu = Menu::new(AutoClose::Never, 5).context("Cannot create tray menu")?;
+    fn native_menu_has_checked_timer_and_placement_submenus() -> Result<()> {
+        let menu = Menu::new(AutoClose::Never, Placement::TopLeft, 5)
+            .context("Cannot create tray menu")?;
         unsafe {
-            assert_eq!(GetMenuItemCount(Some(menu.0)), 5);
+            assert_eq!(GetMenuItemCount(Some(menu.0)), 6);
             assert_eq!(GetMenuItemID(menu.0, 0), CAPTURE_ITEM as u32);
-            assert_eq!(GetMenuItemID(menu.0, 4), QUIT_ITEM as u32);
+            assert_eq!(GetMenuItemID(menu.0, 5), QUIT_ITEM as u32);
             let timers = GetSubMenu(menu.0, 1);
             assert_eq!(GetMenuItemCount(Some(timers)), 6);
             assert!(GetMenuState(timers, TIMER_BASE as u32 + 5, MF_BYCOMMAND) & MF_CHECKED.0 != 0);
+            let positions = GetSubMenu(menu.0, 2);
+            assert_eq!(GetMenuItemCount(Some(positions)), 4);
+            assert!(
+                GetMenuState(positions, PLACEMENT_BASE as u32, MF_BYCOMMAND) & MF_CHECKED.0 != 0
+            );
         }
         Ok(())
     }
