@@ -469,7 +469,7 @@ impl Editor {
             stroke_open: false,
             stroke_dragging: false,
             stroke_original: None,
-            selected_color: 4,
+            selected_color: 1,
             custom_color: 0x006dfd,
             active_tool: Control::Move,
             pill_center: 0.0,

@@ -618,7 +618,7 @@ impl Document {
         );
         let i = self.marks.len();
         self.marks.push(mark.clone());
-        self.selected = Some(i);
+        self.selected = (!matches!(mark.shape, Shape::Pencil(..))).then_some(i);
         self.record(Change {
             index: i,
             before: None,
@@ -740,9 +740,9 @@ impl Document {
             (Some(_), Some(mark)) => self.marks[change.index] = mark.clone(),
             (None, None) => unreachable!(),
         }
-        self.selected = target
-            .as_ref()
-            .and_then(|mark| (!matches!(mark.shape, Shape::Crop(..))).then_some(change.index));
+        self.selected = target.as_ref().and_then(|mark| {
+            (!matches!(mark.shape, Shape::Crop(..) | Shape::Pencil(..))).then_some(change.index)
+        });
         self.revision = self.revision.wrapping_add(1);
     }
     pub fn undo(&mut self) -> bool {
@@ -1252,6 +1252,21 @@ mod tests {
             &base.pixels[(25 * 64 + 35) * 4..(25 * 64 + 35) * 4 + 4],
             &[255, 0, 0, 255]
         );
+        Ok(())
+    }
+    #[test]
+    fn finished_pencil_does_not_force_edit_handles_but_remains_reselectable() -> Result<()> {
+        let mut document = Document::default();
+        let mut pencil =
+            Mark::from_tool(Control::Pencil, Point { x: 4.0, y: 4.0 }, 0xf92d3a, 3.0).unwrap();
+        pencil.update(Point { x: 24.0, y: 4.0 });
+        assert!(pencil.finish());
+        document.add(pencil)?;
+        assert_eq!(document.selected, None);
+        assert_eq!(document.hit(Point { x: 14.0, y: 4.0 }, 3.0), Some(0));
+        assert!(document.undo());
+        assert!(document.redo());
+        assert_eq!(document.selected, None);
         Ok(())
     }
     #[test]

@@ -445,8 +445,8 @@ impl Renderer {
                 self.line((x - 2.5, y + 1.0), (x + 1.0, y + 4.0), rgb, 1.4);
             }
             Control::Highlighter => {
-                self.line((x - 5.5, y + 4.5), (x - 1.0, y - 5.0), rgb, 2.3);
-                self.line((x - 1.0, y - 5.0), (x + 5.5, y + 4.5), rgb, 2.3);
+                self.line((x - 5.5, y + 4.5), (x, y - 5.0), rgb, 2.3);
+                self.line((x, y - 5.0), (x + 5.5, y + 4.5), rgb, 2.3);
                 self.line((x - 3.5, y + 1.0), (x + 3.5, y + 1.0), rgb, 1.7);
                 self.line((x - 6.5, y + 6.5), (x + 6.5, y + 6.5), rgb, 2.1);
             }
@@ -1038,17 +1038,34 @@ impl Renderer {
                 let (x, y) = map(*center);
                 let radius = mark.counter_radius() * scale;
                 self.circle(x, y, radius, mark.color, true);
+                // Scale the glyph with the badge, including fractional Fit/zoom values.
+                // Preserve any outer transform so rotated counters keep their rotation.
+                let factor = (radius * 1.12 / 16.0).max(0.01);
+                let mut previous = windows_numerics::Matrix3x2::default();
+                unsafe { self.target.GetTransform(&mut previous) };
+                let (tx, ty) = (x * (1.0 - factor), y * (1.0 - factor));
+                let matrix = windows_numerics::Matrix3x2 {
+                    M11: factor * previous.M11,
+                    M12: factor * previous.M12,
+                    M21: factor * previous.M21,
+                    M22: factor * previous.M22,
+                    M31: tx * previous.M11 + ty * previous.M21 + previous.M31,
+                    M32: tx * previous.M12 + ty * previous.M22 + previous.M32,
+                };
+                unsafe { self.target.SetTransform(&matrix) };
+                let unscaled_radius = radius / factor;
                 self.text(
                     &number.to_string(),
                     Rect {
-                        x: x - radius,
-                        y: y - radius,
-                        w: radius * 2.0,
-                        h: radius * 2.0,
+                        x: x - unscaled_radius,
+                        y: y - unscaled_radius,
+                        w: unscaled_radius * 2.0,
+                        h: unscaled_radius * 2.0,
                     },
                     0xffffff,
                     true,
                 );
+                unsafe { self.target.SetTransform(&previous) };
             }
             Shape::Crop(..) => {}
             Shape::Image(a, b, overlay) => {

@@ -19,10 +19,11 @@ param(
     [switch]$TextOnly,
     [switch]$CropOnly,
     [switch]$ImageOnly,
-    [switch]$EditableOnly
+    [switch]$EditableOnly,
+    [switch]$PolishOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly -or $PolishOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -1250,6 +1251,46 @@ function Test-Image {
     if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Import modified source PNG.'}
     Write-Host 'PASS: native Add Image dialog, transparent imported PNG in full-resolution output, source unchanged'
 }
+function Count-WhiteGlyph([string]$Path,[int]$X,[int]$Y,[int]$Radius) {
+    $image=[Drawing.Bitmap]::new($Path);$count=0
+    try{
+        for($dy=-$Radius;$dy -le $Radius;$dy++) {for($dx=-$Radius;$dx -le $Radius;$dx++) {
+            $p=$image.GetPixel($X+$dx,$Y+$dy)
+            if($p.R -gt 220 -and $p.G -gt 220 -and $p.B -gt 220){$count++}
+        }}
+    }finally{$image.Dispose()}
+    return $count
+}
+function Test-Polish {
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $preview=New-TestPreview
+    $hash=(Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $preview.Window 'Annotate';$editor=Wait-Editor
+    $bounds=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    $sx=[int]($bounds.Left+($bounds.Right-$bounds.Left-350*$s)/2)
+    $sy=[int]($bounds.Top+48*$s+($bounds.Bottom-$bounds.Top-96*$s-200*$s)/2)
+    Click-EditorAction $editor 'Counter';[CaptureInput]::ClickAt([int]($sx+175*$s),[int]($sy+100*$s))
+    Start-Sleep -Milliseconds 100;Save-GalleryScreenshot 'editor-polish-counter-100.png'
+    $normal=Count-WhiteGlyph '.pi/capture-smoke/editor-polish-counter-100.png' ([int]($sx+175*$s)) ([int]($sy+100*$s)) ([int](9*$s))
+    Click-EditorAction $editor 'Zoom';Select-TrayItem '200%' -Accessible
+    Start-Sleep -Milliseconds 150;Save-GalleryScreenshot 'editor-polish-counter-200.png'
+    $enlarged=Count-WhiteGlyph '.pi/capture-smoke/editor-polish-counter-200.png' ([int]($sx+175*$s)) ([int]($sy+100*$s)) ([int](18*$s))
+    Click-EditorAction $editor 'Zoom';Select-TrayItem '100%' -Accessible
+    Click-EditorAction $editor 'Pencil'
+    [CaptureInput]::HoldAt([int]($sx+250*$s),[int]($sy+175*$s))
+    [CaptureInput]::MouseAt([int]($sx+290*$s),[int]($sy+175*$s),0)
+    [CaptureInput]::DropAt([int]($sx+290*$s),[int]($sy+175*$s))
+    Start-Sleep -Milliseconds 140;Save-GalleryScreenshot 'editor-polish-pencil.png'
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$output=Wait-NewShot $before
+    $image=[Drawing.Bitmap]::new($output)
+    try{$badge=$image.GetPixel(175,90);if($badge.R -lt 180 -or $badge.G -gt 130){throw "Default color is not red: $badge"}}finally{$image.Dispose()}
+    if($normal -lt 10 -or $enlarged -lt $normal*2.5){throw "Counter numeral does not scale with zoom: $normal -> $enlarged white pixels"}
+    $image=[Drawing.Bitmap]::new('.pi/capture-smoke/editor-polish-pencil.png')
+    try{$p=$image.GetPixel([int]($sx+250*$s),[int]($sy+175*$s));if($p.R -gt 220 -and $p.G -gt 220 -and $p.B -gt 220){throw "Pencil is still selected with a white resize handle: $p"}}finally{$image.Dispose()}
+    if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Editing changed the source.'}
+    Write-Host 'PASS: default red, Pencil ends without edit handles, Counter numeral scales with zoom, source unchanged'
+}
 function Test-Editable {
     Close-AllPreviews;Set-AutoClose 'Never' 'never'
     $preview=New-TestPreview
@@ -2263,6 +2304,7 @@ try {
     elseif ($CropOnly) { Test-Crop }
     elseif ($ImageOnly) { Test-Image }
     elseif ($EditableOnly) { Test-Editable }
+    elseif ($PolishOnly) { Test-Polish }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }
