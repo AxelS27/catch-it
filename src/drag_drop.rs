@@ -1,6 +1,18 @@
 //! Native Shell IDataObject supplies CF_HDROP and Shell metadata; OLE owns the
 //! modal drag loop. We do not implement file transfers or terminal text injection.
-use std::{cell::Cell, os::windows::ffi::OsStrExt, path::Path, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    os::windows::ffi::OsStrExt,
+    path::Path,
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use windows::{
@@ -46,7 +58,6 @@ pub enum Outcome {
 #[implement(IDropSource, Agile = false)]
 struct DropSource {
     cancel: Rc<Cell<bool>>,
-    visual: Option<Rc<DragVisual>>,
 }
 
 impl IDropSource_Impl for DropSource_Impl {
@@ -56,11 +67,6 @@ impl IDropSource_Impl for DropSource_Impl {
         } else if keys.0 & MK_LBUTTON.0 == 0 {
             DRAGDROP_S_DROP
         } else {
-            if let Some(visual) = &self.visual
-                && let Err(error) = visual.move_to_cursor(false)
-            {
-                return error.code();
-            }
             S_OK
         }
     }
@@ -128,7 +134,7 @@ pub fn preview_pixels(pixels: &[u8], width: u32, height: u32) -> Result<(Vec<u8>
 pub struct PreparedDrag {
     data: IDataObject,
     source: IDropSource,
-    visual: Rc<DragVisual>,
+    visual: DragVisualWorker,
 }
 
 impl PreparedDrag {
@@ -141,13 +147,8 @@ impl PreparedDrag {
         cancel: Rc<Cell<bool>>,
     ) -> Result<Self> {
         let data = file_data_object(path)?;
-        let bitmap = drag_bitmap(pixels, width, height)?;
-        let visual = Rc::new(DragVisual::new(&bitmap, width, height, offset)?);
-        let source = DropSource {
-            cancel,
-            visual: Some(Rc::clone(&visual)),
-        }
-        .into();
+        let visual = DragVisualWorker::new(pixels.to_vec(), width, height, offset)?;
+        let source = DropSource { cancel }.into();
         Ok(Self {
             data,
             source,
@@ -156,14 +157,11 @@ impl PreparedDrag {
     }
 
     pub fn run(&self) -> Result<Outcome> {
-        self.visual.move_to_cursor(true)?;
         let mut effect = DROPEFFECT_NONE;
         // OLE is initialized on the UI STA. Objects and visual outlive its
         // nested loop; the transparent layered window is never a drop target.
         let status = unsafe { DoDragDrop(&self.data, &self.source, DROPEFFECT_COPY, &mut effect) };
-        unsafe {
-            let _ = ShowWindow(self.visual.hwnd, SW_HIDE);
-        }
+        self.visual.stop();
         status.ok().context("Windows drag-and-drop failed")?;
         Ok(if status == DRAGDROP_S_DROP && effect == DROPEFFECT_COPY {
             Outcome::Copied
@@ -209,12 +207,95 @@ unsafe extern "system" fn drag_window_proc(
     }
 }
 
-/// One cached, premultiplied bitmap. Windows composes it; pointer movement only
-/// changes position, with no CPU frame rendering or idle polling.
-/// Layered + transparent makes hit testing pass through across process boundaries.
+/// OLE's source STA can pause inside a browser's DragOver callback. Own the
+/// layered image on a separate UI thread so its motion is not gated by the
+/// target website or the modal DoDragDrop loop.
+struct DragVisualWorker {
+    stop_requested: Arc<AtomicBool>,
+    thread: RefCell<Option<JoinHandle<()>>>,
+}
+impl DragVisualWorker {
+    fn new(pixels: Vec<u8>, width: u32, height: u32, offset: POINT) -> Result<Self> {
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stop_requested);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (offset_x, offset_y) = (offset.x, offset.y);
+        let thread = thread::Builder::new()
+            .name("screenshot-drag-image".into())
+            .spawn(move || {
+                let ready = (|| {
+                    let bitmap = drag_bitmap(&pixels, width, height)?;
+                    let visual = DragVisual::new(
+                        &bitmap,
+                        width,
+                        height,
+                        POINT {
+                            x: offset_x,
+                            y: offset_y,
+                        },
+                    )?;
+                    visual.move_to_cursor(true)?;
+                    Ok::<_, anyhow::Error>(visual)
+                })();
+                match ready {
+                    Ok(visual) => {
+                        if ready_tx.send(Ok(())).is_err() {
+                            return;
+                        }
+                        while !stop.load(Ordering::Relaxed) {
+                            // This thread owns the HWND. Pump hit-test/window-position
+                            // messages so cross-process drop targets remain reachable.
+                            unsafe {
+                                let mut message = MSG::default();
+                                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                                    let _ = TranslateMessage(&message);
+                                    DispatchMessageW(&message);
+                                }
+                            }
+                            if visual.move_to_cursor(false).is_err() {
+                                break;
+                            }
+                            thread::sleep(Duration::from_millis(8));
+                        }
+                        unsafe {
+                            let _ = ShowWindow(visual.hwnd, SW_HIDE);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                    }
+                }
+            })?;
+        let ready = ready_rx
+            .recv()
+            .context("Drag-image worker failed during setup")?;
+        if let Err(error) = ready {
+            let _ = thread.join();
+            return Err(error);
+        }
+        Ok(Self {
+            stop_requested,
+            thread: RefCell::new(Some(thread)),
+        })
+    }
+    fn stop(&self) {
+        self.stop_requested.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.borrow_mut().take() {
+            let _ = thread.join();
+        }
+    }
+}
+impl Drop for DragVisualWorker {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+/// One cached, premultiplied bitmap. Only position moves on the worker;
+/// Windows composes it and transparent hit-testing reaches the drop target.
 struct DragVisual {
     hwnd: HWND,
     offset: POINT,
+    last: Cell<Option<(i32, i32)>>,
 }
 impl DragVisual {
     fn new(bitmap: &Bitmap, width: u32, height: u32, offset: POINT) -> Result<Self> {
@@ -237,7 +318,11 @@ impl DragVisual {
                 Some(GetModuleHandleW(None)?.into()),
                 None,
             )?;
-            let visual = Self { hwnd, offset };
+            let visual = Self {
+                hwnd,
+                offset,
+                last: Cell::new(None),
+            };
             let dc = CreateCompatibleDC(None);
             if dc.is_invalid() {
                 return Err(windows::core::Error::from_thread().into());
@@ -281,21 +366,29 @@ impl DragVisual {
         unsafe {
             let mut cursor = POINT::default();
             GetCursorPos(&mut cursor)?;
+            let position = (cursor.x - self.offset.x, cursor.y - self.offset.y);
+            if !show && self.last.get() == Some(position) {
+                return Ok(());
+            }
             SetWindowPos(
                 self.hwnd,
-                Some(HWND_TOPMOST),
-                cursor.x - self.offset.x,
-                cursor.y - self.offset.y,
+                None,
+                position.0,
+                position.1,
                 0,
                 0,
                 SWP_NOACTIVATE
                     | SWP_NOSIZE
+                    | SWP_NOZORDER
+                    | SWP_NOSENDCHANGING
                     | if show {
                         SWP_SHOWWINDOW
                     } else {
                         SET_WINDOW_POS_FLAGS(0)
                     },
-            )
+            )?;
+            self.last.set(Some(position));
+            Ok(())
         }
     }
 }
@@ -369,7 +462,6 @@ mod tests {
         let cancel = Rc::new(Cell::new(false));
         let source: IDropSource = DropSource {
             cancel: Rc::clone(&cancel),
-            visual: None,
         }
         .into();
         unsafe {

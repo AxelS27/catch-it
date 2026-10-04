@@ -49,7 +49,7 @@ Implemented:
 - Native OLE file drag using Shell `IDataObject` / `CF_HDROP` and a non-agile `IDropSource` on the UI STA.
 - DPI-aware system drag threshold; a click alone does not initiate a drag.
 - Copy-only operation: Explorer copies the PNG, and compatible terminals receive its file path.
-- The miniature native drag image downsamples the cached premultiplied GPU card pixels while retaining its centered cover crop. Theme-dependent borders are drawn only on the on-screen card; no second PNG decode occurs when dragging. It follows the pointer even over unsupported targets; no focus activation or target hit-test interference. The entire filled card supports hover, drag, and dismissal.
+- The miniature native drag image downsamples the cached premultiplied GPU card pixels while retaining its centered cover crop. Theme-dependent borders are drawn only on the on-screen card; no second PNG decode occurs when dragging. A dedicated Win32 thread positions its cached, transparent layered window while the OLE source STA handles the drop target; pointer-follow no longer waits for the target website's drag callbacks. It follows the pointer even over unsupported targets without taking focus or blocking target hit tests. The entire filled card supports hover, drag, and dismissal.
 - Lifetime pauses for the entire OLE modal loop. Escape or rejected drops restore the preview and its remaining lifetime.
 - Successful drops dismiss an unpinned preview, not the PNG. A pinned reference remains available after a successful drop. Quit safely cancels an active drag.
 - Automatic cleanup at startup and once per hour on a separate sleeping thread, never on the capture/render thread.
@@ -117,6 +117,15 @@ cargo build --release
 ```
 
 Unit tests cover selection direction, clamping, empty regions, crop boundaries, display-rotation transforms, invalid PNG buffers, and a real WIC PNG round trip through a Unicode filename containing spaces. Thumbnail tests cover layout at 100%, 125%, 150%, and 200% scaling, negative monitor origins, extreme aspect ratios, rounded hit testing, hover/drag/capture-hidden timing, pin/unpin lifecycles, Never, interval changes, interrupted dismissal, disabled motion, distinct DPI-scaled controls, permanent queue eviction/no-resurrection, chronological pin placement/compaction, screen-derived capacity, and persisted settings. Drag tests check actual COM source behavior, STA affinity, unchanged premultiplied card-pixel upload, invalid drag buffers, system thresholds, and native `CF_HDROP` paths with spaces and Unicode.
+
+### Focused browser drag test
+
+```powershell
+./scripts/smoke-capture.ps1 -Configuration release -WebDragOnly
+./scripts/smoke-capture.ps1 -Configuration release -QuickAccessOnly
+```
+
+The first test drags a real Quick Access screenshot and a native editor `Drag Me` output into an isolated local Chrome HTML5 drop zone, including a deliberately slow drag-over handler; it samples pointer-follow latency and verifies the source PNG remains unchanged. The second covers a long canceled drag, rejected target, and copy-only Explorer drop. These checks do not establish how WhatsApp or ChatGPT process drops on their own pages.
 
 ### Focused drawing test
 
