@@ -20,10 +20,11 @@ param(
     [switch]$CropOnly,
     [switch]$ImageOnly,
     [switch]$EditableOnly,
-    [switch]$PolishOnly
+    [switch]$PolishOnly,
+    [switch]$SliderOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly -or $PolishOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly -or $PolishOnly -or $SliderOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -1038,9 +1039,77 @@ function Assert-EditorPalettePixel([int]$X,[int]$Y,[int]$Argb) {
     Save-GalleryScreenshot 'editor-palette-failure.png'
     throw "Palette pixel $X,$Y did not match color $Argb"
 }
+function Test-Sliders {
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-1),0,0,0,0,0x13)
+    $capture=New-TestPreview
+    $sourceHash=(Get-FileHash -LiteralPath $capture.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $capture.Window 'Annotate';$editor=Wait-Editor
+    $r=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    [CaptureInput]::ClickAt([int]($r.Left+88*$s),[int]($r.Top+24*$s))
+    Start-Sleep -Milliseconds 200
+    $r=[CaptureInput]::ClientBounds($editor)
+    $at={param([double]$X,[double]$Y)[CaptureInput]::ClickAt([int]($r.Left+$X*$s),[int]($r.Top+$Y*$s))}
+    & $at 131 285 # gradient
+    Save-GalleryScreenshot 'background-slider-default.png'
+    $image=[Drawing.Bitmap]::new('.pi/capture-smoke/background-slider-default.png')
+    try{$toggle=$image.GetPixel([int]($r.Left+234*$s),[int]($r.Top+704*$s));if($toggle.R -lt 210){throw "Auto-balance is not enabled by default: $toggle"}}finally{$image.Dispose()}
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$initial=Wait-NewShot $before
+    & $at 222 660; & $at 109 710; & $at 241 759; & $at 228 704 # move sliders and turn auto-balance off
+    & $at 211 626 # Reset adjustments; keep the chosen background style
+    Save-GalleryScreenshot 'background-slider-reset.png'
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$reset=Wait-NewShot $before
+    $a=[IO.File]::ReadAllBytes($initial);$b=[IO.File]::ReadAllBytes($reset)
+    if(-not [Linq.Enumerable]::SequenceEqual([byte[]]$a,[byte[]]$b)){throw 'Reset did not restore the original background output and selected style.'}
+    if((Get-FileHash -LiteralPath $capture.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Slider controls changed the source PNG.'}
+    Write-Host 'PASS: default auto-balance on, Reset restores adjustments without changing style or source'
+    Click-EditorAction $editor 'Close';Close-AllPreviews
+    $screen=[Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $x1=$screen.Left+80;$y1=$screen.Top+80
+    $x2=[Math]::Min($screen.Right-60,$x1+1600);$y2=[Math]::Min($screen.Bottom-60,$y1+800)
+    $beforeWindows=[CaptureInput]::ThumbnailWindows($false);$before=@(Get-Shots)
+    [void](Start-Selection)
+    [CaptureInput]::HoldAt($x1,$y1)
+    [CaptureInput]::MouseAt($x2,$y2,0);[CaptureInput]::DropAt($x2,$y2)
+    $largeShot=Wait-NewShot $before;$largePreview=Wait-NewPreview $beforeWindows
+    $largeHash=(Get-FileHash -LiteralPath $largeShot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $largePreview 'Annotate';$largeEditor=Wait-Editor
+    $r=[CaptureInput]::ClientBounds($largeEditor);$s=[CaptureInput]::GetDpiForWindow($largeEditor)/96.0
+    [CaptureInput]::ClickAt([int]($r.Left+88*$s),[int]($r.Top+24*$s));Start-Sleep -Milliseconds 140
+    $r=[CaptureInput]::ClientBounds($largeEditor)
+    [CaptureInput]::ClickAt([int]($r.Left+131*$s),[int]($r.Top+285*$s))
+    Start-Sleep -Milliseconds 220
+    $sliderY=[int]($r.Top+660*$s);$start=[int]($r.Left+45*$s)
+    [CaptureInput]::HoldAt($start,$sliderY);Start-Sleep -Milliseconds 70
+    $clock=[Diagnostics.Stopwatch]::StartNew()
+    for($i=1;$i -le 15;$i++){
+        [CaptureInput]::MouseAt([int]($start+12*$s*$i),$sliderY,0)
+        Start-Sleep -Milliseconds 30
+        if($i -eq 8){Start-Sleep -Milliseconds 100;Save-GalleryScreenshot 'background-slider-drag-large.png'}
+    }
+    [CaptureInput]::DropAt([int]($start+180*$s),$sliderY)
+    $clock.Stop()
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$output=Wait-NewShot $before
+    if((Get-FileHash -LiteralPath $largeShot -Algorithm SHA256).Hash -ne $largeHash){throw 'Large capture source changed while sliding.'}
+    $src=[Drawing.Bitmap]::new($largeShot);$dst=[Drawing.Bitmap]::new($output)
+    try{
+        if($dst.Width -le $src.Width -or $dst.Height -le $src.Height){throw 'Large capture background export lost its padding.'}
+        if($dst.GetPixel(0,0).ToArgb() -eq $src.GetPixel(0,0).ToArgb()){throw 'Large capture gradient was not applied.'}
+    }finally{$src.Dispose();$dst.Dispose()}
+    $during=[Drawing.Bitmap]::new('.pi/capture-smoke/background-slider-drag-large.png')
+    try{
+        $thumbX=[int]($r.Left+(45+12*8)*$s);$thumbY=[int]($r.Top+660*$s)
+        $thumb=$during.GetPixel($thumbX,$thumbY)
+        if($thumb.R -lt 210 -or $thumb.G -lt 210){throw "Slider preview did not keep up with drag midpoint: $thumb"}
+    }finally{$during.Dispose()}
+    Write-Host "PASS: live drag preview on a large real capture; full-resolution export after release ($($clock.ElapsedMilliseconds) ms for 15 spaced pointer steps plus screenshot)"
+}
 function Test-Background {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run BackgroundOnly with pwsh -Sta.'}
     Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-1),0,0,0,0,0x13)
     $first=New-TestPreview
     $hash=(Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash
     [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
@@ -1211,7 +1280,7 @@ function Test-Background {
     [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10))
     Assert-ClipboardImage $first.Shot
     if((Get-FileHash -LiteralPath $first.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Background Tool changed the original PNG.'}
-    Write-Host 'PASS: native Background panel, gradients/wallpapers/blur, live controls on small windows, auto-balance, Save/Copy output, None reset and original PNG intact'
+    Write-Host 'PASS: native Background panel, gradients/wallpapers/blur, live controls on small windows, auto-balance, Save/Copy output, None removes background and original PNG intact'
 }
 function Test-Image {
     Close-AllPreviews;Set-AutoClose 'Never' 'never'
@@ -2305,6 +2374,7 @@ try {
     elseif ($ImageOnly) { Test-Image }
     elseif ($EditableOnly) { Test-Editable }
     elseif ($PolishOnly) { Test-Polish }
+    elseif ($SliderOnly) { Test-Sliders }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }

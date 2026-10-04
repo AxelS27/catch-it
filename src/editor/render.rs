@@ -1429,6 +1429,19 @@ impl Renderer {
             if dark { 0x414145 } else { 0xd5d5d8 },
             1.0,
         );
+        let reset = Rect {
+            x: 183.0,
+            y: base + 567.0 + offset,
+            w: 61.0,
+            h: 24.0,
+        };
+        self.pill(reset, if dark { 0x34343b } else { 0xe3e3e8 }, 6.0);
+        self.text(
+            "Reset",
+            reset,
+            if dark { 0xddeaff } else { 0x1766a9 },
+            false,
+        );
         for (slider, name) in [
             (Slider::Padding, "Padding"),
             (Slider::Inset, "Inset"),
@@ -1655,6 +1668,11 @@ impl Renderer {
             }
             if let Some(bitmap) = &self.bitmap {
                 unsafe {
+                    let size = bitmap.GetPixelSize();
+                    let (sx, sy) = (
+                        size.width as f32 / image.width as f32,
+                        size.height as f32 / image.height as f32,
+                    );
                     self.target.DrawBitmap(
                         bitmap,
                         Some(&rect(r)),
@@ -1667,10 +1685,10 @@ impl Renderer {
                             D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
                         },
                         Some(&D2D_RECT_F {
-                            left: cx as f32,
-                            top: cy as f32,
-                            right: ex as f32,
-                            bottom: ey as f32,
+                            left: cx as f32 * sx,
+                            top: cy as f32 * sy,
+                            right: ex as f32 * sx,
+                            bottom: ey as f32 * sy,
                         }),
                     );
                 }

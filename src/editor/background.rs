@@ -52,6 +52,7 @@ pub enum Target {
     Solid(usize),
     Blurred(usize),
     Slider(Slider),
+    Reset,
     AutoBalance,
     ToggleGradients,
 }
@@ -86,13 +87,22 @@ impl Default for Background {
             inset: 0.0,
             shadow: 0.30,
             corners: 0.20,
-            auto_balance: false,
+            auto_balance: true,
             dragging: None,
             scroll_y: 0.0,
         }
     }
 }
 impl Background {
+    /// Restore adjustment defaults without discarding the chosen backdrop or sidebar position.
+    pub fn reset_adjustments(&mut self) {
+        let defaults = Self::default();
+        self.padding = defaults.padding;
+        self.inset = defaults.inset;
+        self.shadow = defaults.shadow;
+        self.corners = defaults.corners;
+        self.auto_balance = defaults.auto_balance;
+    }
     pub fn max_scroll(&self, client_height: f32) -> f32 {
         let content_height = if self.expanded { 730.0 } else { 538.0 };
         (content_height - (client_height - PANEL_TOP - PANEL_BOTTOM)).max(0.0)
@@ -126,7 +136,8 @@ impl Background {
             Slider::Shadow => &mut self.shadow,
             Slider::Corners => &mut self.corners,
         };
-        let changed = (*field - value).abs() > 0.001;
+        // Slider state is continuous. Raster dimensions still land on integer pixels at export.
+        let changed = *field != value;
         *field = value;
         changed
     }
@@ -172,6 +183,9 @@ impl Background {
             if row < 2 && col < 9 {
                 return Some(Target::Solid(row * 9 + col));
             }
+        }
+        if (565.0..593.0).contains(&y) && (183.0..245.0).contains(&x) {
+            return Some(Target::Reset);
         }
         if (637.0..669.0).contains(&y) && (142.0..250.0).contains(&x) {
             return Some(Target::AutoBalance);
@@ -333,8 +347,57 @@ pub fn source_origin(width: u32, height: u32, settings: &Background) -> Result<(
     Ok((frame, frame.saturating_sub(shift)))
 }
 
-/// Composite at original-pixel scale. A 256 MiB bound prevents slider drags
-/// from allocating an unbounded raster for huge captures.
+/// Bounded working raster for responsive live drags. Never used for saved output.
+pub fn drag_source(source: &Raster) -> Raster {
+    if source.width == 0 || source.height == 0 {
+        return Raster {
+            width: source.width,
+            height: source.height,
+            pixels: source.pixels.clone(),
+        };
+    }
+    let factor = (900.0 / source.width.max(source.height) as f32).min(1.0);
+    let width = (source.width as f32 * factor).round().max(1.0) as u32;
+    let height = (source.height as f32 * factor).round().max(1.0) as u32;
+    let mut pixels = vec![0; width as usize * height as usize * 4];
+    for y in 0..height {
+        let sy = ((y as f32 + 0.5) / factor)
+            .floor()
+            .min((source.height - 1) as f32) as usize;
+        for x in 0..width {
+            let sx = ((x as f32 + 0.5) / factor)
+                .floor()
+                .min((source.width - 1) as f32) as usize;
+            let from = (sy * source.width as usize + sx) * 4;
+            let to = (y as usize * width as usize + x as usize) * 4;
+            pixels[to..to + 4].copy_from_slice(&source.pixels[from..from + 4]);
+        }
+    }
+    Raster {
+        width,
+        height,
+        pixels,
+    }
+}
+/// Full-resolution output dimensions, including the same export memory limit.
+pub fn output_size(width: u32, height: u32, settings: &Background) -> Result<(u32, u32)> {
+    if !settings.selected() {
+        return Ok((width, height));
+    }
+    let (frame, _) = source_origin(width, height, settings)?;
+    let w = width
+        .checked_add(frame.checked_mul(2).context("Background width overflow")?)
+        .context("Background width overflow")?;
+    let h = height
+        .checked_add(frame.checked_mul(2).context("Background height overflow")?)
+        .context("Background height overflow")?;
+    anyhow::ensure!(
+        u64::from(w) * u64::from(h) * 4 <= 256 * 1024 * 1024,
+        "Background output exceeds 256 MiB; reduce padding"
+    );
+    Ok((w, h))
+}
+/// Composite at original-pixel scale. A 256 MiB bound protects large captures.
 pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
     if !settings.selected() {
         return Ok(Raster {
@@ -346,19 +409,8 @@ pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
     anyhow::ensure!(source.width > 0 && source.height > 0, "Empty screenshot");
     let shortest = source.width.min(source.height) as f32;
     let (frame, balanced_y) = source_origin(source.width, source.height, settings)?;
-    let width = source
-        .width
-        .checked_add(frame.checked_mul(2).context("Background width overflow")?)
-        .context("Background width overflow")?;
-    let height = source
-        .height
-        .checked_add(frame.checked_mul(2).context("Background height overflow")?)
-        .context("Background height overflow")?;
+    let (width, height) = output_size(source.width, source.height, settings)?;
     let length = u64::from(width) * u64::from(height) * 4;
-    anyhow::ensure!(
-        length <= 256 * 1024 * 1024,
-        "Background output exceeds 256 MiB; reduce padding"
-    );
     anyhow::ensure!(
         source.pixels.len() == source.width as usize * source.height as usize * 4,
         "Invalid source raster"
@@ -538,6 +590,54 @@ mod tests {
             .pixels[corner..corner + 3]
         );
         Ok(())
+    }
+    #[test]
+    fn adjustments_reset_to_defaults_without_losing_the_chosen_style() {
+        let mut b = Background {
+            open: true,
+            style: Style::Gradient(4),
+            padding: 0.9,
+            inset: 0.8,
+            shadow: 0.7,
+            corners: 0.6,
+            auto_balance: false,
+            scroll_y: 120.0,
+            ..Default::default()
+        };
+        assert_eq!(b.hit(211.0, PANEL_TOP + 578.0 - 120.0), Some(Target::Reset));
+        b.reset_adjustments();
+        let defaults = Background::default();
+        assert!(b.auto_balance);
+        assert_eq!(
+            (b.padding, b.inset, b.shadow, b.corners),
+            (
+                defaults.padding,
+                defaults.inset,
+                defaults.shadow,
+                defaults.corners
+            )
+        );
+        assert_eq!(b.style, Style::Gradient(4));
+        assert_eq!(b.scroll_y, 120.0);
+        assert!(b.open);
+    }
+    #[test]
+    fn sliders_keep_subpixel_changes_and_drag_source_is_bounded() {
+        let mut b = Background::default();
+        assert!(b.set_slider(Slider::Corners, 180.0));
+        assert!(b.set_slider(Slider::Corners, 180.02));
+        let source = Raster {
+            width: 1600,
+            height: 800,
+            pixels: vec![255; 1600 * 800 * 4],
+        };
+        let reduced = drag_source(&source);
+        assert_eq!((reduced.width, reduced.height), (900, 450));
+        assert_eq!(reduced.pixels.len(), 900 * 450 * 4);
+        b.style = Style::Gradient(0);
+        let full = output_size(source.width, source.height, &b).unwrap();
+        let rendered = compose(&source, &b).unwrap();
+        assert_eq!((rendered.width, rendered.height), full);
     }
     #[test]
     fn small_editor_scrolls_to_reach_bottom_controls() {
