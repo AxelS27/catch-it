@@ -21,10 +21,11 @@ param(
     [switch]$ImageOnly,
     [switch]$EditableOnly,
     [switch]$PolishOnly,
-    [switch]$SliderOnly
+    [switch]$SliderOnly,
+    [switch]$WebDragOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly -or $PolishOnly -or $SliderOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly -or $PolishOnly -or $SliderOnly -or $WebDragOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -1042,6 +1043,120 @@ function Assert-EditorPalettePixel([int]$X,[int]$Y,[int]$Argb) {
     }
     Save-GalleryScreenshot 'editor-palette-failure.png'
     throw "Palette pixel $X,$Y did not match color $Argb"
+}
+function Test-WebDrag {
+    $chrome='C:\Program Files\Google\Chrome\Application\chrome.exe'
+    if(-not (Test-Path -LiteralPath $chrome)){throw 'Chrome is required for the focused web drop-zone test.'}
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-1),0,0,0,0,0x13)
+    $capture=New-TestPreview
+    $hash=(Get-FileHash -LiteralPath $capture.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    $html=Join-Path $artifacts 'web-drop-zone.html';$profile=Join-Path $artifacts 'web-drop-profile'
+    @'
+<!doctype html><meta charset="utf-8"><title>SimpleScreenshot Drop Test</title>
+<style>body{margin:0;background:#25252b;color:white;font:26px Segoe UI;display:grid;place-items:center;height:100vh}#drop{width:75%;height:70%;display:grid;place-items:center;border:4px dashed #999;border-radius:20px;background:#555}#drop.hover{background:#645bc5}#drop.done{background:#1e7846}</style>
+<div id="drop">Drop PNG here</div><script>
+const zone=document.getElementById('drop');let slowed=false;
+document.addEventListener('dragover',e=>{e.preventDefault();e.dataTransfer.dropEffect='copy';if(!slowed){slowed=true;const until=performance.now()+180;while(performance.now()<until){}}zone.className='hover'});
+document.addEventListener('dragleave',e=>{if(!e.relatedTarget||!document.contains(e.relatedTarget))zone.className=''});
+document.addEventListener('drop',e=>{e.preventDefault();let files=e.dataTransfer.files;zone.className=files.length&&files[0].type==='image/png'?'done':'';zone.textContent=files.length?'Received '+files[0].name:'No file received';document.title=files.length?'SimpleScreenshot Drop OK':'SimpleScreenshot Drop Failed'});
+</script>
+'@ | Set-Content -LiteralPath $html -Encoding utf8
+    $uri=[Uri]::new((Resolve-Path -LiteralPath $html).Path).AbsoluteUri
+    try {
+        $browser=Start-Process -FilePath $chrome -ArgumentList @("--user-data-dir=$profile",'--no-first-run','--disable-extensions','--window-size=1050,680','--window-position=280,100',"--app=$uri") -PassThru
+        $window=[IntPtr]::Zero
+        for($i=0;$i -lt 100;$i++){
+            $browser.Refresh();$window=[IntPtr]$browser.MainWindowHandle
+            if($window -ne [IntPtr]::Zero){break}
+            Start-Sleep -Milliseconds 50
+        }
+        if($window -eq [IntPtr]::Zero){throw 'Isolated browser drop-zone did not open.'}
+        $bounds=[CaptureInput]::ClientBounds($window)
+        $tx=[int](($bounds.Left+$bounds.Right)/2);$ty=[int](($bounds.Top+$bounds.Bottom)/2)
+        $rect=Preview-Rect $capture.Window
+        $x=[int](($rect.Left+$rect.Right)/2);$y=[int](($rect.Top+$rect.Bottom)/2)
+        [CaptureInput]::HoldAt($x,$y);Start-Sleep -Milliseconds 60
+        [CaptureInput]::MouseAt($x-42,$y-24,0)
+        for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 20}
+        $visual=[CaptureInput]::DragWindow()
+        if($visual -eq [IntPtr]::Zero){throw 'OLE drag preview did not start.'}
+        $dragRect=New-Object CaptureInput+Rect;$latencies=@()
+        $fromX=$x-42;$fromY=$y-24
+        for($i=1;$i -le 18;$i++){
+            $px=[int]($fromX+($tx-$fromX)*$i/18);$py=[int]($fromY+($ty-$fromY)*$i/18)
+            $step=[Diagnostics.Stopwatch]::StartNew();[CaptureInput]::MouseAt($px,$py,0)
+            $seen=$false
+            while($step.ElapsedMilliseconds -lt 1200){
+                [void][CaptureInput]::GetWindowRect($visual,[ref]$dragRect)
+                if([Math]::Abs($dragRect.Right-($px+8)) -le 3 -and [Math]::Abs($dragRect.Bottom-($py+20)) -le 3){$seen=$true;break}
+                Start-Sleep -Milliseconds 3
+            }
+            if(-not $seen){throw "OLE drag preview lagged behind pointer step $i"}
+            $latencies+=$step.ElapsedMilliseconds
+        }
+        $hovered=$false
+        for($i=0;$i -lt 60;$i++){
+            $hover=[CaptureInput]::ScreenPixel(($tx+60),($ty+60))
+            if(($hover -band 255) -gt 85 -and (($hover -shr 16) -band 255) -gt 150){$hovered=$true;break}
+            Start-Sleep -Milliseconds 20
+        }
+        if(-not $hovered){Save-GalleryScreenshot 'web-drop-hover-failure.png';throw 'Chrome did not receive the native file drag-over event.'}
+        [CaptureInput]::DropAt($tx,$ty)
+        $received=$false
+        for($i=0;$i -lt 100;$i++){
+            $rgb=[CaptureInput]::ScreenPixel($tx,$ty)
+            if(($rgb -band 255) -lt 90 -and (($rgb -shr 8) -band 255) -gt 100 -and (($rgb -shr 16) -band 255) -lt 140){$received=$true;break}
+            Start-Sleep -Milliseconds 30
+        }
+        Save-GalleryScreenshot 'web-drop-zone.png'
+        if(-not $received){throw 'Browser drop zone did not receive the screenshot PNG.'}
+        if((Get-FileHash -LiteralPath $capture.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Web drop modified the original PNG.'}
+        $latencies=@($latencies|Sort-Object)
+        Write-Host "PASS: Chrome HTML5 drop received original PNG; 18-step drag preview latency median=$($latencies[8]) ms, max=$($latencies[-1]) ms"
+        [void][CaptureInput]::SetForegroundWindow($window);Press-Key 0x74 # reload isolated drop zone
+        [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-1),0,0,0,0,0x13)
+        $again=New-TestPreview
+        $againHash=(Get-FileHash -LiteralPath $again.Shot -Algorithm SHA256).Hash
+        [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+        Click-PreviewAction $again.Window 'Annotate';$editor=Wait-Editor
+        [void][CaptureInput]::MoveWindow($editor,1050,210,800,640,$true)
+        $editorBounds=[CaptureInput]::ClientBounds($editor)
+        $ex=[int](($editorBounds.Left+$editorBounds.Right)/2);$ey=[int]($editorBounds.Bottom-24)
+        [CaptureInput]::HoldAt($ex,$ey);Start-Sleep -Milliseconds 70
+        [CaptureInput]::MouseAt(($ex-65),($ey-55),0)
+        for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 20}
+        if([CaptureInput]::DragWindow() -eq [IntPtr]::Zero){throw 'Editor Drag Me did not start.'}
+        for($i=1;$i -le 18;$i++){
+            [CaptureInput]::MouseAt([int]($ex-65+($tx-$ex+65)*$i/18),[int]($ey-55+($ty-$ey+55)*$i/18),0)
+            Start-Sleep -Milliseconds 15
+        }
+        $hovered=$false
+        for($i=0;$i -lt 60;$i++){
+            $hover=[CaptureInput]::ScreenPixel(($tx+130),($ty+90))
+            if(($hover -band 255) -gt 85 -and (($hover -shr 16) -band 255) -gt 150){$hovered=$true;break}
+            Start-Sleep -Milliseconds 20
+        }
+        if(-not $hovered){Save-GalleryScreenshot 'web-drop-editor-hover-failure.png';throw "Browser did not receive editor Drag Me over drop zone at $($tx+130),$($ty+90): $hover"}
+        [CaptureInput]::DropAt($tx,$ty)
+        $received=$false
+        for($i=0;$i -lt 100;$i++){
+            $rgb=[CaptureInput]::ScreenPixel($tx,$ty)
+            if(($rgb -band 255) -lt 90 -and (($rgb -shr 8) -band 255) -gt 100 -and (($rgb -shr 16) -band 255) -lt 140){$received=$true;break}
+            Start-Sleep -Milliseconds 30
+        }
+        Save-GalleryScreenshot 'web-drop-editor.png'
+        if(-not $received){throw 'Editor drag did not deliver PNG into browser.'}
+        if((Get-FileHash -LiteralPath $again.Shot -Algorithm SHA256).Hash -ne $againHash){throw 'Editor web drop changed source PNG.'}
+        Write-Host 'PASS: editor Drag Me also drops original PNG into Chrome without changing source'
+    }finally {
+        Get-CimInstance Win32_Process -Filter "name = 'chrome.exe'" |
+            Where-Object { $_.ExecutablePath -eq $chrome -and $_.CommandLine -like "*$profile*" } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 100
+        Remove-Item -LiteralPath $profile -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 function Test-Sliders {
     Close-AllPreviews;Set-AutoClose 'Never' 'never'
@@ -2433,6 +2548,7 @@ try {
     elseif ($EditableOnly) { Test-Editable }
     elseif ($PolishOnly) { Test-Polish }
     elseif ($SliderOnly) { Test-Sliders }
+    elseif ($WebDragOnly) { Test-WebDrag }
     elseif ($ActionsOnly) { Test-Actions }
     elseif ($FifoOnly) { Test-Fifo }
     elseif ($Gallery -or $GalleryOnly) { Test-Gallery }
