@@ -653,7 +653,7 @@ impl Editor {
     pub fn load(&mut self, image: Raster) -> Result<()> {
         self.drag_image = Some(drag_preview(&image));
         if let Some(renderer) = &mut self.state.renderer {
-            renderer.set_image(&image)?;
+            renderer.set_source(&image)?;
         }
         println!(
             "Editor loaded: {} x {} original pixels",
@@ -1142,17 +1142,14 @@ fn resize_state(hwnd: HWND, state: &mut WindowState, width: u32, height: u32) ->
     if let Some(renderer) = &state.renderer {
         renderer.resize(width, height, state.dpi)?;
     } else {
-        state.renderer = Some(Renderer::new(
-            hwnd,
-            width,
-            height,
-            state.dpi,
-            state
-                .drag_preview
-                .as_ref()
-                .or(state.composed.as_ref())
-                .or(state.image.as_ref()),
-        )?);
+        let mut renderer = Renderer::new(hwnd, width, height, state.dpi, None)?;
+        if let Some(source) = state.image.as_ref() {
+            renderer.set_source(source)?;
+            if let Some(image) = state.drag_preview.as_ref().or(state.composed.as_ref()) {
+                renderer.set_image(image)?;
+            }
+        }
+        state.renderer = Some(renderer);
     }
     for (c, r) in &state.layout.controls {
         unsafe {
@@ -1239,7 +1236,11 @@ fn refresh_background_drag(hwnd: HWND, state: &mut WindowState) -> Result<()> {
             let reduced = state
                 .drag_source
                 .get_or_insert_with(|| background::drag_source(source));
-            Some(background::compose(reduced, &state.background)?)
+            Some(background::compose_preview(
+                reduced,
+                source.width.min(source.height),
+                &state.background,
+            )?)
         } else {
             None
         };

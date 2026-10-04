@@ -20,7 +20,7 @@ use windows::{
             Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
         },
     },
-    core::w,
+    core::{Interface, w},
 };
 use windows_numerics::Vector2;
 
@@ -56,6 +56,7 @@ pub struct Renderer {
     label: IDWriteTextFormat,
     large: IDWriteTextFormat,
     bitmap: Option<ID2D1Bitmap>,
+    source_bitmap: Option<ID2D1Bitmap>,
     swatches: Vec<ID2D1Bitmap>,
     picker_bitmap: RefCell<Option<(u16, ID2D1Bitmap)>>,
     overlay_bitmaps: RefCell<HashMap<usize, ID2D1Bitmap>>,
@@ -199,12 +200,18 @@ impl Renderer {
                 label,
                 large: make_font(16.0)?,
                 bitmap: None,
+                source_bitmap: None,
             };
             if let Some(image) = image {
                 renderer.set_image(image)?;
             }
             Ok(renderer)
         }
+    }
+    pub fn set_source(&mut self, image: &Raster) -> Result<()> {
+        self.set_image(image)?;
+        self.source_bitmap = self.bitmap.clone();
+        Ok(())
     }
     pub fn set_image(&mut self, image: &Raster) -> Result<()> {
         let pixels = premultiply(&image.pixels);
@@ -1693,7 +1700,7 @@ impl Renderer {
                     );
                 }
             }
-            if source.is_some() {
+            if let Some(source) = source {
                 let scale = view.scale(layout.canvas, shown_w, shown_h);
                 let origin = Point {
                     x: r.x + (ox as f32 - cx as f32) * scale,
@@ -1706,6 +1713,58 @@ impl Renderer {
                 unsafe {
                     self.target
                         .PushAxisAlignedClip(&rect(r), D2D1_ANTIALIAS_MODE_ALIASED);
+                }
+                if background.dragging.is_some()
+                    && background.selected()
+                    && let Some(bitmap) = &self.source_bitmap
+                {
+                    let dest = Rect {
+                        x: origin.x,
+                        y: origin.y,
+                        w: source.width as f32 * scale,
+                        h: source.height as f32 * scale,
+                    };
+                    let radius =
+                        (source.width.min(source.height) as f32 * background.corners * 0.16)
+                            .min((source.width.min(source.height) - 1) as f32 * 0.5)
+                            * scale;
+                    unsafe {
+                        if radius > 0.01 {
+                            let mask = self.factory.CreateRoundedRectangleGeometry(
+                                &D2D1_ROUNDED_RECT {
+                                    rect: rect(dest),
+                                    radiusX: radius,
+                                    radiusY: radius,
+                                },
+                            )?;
+                            self.target.PushLayer(
+                                &D2D1_LAYER_PARAMETERS {
+                                    contentBounds: rect(r),
+                                    geometricMask: std::mem::ManuallyDrop::new(Some(mask.cast()?)),
+                                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                                    maskTransform: windows_numerics::Matrix3x2 {
+                                        M11: 1.0,
+                                        M22: 1.0,
+                                        ..Default::default()
+                                    },
+                                    opacity: 1.0,
+                                    opacityBrush: std::mem::ManuallyDrop::new(None),
+                                    layerOptions: D2D1_LAYER_OPTIONS_NONE,
+                                },
+                                None::<&ID2D1Layer>,
+                            );
+                        }
+                        self.target.DrawBitmap(
+                            bitmap,
+                            Some(&rect(dest)),
+                            1.0,
+                            D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                            None,
+                        );
+                        if radius > 0.01 {
+                            self.target.PopLayer();
+                        }
+                    }
                 }
                 for (index, mark) in document.marks.iter().enumerate() {
                     if editing_text != Some(index) {

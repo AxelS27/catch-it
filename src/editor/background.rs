@@ -356,7 +356,7 @@ pub fn drag_source(source: &Raster) -> Raster {
             pixels: source.pixels.clone(),
         };
     }
-    let factor = (900.0 / source.width.max(source.height) as f32).min(1.0);
+    let factor = (300.0 / source.width.max(source.height) as f32).min(1.0);
     let width = (source.width as f32 * factor).round().max(1.0) as u32;
     let height = (source.height as f32 * factor).round().max(1.0) as u32;
     let mut pixels = vec![0; width as usize * height as usize * 4];
@@ -397,8 +397,25 @@ pub fn output_size(width: u32, height: u32, settings: &Background) -> Result<(u3
     );
     Ok((w, h))
 }
+/// During a drag, only the backdrop and its shadow need CPU composition.
+/// The original screenshot is drawn separately at native resolution by Direct2D.
+pub fn compose_preview(
+    source: &Raster,
+    full_shortest: u32,
+    settings: &Background,
+) -> Result<Raster> {
+    compose_inner(source, settings, full_shortest, false)
+}
 /// Composite at original-pixel scale. A 256 MiB bound protects large captures.
 pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
+    compose_inner(source, settings, source.width.min(source.height), true)
+}
+fn compose_inner(
+    source: &Raster,
+    settings: &Background,
+    full_shortest: u32,
+    include_source: bool,
+) -> Result<Raster> {
     if !settings.selected() {
         return Ok(Raster {
             width: source.width,
@@ -456,7 +473,8 @@ pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
         let blur = extent.max(0.5);
         // A nonzero first step used to cast a full-strength shadow because of
         // the minimum blur radius. Fade opacity in before reaching full blur.
-        let strength = (extent / 3.0).clamp(0.0, 1.0);
+        // Downsampling must not fade the preview shadow at small slider values.
+        let strength = (full_shortest as f32 * 0.09 * settings.shadow / 3.0).clamp(0.0, 1.0);
         let offset = extent * 0.35;
         let half_w = (source.width - 1) as f32 * 0.5;
         let half_h = (source.height - 1) as f32 * 0.5;
@@ -484,33 +502,35 @@ pub fn compose(source: &Raster, settings: &Background) -> Result<Raster> {
             }
         }
     }
-    for y in 0..source.height {
-        for x in 0..source.width {
-            let xx = x as f32;
-            let yy = y as f32;
-            let cx = xx.clamp(radius, source.width as f32 - radius - 1.0);
-            let cy = yy.clamp(radius, source.height as f32 - radius - 1.0);
-            let coverage = if radius > 0.0 {
-                let edge =
-                    (radius + 0.5 - ((xx - cx).powi(2) + (yy - cy).powi(2)).sqrt()).clamp(0.0, 1.0);
-                // Fade into rounding when radius is less than one output pixel.
-                // At radius zero, an opaque square still covers the entire corner.
-                1.0 - (1.0 - edge) * radius.min(1.0)
-            } else {
-                1.0
-            };
-            if coverage == 0.0 {
-                continue;
-            }
-            let out = (((y + balanced_y) * width + x + frame) * 4) as usize;
-            let input = ((y * source.width + x) * 4) as usize;
-            // Apply source alpha and antialiased rounded-corner coverage to the backdrop.
-            let alpha = (source.pixels[input + 3] as f32 * coverage).round() as u16;
-            for channel in 0..3 {
-                output[out + channel] = ((source.pixels[input + channel] as u16 * alpha
-                    + output[out + channel] as u16 * (255 - alpha)
-                    + 127)
-                    / 255) as u8;
+    if include_source {
+        for y in 0..source.height {
+            for x in 0..source.width {
+                let xx = x as f32;
+                let yy = y as f32;
+                let cx = xx.clamp(radius, source.width as f32 - radius - 1.0);
+                let cy = yy.clamp(radius, source.height as f32 - radius - 1.0);
+                let coverage = if radius > 0.0 {
+                    let edge = (radius + 0.5 - ((xx - cx).powi(2) + (yy - cy).powi(2)).sqrt())
+                        .clamp(0.0, 1.0);
+                    // Fade into rounding when radius is less than one output pixel.
+                    // At radius zero, an opaque square still covers the entire corner.
+                    1.0 - (1.0 - edge) * radius.min(1.0)
+                } else {
+                    1.0
+                };
+                if coverage == 0.0 {
+                    continue;
+                }
+                let out = (((y + balanced_y) * width + x + frame) * 4) as usize;
+                let input = ((y * source.width + x) * 4) as usize;
+                // Apply source alpha and antialiased rounded-corner coverage to the backdrop.
+                let alpha = (source.pixels[input + 3] as f32 * coverage).round() as u16;
+                for channel in 0..3 {
+                    output[out + channel] = ((source.pixels[input + channel] as u16 * alpha
+                        + output[out + channel] as u16 * (255 - alpha)
+                        + 127)
+                        / 255) as u8;
+                }
             }
         }
     }
@@ -622,6 +642,31 @@ mod tests {
         assert!(b.open);
     }
     #[test]
+    fn drag_preview_keeps_full_size_shadow_strength_and_excludes_source_pixels() -> Result<()> {
+        let source = Raster {
+            width: 100,
+            height: 100,
+            pixels: [255, 0, 0, 255].repeat(100 * 100),
+        };
+        let settings = Background {
+            style: Style::Solid(1),
+            shadow: 0.15,
+            corners: 0.0,
+            ..Default::default()
+        };
+        let normal = compose_preview(&source, 100, &settings)?;
+        let large = compose_preview(&source, 1000, &settings)?;
+        let full = compose(&source, &settings)?;
+        let frame = (full.width - source.width) / 2;
+        let center = (((frame + 50) * full.width + frame + 50) * 4) as usize;
+        assert_eq!(&full.pixels[center..center + 4], &[255, 0, 0, 255]);
+        assert!(
+            large.pixels[center] < normal.pixels[center],
+            "A reduced live preview must retain the original shadow opacity"
+        );
+        Ok(())
+    }
+    #[test]
     fn sliders_keep_subpixel_changes_and_drag_source_is_bounded() {
         let mut b = Background::default();
         assert!(b.set_slider(Slider::Corners, 180.0));
@@ -632,8 +677,8 @@ mod tests {
             pixels: vec![255; 1600 * 800 * 4],
         };
         let reduced = drag_source(&source);
-        assert_eq!((reduced.width, reduced.height), (900, 450));
-        assert_eq!(reduced.pixels.len(), 900 * 450 * 4);
+        assert_eq!((reduced.width, reduced.height), (300, 150));
+        assert_eq!(reduced.pixels.len(), 300 * 150 * 4);
         b.style = Style::Gradient(0);
         let full = output_size(source.width, source.height, &b).unwrap();
         let rendered = compose(&source, &b).unwrap();

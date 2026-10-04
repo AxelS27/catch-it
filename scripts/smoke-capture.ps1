@@ -224,6 +224,10 @@ public static class CaptureInput {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wparam, IntPtr lparam);
+    [DllImport("user32.dll")] static extern IntPtr GetDC(IntPtr hwnd);
+    [DllImport("user32.dll")] static extern int ReleaseDC(IntPtr hwnd, IntPtr dc);
+    [DllImport("gdi32.dll")] static extern uint GetPixel(IntPtr dc, int x, int y);
+    public static uint ScreenPixel(int x,int y){var dc=GetDC(IntPtr.Zero);try{return GetPixel(dc,x,y);}finally{ReleaseDC(IntPtr.Zero,dc);}}
 }
 '@
 [void][CaptureInput]::SetProcessDpiAwarenessContext([IntPtr](-4))
@@ -1064,6 +1068,30 @@ function Test-Sliders {
     if(-not [Linq.Enumerable]::SequenceEqual([byte[]]$a,[byte[]]$b)){throw 'Reset did not restore the original background output and selected style.'}
     if((Get-FileHash -LiteralPath $capture.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Slider controls changed the source PNG.'}
     Write-Host 'PASS: default auto-balance on, Reset restores adjustments without changing style or source'
+    & $at 55 553 # white backdrop makes any shadow loss obvious
+    & $at 16 759 # Shadow off
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$noShadow=Wait-NewShot $before
+    $shadowX=[int]($r.Left+16*$s);$shadowY=[int]($r.Top+759*$s)
+    [CaptureInput]::HoldAt($shadowX,$shadowY)
+    [CaptureInput]::MouseAt([int]($r.Left+112*$s),$shadowY,0)
+    Start-Sleep -Milliseconds 90;Save-GalleryScreenshot 'background-shadow-while-dragging.png'
+    [CaptureInput]::DropAt([int]($r.Left+112*$s),$shadowY)
+    $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$withShadow=Wait-NewShot $before
+    $off=[Drawing.Bitmap]::new($noShadow);$on=[Drawing.Bitmap]::new($withShadow)
+    try{
+        $frame=[int](($on.Width-350)/2);$sampleX=$frame+175;$sampleY=$frame+200+1
+        $white=$off.GetPixel($sampleX,$sampleY);$shade=$on.GetPixel($sampleX,$sampleY)
+        if($shade.R -ge $white.R-10){throw "Shadow vanished after dragging: $white -> $shade"}
+        $during=[Drawing.Bitmap]::new('.pi/capture-smoke/background-shadow-while-dragging.png')
+        try{
+            $scale=1.6*$s;$canvasW=$r.Right-$r.Left-260*$s
+            $imageTop=$r.Top+48*$s+($r.Bottom-$r.Top-96*$s-$on.Height*$scale)/2
+            $contentBottom=$imageTop+($frame-[Math]::Round(200*0.03*(96/102))+200)*$scale
+            $screenX=[int]($r.Left+260*$s+$canvasW/2);$darkest=255
+            for($dy=4;$dy -le 18;$dy+=2){$darkest=[Math]::Min($darkest,$during.GetPixel($screenX,[int]($contentBottom+$dy)).R)}
+            if($darkest -gt 235){throw "Shadow missing from live drag preview: lightest dark ring=$darkest"}
+        }finally{$during.Dispose()}
+    }finally{$off.Dispose();$on.Dispose()}
     Click-EditorAction $editor 'Close';Close-AllPreviews
     $screen=[Windows.Forms.Screen]::PrimaryScreen.Bounds
     $x1=$screen.Left+80;$y1=$screen.Top+80
@@ -1083,11 +1111,20 @@ function Test-Sliders {
     Start-Sleep -Milliseconds 220
     $sliderY=[int]($r.Top+660*$s);$start=[int]($r.Left+45*$s)
     [CaptureInput]::HoldAt($start,$sliderY);Start-Sleep -Milliseconds 70
-    $clock=[Diagnostics.Stopwatch]::StartNew()
+    $clock=[Diagnostics.Stopwatch]::StartNew();$latencies=@()
     for($i=1;$i -le 15;$i++){
-        [CaptureInput]::MouseAt([int]($start+12*$s*$i),$sliderY,0)
-        Start-Sleep -Milliseconds 30
-        if($i -eq 8){Start-Sleep -Milliseconds 100;Save-GalleryScreenshot 'background-slider-drag-large.png'}
+        $target=[int]($start+12*$s*$i)
+        $step=[Diagnostics.Stopwatch]::StartNew()
+        [CaptureInput]::MouseAt($target,$sliderY,0)
+        $seen=$false
+        while($step.ElapsedMilliseconds -lt 1200){
+            $rgb=[CaptureInput]::ScreenPixel(($target-[int](4*$s)),($sliderY+[int](4*$s)))
+            if(($rgb -band 255) -gt 215 -and (($rgb -shr 8) -band 255) -gt 215 -and (($rgb -shr 16) -band 255) -gt 215){$seen=$true;break}
+            Start-Sleep -Milliseconds 3
+        }
+        if(-not $seen){throw "Padding thumb did not reach pointer step $i within 1200 ms"}
+        $latencies+=$step.ElapsedMilliseconds
+        if($i -eq 8){Save-GalleryScreenshot 'background-slider-drag-large.png'}
     }
     [CaptureInput]::DropAt([int]($start+180*$s),$sliderY)
     $clock.Stop()
@@ -1104,7 +1141,28 @@ function Test-Sliders {
         $thumb=$during.GetPixel($thumbX,$thumbY)
         if($thumb.R -lt 210 -or $thumb.G -lt 210){throw "Slider preview did not keep up with drag midpoint: $thumb"}
     }finally{$during.Dispose()}
-    Write-Host "PASS: live drag preview on a large real capture; full-resolution export after release ($($clock.ElapsedMilliseconds) ms for 15 spaced pointer steps plus screenshot)"
+    $ordered=@($latencies|Sort-Object)
+    Write-Host "PASS: Padding follows large-capture drag ($($clock.ElapsedMilliseconds) ms / 15 steps, median=$($ordered[7]) ms, max=$($ordered[-1]) ms)"
+    foreach($case in @(@('Inset',20,710),@('Shadow',20,759),@('Corners',146,759))){
+        $label=$case[0];$x=[int]($r.Left+[int]$case[1]*$s);$y=[int]($r.Top+[int]$case[2]*$s)
+        [CaptureInput]::HoldAt($x,$y);Start-Sleep -Milliseconds 90
+        $times=@()
+        for($i=1;$i -le 15;$i++){
+            $target=[int]($x+6*$s*$i);$step=[Diagnostics.Stopwatch]::StartNew()
+            [CaptureInput]::MouseAt($target,$y,0);$seen=$false
+            while($step.ElapsedMilliseconds -lt 1200){
+                $rgb=[CaptureInput]::ScreenPixel(($target-[int](4*$s)),($y+[int](4*$s)))
+                if(($rgb -band 255) -gt 215 -and (($rgb -shr 8) -band 255) -gt 215 -and (($rgb -shr 16) -band 255) -gt 215){$seen=$true;break}
+                Start-Sleep -Milliseconds 3
+            }
+            if(-not $seen){throw "$label thumb did not follow pointer step $i"}
+            $times+=$step.ElapsedMilliseconds
+        }
+        [CaptureInput]::DropAt([int]($x+90*$s),$y)
+        $sorted=@($times|Sort-Object)
+        Write-Host "PASS: $label follows large-capture drag (median=$($sorted[7]) ms, max=$($sorted[-1]) ms)"
+        Start-Sleep -Milliseconds 120
+    }
 }
 function Test-Background {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run BackgroundOnly with pwsh -Sta.'}
