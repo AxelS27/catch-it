@@ -2,7 +2,7 @@ use super::{
     background::{self, Background, Slider, Style},
     color_picker::{self, Picker},
     document::{self, Document, Mark, Point, Shape},
-    layout::{Control, Layout, PRESET_COLORS, Rect, View},
+    layout::{self, Control, Layout, PRESET_COLORS, Rect, View},
 };
 use crate::storage::Raster;
 use anyhow::{Context, Result};
@@ -1501,16 +1501,21 @@ impl Renderer {
             } else {
                 (0, 0)
             };
-            let (cx, cy, ex, ey) = document
-                .crop_pixels(
-                    image.width,
-                    image.height,
-                    Point {
-                        x: ox as f32,
-                        y: oy as f32,
-                    },
-                )
-                .unwrap_or((0, 0, image.width, image.height));
+            let full = (0, 0, image.width, image.height);
+            let (cx, cy, ex, ey) = if crop_mode {
+                full
+            } else {
+                document
+                    .crop_pixels(
+                        image.width,
+                        image.height,
+                        Point {
+                            x: ox as f32,
+                            y: oy as f32,
+                        },
+                    )
+                    .unwrap_or(full)
+            };
             let (shown_w, shown_h) = (ex - cx, ey - cy);
             let r = view.image_rect(layout.canvas, shown_w, shown_h);
             let visible = Rect {
@@ -1590,25 +1595,84 @@ impl Renderer {
                         w: (hi.x - lo.x) * scale,
                         h: (hi.y - lo.y) * scale,
                     };
-                    self.fill_opacity(r, 0x080912, 0.58);
+                    let (left, top, right, bottom) = (
+                        focus.x.max(r.x).min(r.x + r.w),
+                        focus.y.max(r.y).min(r.y + r.h),
+                        (focus.x + focus.w).max(r.x).min(r.x + r.w),
+                        (focus.y + focus.h).max(r.y).min(r.y + r.h),
+                    );
+                    self.fill_opacity(
+                        Rect {
+                            x: r.x,
+                            y: r.y,
+                            w: r.w,
+                            h: top - r.y,
+                        },
+                        0x080912,
+                        0.56,
+                    );
+                    self.fill_opacity(
+                        Rect {
+                            x: r.x,
+                            y: bottom,
+                            w: r.w,
+                            h: r.y + r.h - bottom,
+                        },
+                        0x080912,
+                        0.56,
+                    );
+                    self.fill_opacity(
+                        Rect {
+                            x: r.x,
+                            y: top,
+                            w: left - r.x,
+                            h: bottom - top,
+                        },
+                        0x080912,
+                        0.56,
+                    );
+                    self.fill_opacity(
+                        Rect {
+                            x: right,
+                            y: top,
+                            w: r.x + r.w - right,
+                            h: bottom - top,
+                        },
+                        0x080912,
+                        0.56,
+                    );
                     if focus.w > 0.0 && focus.h > 0.0 {
-                        if let Some(bitmap) = &self.bitmap {
-                            unsafe {
-                                self.target.DrawBitmap(
-                                    bitmap,
-                                    Some(&rect(focus)),
-                                    1.0,
-                                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                                    Some(&D2D_RECT_F {
-                                        left: lo.x + ox as f32,
-                                        top: lo.y + oy as f32,
-                                        right: hi.x + ox as f32,
-                                        bottom: hi.y + oy as f32,
-                                    }),
-                                );
-                            }
+                        self.outline(focus, 0xffffff, 1.5);
+                        for point in [
+                            (focus.x, focus.y),
+                            (focus.x + focus.w / 2.0, focus.y),
+                            (focus.x + focus.w, focus.y),
+                            (focus.x, focus.y + focus.h / 2.0),
+                            (focus.x + focus.w, focus.y + focus.h / 2.0),
+                            (focus.x, focus.y + focus.h),
+                            (focus.x + focus.w / 2.0, focus.y + focus.h),
+                            (focus.x + focus.w, focus.y + focus.h),
+                        ] {
+                            self.fill(
+                                Rect {
+                                    x: point.0 - 4.0,
+                                    y: point.1 - 4.0,
+                                    w: 8.0,
+                                    h: 8.0,
+                                },
+                                0xffffff,
+                            );
+                            self.outline(
+                                Rect {
+                                    x: point.0 - 4.0,
+                                    y: point.1 - 4.0,
+                                    w: 8.0,
+                                    h: 8.0,
+                                },
+                                0x1b1b20,
+                                1.0,
+                            );
                         }
-                        self.outline(focus, 0x007aff, 2.0);
                         for fraction in [1.0 / 3.0, 2.0 / 3.0] {
                             self.line(
                                 (focus.x + focus.w * fraction, focus.y),
@@ -1666,6 +1730,22 @@ impl Renderer {
         }
         unsafe {
             self.target.PopAxisAlignedClip();
+        }
+        if crop_mode {
+            let (cancel, apply) = layout::crop_actions(layout.canvas);
+            self.pill(
+                Rect {
+                    x: cancel.x - 6.0,
+                    y: cancel.y - 5.0,
+                    w: 156.0,
+                    h: 42.0,
+                },
+                0x202126,
+                10.0,
+            );
+            self.text("Cancel", cancel, 0xf5f5f5, true);
+            self.pill(apply, 0x0078d4, 7.0);
+            self.text("Apply", apply, 0xffffff, true);
         }
         self.panel(layout, background, dark);
         // Hover surfaces stay centered on their icons. Draw them before the

@@ -157,6 +157,7 @@ struct WindowState {
     next_counter: u32,
     crop_mode: bool,
     crop_drag: Option<Mark>,
+    crop_grab: Option<interaction::CropGrab>,
     text_editing: Option<TextEdit>,
     document: Document,
     pending_mark: Option<Mark>,
@@ -369,6 +370,9 @@ impl WindowState {
     fn view_size(&self) -> Option<(u32, u32)> {
         let source = self.image.as_ref()?;
         let image = self.composed.as_ref().unwrap_or(source);
+        if self.crop_mode {
+            return Some((image.width, image.height));
+        }
         let (ox, oy) =
             background::source_origin(source.width, source.height, &self.background).ok()?;
         Some(
@@ -400,7 +404,7 @@ impl WindowState {
         self.pressed = None;
         self.drag_start = None;
         self.pending_mark = None;
-        self.crop_drag = None;
+        self.crop_grab = None;
         if let Some(gesture) = self.moving_mark.take() {
             self.document.marks[gesture.index] = gesture.original;
         }
@@ -455,6 +459,7 @@ impl Editor {
             next_counter: 1,
             crop_mode: false,
             crop_drag: None,
+            crop_grab: None,
             text_editing: None,
             document: Document::default(),
             pending_mark: None,

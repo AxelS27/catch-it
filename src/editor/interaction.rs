@@ -149,17 +149,21 @@ fn source_point(s: &WindowState, p: (f32, f32)) -> Option<(Point, f32)> {
     let source = s.image.as_ref()?;
     let image = s.composed.as_ref().unwrap_or(source);
     let (ox, oy) = background::source_origin(source.width, source.height, &s.background).ok()?;
-    let (cx, cy, ex, ey) = s
-        .document
-        .crop_pixels(
-            image.width,
-            image.height,
-            Point {
-                x: ox as f32,
-                y: oy as f32,
-            },
-        )
-        .unwrap_or((0, 0, image.width, image.height));
+    let full = (0, 0, image.width, image.height);
+    let (cx, cy, ex, ey) = if s.crop_mode {
+        full
+    } else {
+        s.document
+            .crop_pixels(
+                image.width,
+                image.height,
+                Point {
+                    x: ox as f32,
+                    y: oy as f32,
+                },
+            )
+            .unwrap_or(full)
+    };
     let r = s.view.image_rect(s.layout.canvas, ex - cx, ey - cy);
     let scale = s.view.scale(s.layout.canvas, ex - cx, ey - cy);
     Some((
@@ -170,16 +174,120 @@ fn source_point(s: &WindowState, p: (f32, f32)) -> Option<(Point, f32)> {
         scale,
     ))
 }
+#[derive(Clone, Copy)]
+pub(super) struct CropGrab {
+    edge: (i8, i8),
+    start: Point,
+    lo: Point,
+    hi: Point,
+}
+fn crop_hit(mark: &Mark, point: Point, tolerance: f32) -> Option<(i8, i8)> {
+    let (lo, hi) = mark.bounds();
+    for (x, y) in [
+        (0, 0),
+        (2, 0),
+        (0, 2),
+        (2, 2),
+        (1, 0),
+        (0, 1),
+        (2, 1),
+        (1, 2),
+    ] {
+        let hx = [lo.x, (lo.x + hi.x) / 2.0, hi.x][x];
+        let hy = [lo.y, (lo.y + hi.y) / 2.0, hi.y][y];
+        if (point.x - hx).abs() <= tolerance && (point.y - hy).abs() <= tolerance {
+            return Some((x as i8 - 1, y as i8 - 1));
+        }
+    }
+    if point.x > lo.x && point.x < hi.x && point.y > lo.y && point.y < hi.y {
+        Some((0, 0))
+    } else {
+        None
+    }
+}
+fn crop_adjust(grab: CropGrab, point: Point, width: f32, height: f32) -> (Point, Point) {
+    let dx = (point.x - grab.start.x).round();
+    let dy = (point.y - grab.start.y).round();
+    let (mut lo, mut hi) = (grab.lo, grab.hi);
+    if grab.edge == (0, 0) {
+        let dx = dx.clamp(-lo.x, width - hi.x);
+        let dy = dy.clamp(-lo.y, height - hi.y);
+        lo.x += dx;
+        hi.x += dx;
+        lo.y += dy;
+        hi.y += dy;
+    } else {
+        if grab.edge.0 < 0 {
+            lo.x = (lo.x + dx).clamp(0.0, hi.x - 2.0)
+        }
+        if grab.edge.0 > 0 {
+            hi.x = (hi.x + dx).clamp(lo.x + 2.0, width)
+        }
+        if grab.edge.1 < 0 {
+            lo.y = (lo.y + dy).clamp(0.0, hi.y - 2.0)
+        }
+        if grab.edge.1 > 0 {
+            hi.y = (hi.y + dy).clamp(lo.y + 2.0, height)
+        }
+    }
+    (lo, hi)
+}
+fn apply_crop(s: &mut WindowState, hwnd: HWND) {
+    let Some(mark) = s.crop_drag.take() else {
+        return;
+    };
+    s.crop_grab = None;
+    let Some(source) = s.image.as_ref() else {
+        return;
+    };
+    let full = mark.bounds()
+        == (
+            Point::default(),
+            Point {
+                x: source.width as f32,
+                y: source.height as f32,
+            },
+        );
+    let existing = s
+        .document
+        .marks
+        .iter()
+        .rposition(|m| matches!(m.shape, document::Shape::Crop(..)));
+    let result = if let Some(index) = existing {
+        s.document.selected = Some(index);
+        if full {
+            s.document.delete_selected();
+        } else {
+            let original = s.document.marks[index].clone();
+            s.document.marks[index] = mark;
+            s.document.edit(index, original);
+        }
+        Ok(())
+    } else if !full {
+        s.document.add(mark)
+    } else {
+        Ok(())
+    };
+    s.document.selected = None;
+    s.crop_mode = false;
+    s.view.zoom = Zoom::Fit;
+    s.view.pan = (0.0, 0.0);
+    if let Err(error) = result {
+        s.error = Some(format!("{error:#}"));
+        s.request(hwnd, ERROR);
+    }
+    unsafe {
+        let _ = InvalidateRect(Some(hwnd), None, false);
+    }
+}
 fn crop_point(s: &WindowState, p: (f32, f32)) -> Option<Point> {
     let source = s.image.as_ref()?;
     let (point, _) = source_point(s, p)?;
-    let (lo, hi) = s.document.crop().unwrap_or((
-        Point::default(),
-        Point {
-            x: source.width as f32,
-            y: source.height as f32,
-        },
-    ));
+    let lo = Point::default();
+    let hi = Point {
+        x: source.width as f32,
+        y: source.height as f32,
+    };
     Some(Point {
         x: point.x.clamp(lo.x, hi.x),
         y: point.y.clamp(lo.y, hi.y),
@@ -203,9 +311,10 @@ fn inside_source(s: &WindowState, p: Point) -> bool {
         let within_image =
             p.x >= 0.0 && p.y >= 0.0 && p.x < source.width as f32 && p.y < source.height as f32;
         within_image
-            && s.document
-                .crop()
-                .is_none_or(|(lo, hi)| p.x >= lo.x && p.y >= lo.y && p.x < hi.x && p.y < hi.y)
+            && (s.crop_mode
+                || s.document
+                    .crop()
+                    .is_none_or(|(lo, hi)| p.x >= lo.x && p.y >= lo.y && p.x < hi.x && p.y < hi.y))
     })
 }
 
@@ -618,6 +727,7 @@ pub(super) unsafe extern "system" fn window_proc(
                     0x1b => {
                         s.cancel_gesture();
                         s.crop_mode = false;
+                        s.crop_drag = None;
                         if GetCapture() == hwnd {
                             let _ = ReleaseCapture();
                         }
@@ -651,6 +761,7 @@ pub(super) unsafe extern "system" fn window_proc(
                             s.focus = Some(list[i]);
                         }
                     }
+                    0x0d if s.crop_mode && s.focus.is_none() => apply_crop(s, hwnd),
                     0x0d | 0x20 => {
                         if let Some(c) = s.focus {
                             invoke(s, hwnd, c);
@@ -813,17 +924,40 @@ pub(super) unsafe extern "system" fn window_proc(
                         SetCapture(hwnd);
                         return LRESULT(0);
                     }
+                    if s.crop_mode {
+                        let (cancel, apply) = layout::crop_actions(s.layout.canvas);
+                        if cancel.contains(p.0, p.1) {
+                            s.crop_mode = false;
+                            s.crop_drag = None;
+                            s.crop_grab = None;
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                            return LRESULT(0);
+                        }
+                        if apply.contains(p.0, p.1) {
+                            apply_crop(s, hwnd);
+                            return LRESULT(0);
+                        }
+                        if s.layout.canvas.contains(p.0, p.1)
+                            && let Some((point, scale)) = source_point(s, p)
+                            && let Some(mark) = &s.crop_drag
+                            && let Some(edge) = crop_hit(mark, point, 9.0 / scale)
+                        {
+                            let (lo, hi) = mark.bounds();
+                            s.crop_grab = Some(CropGrab {
+                                edge,
+                                start: point,
+                                lo,
+                                hi,
+                            });
+                            let _ = SetFocus(Some(hwnd));
+                            SetCapture(hwnd);
+                        }
+                        return LRESULT(0);
+                    }
                     if s.layout.canvas.contains(p.0, p.1)
                         && let Some((point, scale)) = source_point(s, p)
                         && inside_source(s, point)
                     {
-                        if s.crop_mode {
-                            s.crop_drag = Mark::from_tool(Control::Crop, point, 0, 1.0);
-                            let _ = SetFocus(Some(hwnd));
-                            SetCapture(hwnd);
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                            return LRESULT(0);
-                        }
                         if s.active_tool == Control::Move {
                             let handle = s.document.selected.and_then(|index| {
                                 s.document.marks[index].handles().iter().position(|target| {
@@ -951,12 +1085,14 @@ pub(super) unsafe extern "system" fn window_proc(
                 {
                     let s = &mut *ptr;
                     let p = s.point(lparam);
-                    if s.crop_drag.is_some() {
+                    if let Some(grab) = s.crop_grab {
                         let point = crop_point(s, p);
-                        if let Some(mark) = &mut s.crop_drag
-                            && let Some(point) = point
+                        if let (Some(mark), Some(point), Some(source)) =
+                            (&mut s.crop_drag, point, &s.image)
                         {
-                            mark.update(point);
+                            let (lo, hi) =
+                                crop_adjust(grab, point, source.width as f32, source.height as f32);
+                            mark.shape = document::Shape::Crop(lo, hi);
                         }
                         let _ = InvalidateRect(Some(hwnd), None, false);
                         return LRESULT(0);
@@ -1039,21 +1175,7 @@ pub(super) unsafe extern "system" fn window_proc(
                     let s = &mut *ptr;
                     let p = s.point(lparam);
                     s.drag_start = None;
-                    if let Some(mut mark) = s.crop_drag.take() {
-                        if let Some(point) = crop_point(s, p) {
-                            mark.update(point);
-                        }
-                        if mark.finish() {
-                            if let Err(error) = s.document.add(mark) {
-                                s.error = Some(format!("{error:#}"));
-                                s.request(hwnd, ERROR);
-                            } else {
-                                s.document.selected = None;
-                                s.crop_mode = false;
-                                s.view.zoom = Zoom::Fit;
-                                s.view.pan = (0.0, 0.0);
-                            }
-                        }
+                    if s.crop_grab.take().is_some() {
                         if GetCapture() == hwnd {
                             let _ = ReleaseCapture();
                         }
@@ -1261,6 +1383,25 @@ pub(super) unsafe extern "system" fn window_proc(
                     IDC_HAND
                 } else if s.pan_start.is_some() {
                     IDC_SIZEALL
+                } else if s.crop_mode && {
+                    let (cancel, apply) = layout::crop_actions(s.layout.canvas);
+                    cancel.contains(px, py) || apply.contains(px, py)
+                } {
+                    IDC_HAND
+                } else if s.crop_mode {
+                    let edge = source_point(s, (px, py)).and_then(|(p, scale)| {
+                        s.crop_drag
+                            .as_ref()
+                            .and_then(|m| crop_hit(m, p, 9.0 / scale))
+                    });
+                    match edge {
+                        Some((-1, -1) | (1, 1)) => IDC_SIZENWSE,
+                        Some((1, -1) | (-1, 1)) => IDC_SIZENESW,
+                        Some((0, -1) | (0, 1)) => IDC_SIZENS,
+                        Some((-1, 0) | (1, 0)) => IDC_SIZEWE,
+                        Some((0, 0)) => IDC_SIZEALL,
+                        _ => IDC_ARROW,
+                    }
                 } else if s.hover.is_some_and(|c| {
                     c.enabled()
                         && (s.ready()
@@ -1280,6 +1421,13 @@ pub(super) unsafe extern "system" fn window_proc(
     }
 }
 fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
+    if state.crop_mode
+        && (control.is_drawing_tool() || matches!(control, Control::AddImage | Control::Background))
+    {
+        state.crop_mode = false;
+        state.crop_drag = None;
+        state.crop_grab = None;
+    }
     match control {
         Control::Save => state.request(hwnd, SAVE),
         Control::Copy => state.request(hwnd, COPY),
@@ -1289,19 +1437,24 @@ fn invoke(state: &mut WindowState, hwnd: HWND, control: Control) {
             if state.crop_mode {
                 state.crop_mode = false;
                 state.crop_drag = None;
-            } else if let Some(index) = state
-                .document
-                .marks
-                .iter()
-                .rposition(|mark| matches!(mark.shape, document::Shape::Crop(..)))
-            {
-                state.document.selected = Some(index);
-                state.document.delete_selected();
-                state.document.selected = None;
+                state.crop_grab = None;
+            } else if let Some(source) = &state.image {
+                let (lo, hi) = state.document.crop().unwrap_or((
+                    Point::default(),
+                    Point {
+                        x: source.width as f32,
+                        y: source.height as f32,
+                    },
+                ));
+                state.crop_drag = Some(Mark {
+                    shape: document::Shape::Crop(lo, hi),
+                    color: 0,
+                    width: 1.0,
+                    opacity: 1.0,
+                });
+                state.crop_mode = true;
                 state.view.zoom = Zoom::Fit;
                 state.view.pan = (0.0, 0.0);
-            } else {
-                state.crop_mode = true;
                 state.palette_open = false;
                 state.picker.open = false;
                 state.stroke_open = false;

@@ -1260,8 +1260,13 @@ function Test-Crop {
     $sx=[int]($bounds.Left+($bounds.Right-$bounds.Left-350*$s)/2)
     $sy=[int]($bounds.Top+48*$s+($bounds.Bottom-$bounds.Top-96*$s-200*$s)/2)
     Click-EditorAction $editor 'Crop'
+    Save-GalleryScreenshot 'editor-crop-initial.png'
     $x1=[int]($sx+30*$s);$y1=[int]($sy+20*$s);$x2=[int]($sx+280*$s);$y2=[int]($sy+170*$s)
-    [CaptureInput]::HoldAt($x1,$y1);[CaptureInput]::MouseAt($x2,$y2,0);[CaptureInput]::DropAt($x2,$y2)
+    [CaptureInput]::HoldAt($sx,$sy);[CaptureInput]::MouseAt($x1,$y1,0);[CaptureInput]::DropAt($x1,$y1)
+    [CaptureInput]::HoldAt([int]($sx+350*$s),[int]($sy+200*$s));[CaptureInput]::MouseAt($x2,$y2,0);[CaptureInput]::DropAt($x2,$y2)
+    Save-GalleryScreenshot 'editor-crop-pending.png'
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));Assert-ClipboardImage $preview.Shot
+    [CaptureInput]::ClickAt([int]($bounds.Right-40*$s),[int]($bounds.Top+76*$s))
     Save-GalleryScreenshot 'editor-cropped.png'
     $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$cropped=Wait-NewShot $before
     $image=[Drawing.Bitmap]::new($cropped)
@@ -1274,8 +1279,11 @@ function Test-Crop {
     [CaptureInput]::Chord(0x59,[ushort[]]@(0x11))
     $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$redone=Wait-NewShot $before
     $again=[Drawing.Bitmap]::new($redone);try{if($again.Width -ne 250 -or $again.Height -ne 150){throw 'Redo did not reapply crop.'}}finally{$again.Dispose()}
+    Click-EditorAction $editor 'Crop'
+    [CaptureInput]::ClickAt([int]($bounds.Right-115*$s),[int]($bounds.Top+76*$s))
+    [CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));Assert-ClipboardImage $redone
     if((Get-FileHash -LiteralPath $preview.Shot -Algorithm SHA256).Hash -ne $sourceHash){throw 'Crop modified source PNG.'}
-    Write-Host 'PASS: native crop preview/export dimension, undo/redo, unchanged original PNG'
+    Write-Host 'PASS: crop handle selection, explicit apply/cancel, undo/redo, unchanged original PNG'
 }
 function Test-Text {
     Close-AllPreviews;Set-AutoClose 'Never' 'never'

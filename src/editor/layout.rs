@@ -6,6 +6,24 @@ pub struct Rect {
     pub w: f32,
     pub h: f32,
 }
+pub fn crop_actions(canvas: Rect) -> (Rect, Rect) {
+    let y = canvas.y + 12.0;
+    let x = canvas.x + canvas.w - 150.0;
+    (
+        Rect {
+            x,
+            y,
+            w: 68.0,
+            h: 32.0,
+        },
+        Rect {
+            x: x + 76.0,
+            y,
+            w: 68.0,
+            h: 32.0,
+        },
+    )
+}
 impl Rect {
     pub fn contains(self, x: f32, y: f32) -> bool {
         x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
