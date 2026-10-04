@@ -140,16 +140,30 @@ impl Settings {
     }
     pub fn load() -> Self {
         let result = (|| -> Result<Self> {
-            let path = Self::path()?;
-            if !path.exists() {
-                return Ok(Self::default());
-            }
-            Self::parse(&std::fs::read_to_string(path)?)
+            let local =
+                PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?);
+            Self::load_from(
+                &Self::path()?,
+                &local.join("SimpleScreenshot").join("settings.txt"),
+            )
         })();
         result.unwrap_or_else(|error| {
             eprintln!("Settings ignored: {error:#}");
             Self::default()
         })
+    }
+    fn load_from(path: &std::path::Path, legacy: &std::path::Path) -> Result<Self> {
+        if path.exists() {
+            return Self::parse(&std::fs::read_to_string(path)?);
+        }
+        if legacy.exists() {
+            // Copy only preferences, never move the old PNGs: other programs may
+            // still hold paths to those files. Repeated starts use the new copy.
+            let settings = Self::parse(&std::fs::read_to_string(legacy)?)?;
+            settings.save_to(path)?;
+            return Ok(settings);
+        }
+        Ok(Self::default())
     }
     pub fn save(self) -> Result<()> {
         self.save_to(&Self::path()?)
@@ -212,6 +226,38 @@ mod tests {
             assert!(Settings::parse(text).is_err(), "{text}");
         }
         assert_eq!(AutoClose::Never.duration(), None);
+    }
+    #[test]
+    fn rebrand_imports_preferences_once_without_moving_legacy_data() -> Result<()> {
+        let folder = std::env::temp_dir().join(format!(
+            "catch it migration {} {}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let legacy = folder.join("SimpleScreenshot").join("settings.txt");
+        let current = folder.join("CatchIt").join("settings.txt");
+        std::fs::create_dir_all(legacy.parent().unwrap())?;
+        std::fs::write(&legacy, "auto_close=never\nplacement=top_left\n")?;
+        assert_eq!(
+            Settings::load_from(&current, &legacy)?,
+            Settings {
+                auto_close: AutoClose::Never,
+                placement: Placement::TopLeft
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy)?,
+            "auto_close=never\nplacement=top_left\n"
+        );
+        std::fs::write(&legacy, "auto_close=5\n")?;
+        assert_eq!(
+            Settings::load_from(&current, &legacy)?.placement,
+            Placement::TopLeft
+        );
+        std::fs::remove_dir_all(folder)?;
+        Ok(())
     }
     #[test]
     fn saving_one_choice_preserves_the_other() -> Result<()> {

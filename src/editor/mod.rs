@@ -48,7 +48,7 @@ pub const ERROR: isize = 5;
 pub const ZOOM_MENU: isize = 6;
 pub const BACKGROUND_TOGGLE: isize = 7;
 pub const ADD_IMAGE: isize = 8;
-const CLASS: PCWSTR = w!("SimpleScreenshot.Editor");
+const CLASS: PCWSTR = w!("CatchIt.Editor");
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const ZOOM_VALUES: [f32; 8] = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0];
 const HOVER_TIMER: usize = 51;
@@ -534,7 +534,7 @@ impl Editor {
                 WINDOW_EX_STYLE::default(),
                 CLASS,
                 // Retain an accessible window name; custom chrome never draws it.
-                w!("Simple Screenshot editor"),
+                w!("Catch It editor"),
                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                 work.left + (work.right - work.left - width) / 2,
                 work.top + (work.bottom - work.top - height) / 2,

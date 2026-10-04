@@ -95,9 +95,7 @@ impl Tray {
             hIcon: self.icon,
             ..Default::default()
         };
-        let tip: Vec<_> = "Simple Screenshot - Alt + Shift + S"
-            .encode_utf16()
-            .collect();
+        let tip: Vec<_> = "Catch It - Alt + Shift + S".encode_utf16().collect();
         data.szTip[..tip.len()].copy_from_slice(&tip);
         data
     }
@@ -106,7 +104,7 @@ impl Tray {
         let mut data = self.data();
         anyhow::ensure!(
             unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool(),
-            "Cannot add Simple Screenshot to the notification area"
+            "Cannot add Catch It to the notification area"
         );
         data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) }.as_bool() {

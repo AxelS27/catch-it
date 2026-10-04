@@ -1,4 +1,4 @@
-# Simple Screenshot
+# Catch It
 
 A lightweight Windows screenshot utility with floating capture previews, file drag/drop, a pending queue, and persistent reference cards. The initial macOS-inspired flow and approved CleanShot-inspired extension are described in [PRD.md](PRD.md). Exact reference parity is not claimed.
 
@@ -59,10 +59,10 @@ Implemented:
 Output directory:
 
 ```text
-%LOCALAPPDATA%\SimpleScreenshot\Temp\
+%LOCALAPPDATA%\CatchIt\Temp\
 ```
 
-The auto-close and Quick Access position preferences are atomically saved together in `%LOCALAPPDATA%\SimpleScreenshot\settings.txt` and loaded on startup. Older timer-only settings default to bottom-right. The queue and pins are session-only, not a screenshot history/library, and are not restored after restart.
+The auto-close and Quick Access position preferences are atomically saved together in `%LOCALAPPDATA%\CatchIt\settings.txt` and loaded on startup. On the first run of Catch It, the app imports existing preferences from `%LOCALAPPDATA%\SimpleScreenshot\settings.txt` if the new file is absent. Previous PNGs remain untouched at `%LOCALAPPDATA%\SimpleScreenshot\Temp\`; they are not moved or deleted, because clipboard contents or other apps may still reference their paths. New captures go to the new folder. Older timer-only settings default to bottom-right. The queue and pins are session-only, not a screenshot history/library, and are not restored after restart.
 
 The native editor shell, basic drawing, and a limited Background Tool are implemented; text, redaction, crop, additional arrow styles, opacity/lock controls, and a settings window remain pending. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
 
@@ -105,7 +105,7 @@ Debug or redirected console diagnostics include saved file paths. Use **Auto-clo
 
 Use the notification-area icon (possibly under **Show Hidden Icons**) to take a screenshot or quit. Left-click, right-click, or keyboard activation opens the native menu. `Ctrl + Alt + Q` remains available as a development exit shortcut. If either shortcut is already registered by another application, startup reports an error.
 
-For everyday use, build with `cargo build --release`, then launch `target/release/simple-screenshot.exe` directly. It runs without a console window; errors still appear in a native dialog. No auto-start or installer is configured. Debug builds keep a console, and redirected stdout/stderr remain available for automated tests.
+For everyday use, build with `cargo build --release`, then launch `target/release/catch-it.exe` directly. It runs without a console window; errors still appear in a native dialog. No auto-start or installer is configured. Debug builds keep a console, and redirected stdout/stderr remain available for automated tests.
 
 ## Engineering checks
 
@@ -117,6 +117,14 @@ cargo build --release
 ```
 
 Unit tests cover selection direction, clamping, empty regions, crop boundaries, display-rotation transforms, invalid PNG buffers, and a real WIC PNG round trip through a Unicode filename containing spaces. Thumbnail tests cover layout at 100%, 125%, 150%, and 200% scaling, negative monitor origins, extreme aspect ratios, rounded hit testing, hover/drag/capture-hidden timing, pin/unpin lifecycles, Never, interval changes, interrupted dismissal, disabled motion, distinct DPI-scaled controls, permanent queue eviction/no-resurrection, chronological pin placement/compaction, screen-derived capacity, and persisted settings. Drag tests check actual COM source behavior, STA affinity, unchanged premultiplied card-pixel upload, invalid drag buffers, system thresholds, and native `CF_HDROP` paths with spaces and Unicode.
+
+### Focused rebrand and settings migration test
+
+```powershell
+./scripts/smoke-capture.ps1 -Configuration release -BrandOnly
+```
+
+Starts an isolated Catch It process with old-brand preferences and a PNG fixture, checks that the settings import and a new capture use the new app directory, and leaves the legacy PNG untouched.
 
 ### Focused Quick Access placement test
 

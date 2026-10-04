@@ -2,7 +2,7 @@
 
 ## Status and goal
 
-Research recorded on 2026-10-02. User-approved follow-up: reproduce CleanShot X's **image Annotate editor**, including UI and interaction behavior, in Simple Screenshot. This supersedes the initial exclusion of screenshot editing, not the exclusions of cloud, accounts, recording, or a screenshot library.
+Research recorded on 2026-10-02. User-approved follow-up: reproduce CleanShot X's **image Annotate editor**, including UI and interaction behavior, in Catch It. This supersedes the initial exclusion of screenshot editing, not the exclusions of cloud, accounts, recording, or a screenshot library.
 
 **This document records the researched specification and delivery status, not a claim of exact parity.** Slice 1 and a core-drawing slice are implemented: Annotate opens a native editor shell with full-resolution viewing, zoom/pan, non-destructive Pencil/Rectangle/Filled Rectangle/Ellipse/Line/bendable Arrow, preset/custom Windows colors and stroke widths, object selection/move/resize handles, undo/redo, Copy/Save As/Drag Me, source ownership, and capture recovery. Native Unicode/IME text input, sequential counter badges, Spotlight, non-destructive Crop with undo/redo, and image-derived visual Mosaic are now present. Text-aware Highlight is deliberately disabled because it cannot identify words without recognition; smooth/secure blur, advanced text styles and tool variants remain pending. The mosaic samples image content and **must not be used to hide secrets**: it is not CleanShot's documented randomized secure pixelation, and the untouched source file still exists. OCR and AI are excluded at user request.
 
@@ -307,7 +307,7 @@ The `markup.mp4` frame places drawing tools plus their contextual property pills
 ### Compact custom-title-bar pass
 
 - User requested a smaller default editor and the tool strip inside a **single custom title bar**, with Windows-style minimize/maximize/close controls on the right and no visible "Annotate" text. Default is now 1040 x 700 DIPs (bounded by the monitor work area), rather than 84% x 86% of the desktop.
-- Win32 retains overlapped resizable/system-menu styles while both `WM_NCCALCSIZE` forms remove the second native caption. The blank title-bar area reports `HTCAPTION` for OS-driven dragging; physical resize edges report the correct native `HT*` values; maximized client insets account for the resize frame. Right-side controls issue real system commands. Accessible window text remains `Simple Screenshot editor`, but nothing is painted as a title.
+- Win32 retains overlapped resizable/system-menu styles while both `WM_NCCALCSIZE` forms remove the second native caption. The blank title-bar area reports `HTCAPTION` for OS-driven dragging; physical resize edges report the correct native `HT*` values; maximized client insets account for the resize frame. Right-side controls issue real system commands. Accessible window text remains `Catch It editor`, but nothing is painted as a title.
 - Focused native desktop `-EditorOnly` smoke passed custom-caption absence, default footprint, minimize/maximize/restore, dragging, toolbar/color, zoom/pan, Save/Copy, capture recovery, and close. Tests were scoped to this UI change at the user's request, not rerun against the entire unrelated gallery/FIFO suite. Exact Win11 snap-layout flyout, system-menu behavior under all themes, mixed-monitor DPI, and Mac pixel parity remain open.
 
 ### Dark color picker and stroke slider refinement

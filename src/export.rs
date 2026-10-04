@@ -98,10 +98,7 @@ pub fn save_copy(source: &Path, destination: &Path) -> Result<()> {
         .parent()
         .context("Save destination has no folder")?;
     let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let pending = folder.join(format!(
-        ".simple-screenshot-save-{}-{seq}.tmp",
-        std::process::id()
-    ));
+    let pending = folder.join(format!(".catch-it-save-{}-{seq}.tmp", std::process::id()));
     // Never truncate the chosen target. The temporary copy must be fully written
     // and closed before an atomic same-directory rename replaces an approved file.
     let file = std::fs::OpenOptions::new()

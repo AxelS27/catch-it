@@ -19,7 +19,7 @@ use crate::{
 };
 
 pub const FINISH_SELECTION: u32 = WM_APP + 2;
-const CLASS_NAME: windows::core::PCWSTR = w!("SimpleScreenshot.Selection");
+const CLASS_NAME: windows::core::PCWSTR = w!("CatchIt.Selection");
 
 struct Renderer {
     target: ID2D1HwndRenderTarget,

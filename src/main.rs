@@ -552,7 +552,7 @@ fn show_error(error: &anyhow::Error) {
         MessageBoxW(
             None,
             PCWSTR(message.as_ptr()),
-            w!("Simple Screenshot"),
+            w!("Catch It"),
             MB_OK | MB_ICONERROR,
         );
     }
@@ -652,7 +652,7 @@ fn run() -> Result<()> {
         let class = WNDCLASSW {
             lpfnWndProc: Some(controller_proc),
             hInstance: GetModuleHandleW(None)?.into(),
-            lpszClassName: w!("SimpleScreenshot.Controller"),
+            lpszClassName: w!("CatchIt.Controller"),
             ..Default::default()
         };
         anyhow::ensure!(
@@ -662,7 +662,7 @@ fn run() -> Result<()> {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class.lpszClassName,
-            w!("Simple Screenshot"),
+            w!("Catch It"),
             WINDOW_STYLE::default(),
             0,
             0,
@@ -717,10 +717,10 @@ fn run() -> Result<()> {
         app.gallery.timeout(),
         app.gallery.placement(),
     )?);
-    println!("Simple Screenshot - running in the notification area");
+    println!("Catch It - running in the notification area");
     println!("Alt + Shift + S: select a region on the monitor under the pointer");
     println!("Esc / right-click: cancel. Ctrl + Alt + Q: quit.");
-    println!("Output: %LOCALAPPDATA%\\SimpleScreenshot\\Temp\\");
+    println!("Output: %LOCALAPPDATA%\\CatchIt\\Temp\\");
     println!(
         "Preview: auto-copy image, hover for Copy/Save/pin/close, drag to copy file. Timing is provisional."
     );

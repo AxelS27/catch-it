@@ -23,10 +23,11 @@ param(
     [switch]$PolishOnly,
     [switch]$SliderOnly,
     [switch]$WebDragOnly,
-    [switch]$PlacementOnly
+    [switch]$PlacementOnly,
+    [switch]$BrandOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly -or $PolishOnly -or $SliderOnly -or $WebDragOnly -or $PlacementOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly -or $PolishOnly -or $SliderOnly -or $WebDragOnly -or $PlacementOnly -or $BrandOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -138,7 +139,7 @@ public static class CaptureInput {
     }
     public static IntPtr[] ThumbnailWindows(bool visibleOnly = true) {
         var list = new System.Collections.Generic.List<IntPtr>(); IntPtr window = IntPtr.Zero;
-        while ((window=FindWindowEx(IntPtr.Zero,window,"SimpleScreenshot.Thumbnail",null)) != IntPtr.Zero) {
+        while ((window=FindWindowEx(IntPtr.Zero,window,"CatchIt.Thumbnail",null)) != IntPtr.Zero) {
             if (!visibleOnly || IsWindowVisible(window)) { list.Add(window); }
         }
         list.Sort((a,b) => {
@@ -160,10 +161,10 @@ public static class CaptureInput {
     [DllImport("user32.dll")] static extern bool SystemParametersInfo(uint action,uint p,out uint result,uint flags);
     public static bool InactiveWheelEnabled(){uint mode;return SystemParametersInfo(8220,0,out mode,0)&&mode==2;}
     public static void WheelAt(int x,int y,int delta) { MouseAt(x,y,0); System.Threading.Thread.Sleep(100); mouse_event(2048,0,0,unchecked((uint)delta),UIntPtr.Zero); }
-    public static IntPtr DragWindow() { return FindWindow("SimpleScreenshot.DragImage", null); }
+    public static IntPtr DragWindow() { return FindWindow("CatchIt.DragImage", null); }
     public static int ThumbnailCount() { return ThumbnailWindows().Length; }
     public static int PendingCount() { return ThumbnailWindows(false).Length; }
-    public static IntPtr ControllerWindow() { return FindWindow("SimpleScreenshot.Controller", null); }
+    public static IntPtr ControllerWindow() { return FindWindow("CatchIt.Controller", null); }
     public static IntPtr TaskbarWindow() { return FindWindow("Shell_TrayWnd", null); }
     [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr window, out uint pid);
     public static IntPtr DialogWindow(uint process) {
@@ -208,11 +209,11 @@ public static class CaptureInput {
         var data = new NotifyIconData { Size=(uint)Marshal.SizeOf(typeof(NotifyIconData)), Window=window, Id=1 };
         return Shell_NotifyIcon(2, ref data);
     }
-    public static IntPtr SceneWindow() { return FindWindow(null, "SimpleScreenshot E2E Scene"); }
-    public static IntPtr OverlayWindow() { return FindWindow("SimpleScreenshot.Selection", null); }
-    public static IntPtr EditorWindow() { return FindWindow("SimpleScreenshot.Editor", null); }
-    public static bool IsEditor(IntPtr window) { var name=new System.Text.StringBuilder(128);GetClassName(window,name,128);return name.ToString()=="SimpleScreenshot.Editor"; }
-    public static IntPtr[] EditorWindows() { var result=new System.Collections.Generic.List<IntPtr>(); IntPtr w=IntPtr.Zero; while((w=FindWindowEx(IntPtr.Zero,w,"SimpleScreenshot.Editor",null))!=IntPtr.Zero){result.Add(w);} return result.ToArray(); }
+    public static IntPtr SceneWindow() { return FindWindow(null, "CatchIt E2E Scene"); }
+    public static IntPtr OverlayWindow() { return FindWindow("CatchIt.Selection", null); }
+    public static IntPtr EditorWindow() { return FindWindow("CatchIt.Editor", null); }
+    public static bool IsEditor(IntPtr window) { var name=new System.Text.StringBuilder(128);GetClassName(window,name,128);return name.ToString()=="CatchIt.Editor"; }
+    public static IntPtr[] EditorWindows() { var result=new System.Collections.Generic.List<IntPtr>(); IntPtr w=IntPtr.Zero; while((w=FindWindowEx(IntPtr.Zero,w,"CatchIt.Editor",null))!=IntPtr.Zero){result.Add(w);} return result.ToArray(); }
     public static int EditorCount() { return EditorWindows().Length; }
     [DllImport("user32.dll")] static extern bool GetClientRect(IntPtr hwnd,out Rect rect);
     [DllImport("user32.dll")] static extern bool ClientToScreen(IntPtr hwnd,ref Point point);
@@ -238,7 +239,7 @@ Add-Type -AssemblyName System.Drawing
 
 if ($Scene) {
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'SimpleScreenshot E2E Scene'
+    $form.Text = 'CatchIt E2E Scene'
     $form.FormBorderStyle = 'None'
     $form.StartPosition = 'Manual'
     $form.AutoScaleMode = 'None'
@@ -258,14 +259,14 @@ if ($Scene) {
 }
 
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root "target/$Configuration/simple-screenshot.exe"
+$exe = Join-Path $root "target/$Configuration/catch-it.exe"
 if (-not (Test-Path $exe)) { throw 'Run cargo build first.' }
 $session = (Get-Process -Id $PID).SessionId
-if (Get-Process simple-screenshot -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session }) { throw 'Close the running prototype before starting the interactive test.' }
+if (Get-Process catch-it -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -eq $session }) { throw 'Close the running prototype before starting the interactive test.' }
 $artifacts = Join-Path $root '.pi/capture-smoke'
 [void](New-Item -ItemType Directory -Force $artifacts)
 $dataRoot = Join-Path $artifacts ('User data 日本 ' + [Guid]::NewGuid().ToString('N'))
-$output = Join-Path $dataRoot 'SimpleScreenshot/Temp'
+$output = Join-Path $dataRoot 'CatchIt/Temp'
 $explorerWindow = $null
 $closeExplorer = $false
 $terminalWindow = [IntPtr]::Zero
@@ -626,7 +627,7 @@ function Test-Layout {
     Write-Host 'PASS: filled card supports a close control without changing its bounds'
 }
 function Find-TrayButton {
-    $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Simple Screenshot - Alt + Shift + S')
+    $condition = [System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::NameProperty, 'Catch It - Alt + Shift + S')
     $fallback=$null
     foreach($button in [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition)){
         if(-not $button.Current.IsOffscreen){return $button}
@@ -1045,6 +1046,23 @@ function Assert-EditorPalettePixel([int]$X,[int]$Y,[int]$Argb) {
     Save-GalleryScreenshot 'editor-palette-failure.png'
     throw "Palette pixel $X,$Y did not match color $Argb"
 }
+function Test-Brand {
+    $current=Join-Path $dataRoot 'CatchIt/settings.txt'
+    if(-not(Test-Path $current) -or [IO.File]::ReadAllText($current) -notmatch 'placement=top_left'){
+        throw 'Old preferences were not imported into Catch It.'
+    }
+    if(-not(Test-Path $legacyShot) -or [IO.File]::ReadAllText($legacyShot) -ne 'legacy file'){
+        throw 'Old screenshot was moved or deleted during rebrand.'
+    }
+    $record=New-TestPreview -SkipAnchor
+    if(-not $record.Shot.StartsWith($output,[StringComparison]::OrdinalIgnoreCase)){
+        throw "Catch It saved screenshot to the wrong folder: $($record.Shot)"
+    }
+    $rect=Preview-Rect $record.Window
+    if($rect.Left -gt 100 -or $rect.Top -gt 100){throw 'Catch It did not load the old top-left preference.'}
+    if(-not (Test-Path $legacyShot)){throw 'Capture touched the previous app data.'}
+    Write-Host 'PASS: Catch It executable, window classes, new data directory and legacy settings import; old PNG intact'
+}
 function Test-Placement {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run PlacementOnly with pwsh -Sta.'}
     Close-AllPreviews;Set-AutoClose 'Never' 'never'
@@ -1092,13 +1110,13 @@ function Test-WebDrag {
     [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
     $html=Join-Path $artifacts 'web-drop-zone.html';$profile=Join-Path $artifacts 'web-drop-profile'
     @'
-<!doctype html><meta charset="utf-8"><title>SimpleScreenshot Drop Test</title>
+<!doctype html><meta charset="utf-8"><title>CatchIt Drop Test</title>
 <style>body{margin:0;background:#25252b;color:white;font:26px Segoe UI;display:grid;place-items:center;height:100vh}#drop{width:75%;height:70%;display:grid;place-items:center;border:4px dashed #999;border-radius:20px;background:#555}#drop.hover{background:#645bc5}#drop.done{background:#1e7846}</style>
 <div id="drop">Drop PNG here</div><script>
 const zone=document.getElementById('drop');let slowed=false;
 document.addEventListener('dragover',e=>{e.preventDefault();e.dataTransfer.dropEffect='copy';if(!slowed){slowed=true;const until=performance.now()+180;while(performance.now()<until){}}zone.className='hover'});
 document.addEventListener('dragleave',e=>{if(!e.relatedTarget||!document.contains(e.relatedTarget))zone.className=''});
-document.addEventListener('drop',e=>{e.preventDefault();let files=e.dataTransfer.files;zone.className=files.length&&files[0].type==='image/png'?'done':'';zone.textContent=files.length?'Received '+files[0].name:'No file received';document.title=files.length?'SimpleScreenshot Drop OK':'SimpleScreenshot Drop Failed'});
+document.addEventListener('drop',e=>{e.preventDefault();let files=e.dataTransfer.files;zone.className=files.length&&files[0].type==='image/png'?'done':'';zone.textContent=files.length?'Received '+files[0].name:'No file received';document.title=files.length?'CatchIt Drop OK':'CatchIt Drop Failed'});
 </script>
 '@ | Set-Content -LiteralPath $html -Encoding utf8
     $uri=[Uri]::new((Resolve-Path -LiteralPath $html).Path).AbsoluteUri
@@ -1942,7 +1960,7 @@ function Test-Editor {
     $editor=Wait-Editor
     if([CaptureInput]::GetForegroundWindow() -ne $editor){throw 'Annotate did not intentionally activate the editor.'}
     Assert-EditorPixels $editor $first.Shot
-    if([CaptureInput]::TaggedWindow('Simple Screenshot editor',[uint32]$app.Id) -ne $editor){throw 'Editor accessible window name is missing.'}
+    if([CaptureInput]::TaggedWindow('Catch It editor',[uint32]$app.Id) -ne $editor){throw 'Editor accessible window name is missing.'}
     $frame=Preview-Rect $editor;$client=[CaptureInput]::ClientBounds($editor)
     if($client.Top -ne $frame.Top -or $client.Left -ne $frame.Left){Save-GalleryScreenshot 'editor-caption-failure.png';throw "Caption offsets: window $($frame.Left),$($frame.Top); client $($client.Left),$($client.Top)."}
     if($frame.Right-$frame.Left -gt 1200*[CaptureInput]::GetDpiForWindow($editor)/96.0){throw 'Editor opens too large by default.'}
@@ -2475,7 +2493,7 @@ function Test-DragDrop([switch]$PreviewOnly) {
     Remove-Item -LiteralPath $copy
     Write-Host 'PASS: successful real Explorer drop keeps pinned reference and unchanged original PNG'
 
-    $tag = 'SimpleScreenshot Terminal E2E ' + $PID
+    $tag = 'CatchIt Terminal E2E ' + $PID
     $receiver = Join-Path $artifacts 'terminal-receiver.ps1'
     $resultFile = Join-Path $artifacts 'terminal-path.txt'
     Remove-Item -LiteralPath $resultFile -ErrorAction SilentlyContinue
@@ -2536,6 +2554,16 @@ try {
     }
     $launch.Environment = @{ LOCALAPPDATA = $dataRoot }
     [void](New-Item -ItemType Directory -Force $output)
+    if($BrandOnly){
+        $legacyRoot=Join-Path $dataRoot 'SimpleScreenshot'
+        $legacyTemp=Join-Path $legacyRoot 'Temp'
+        [void](New-Item -ItemType Directory -Force $legacyTemp)
+        [IO.File]::WriteAllText((Join-Path $legacyRoot 'settings.txt'),"auto_close=never`nplacement=top_left`n")
+        $legacyShot=Join-Path $legacyTemp 'shot_1_2_3.png'
+        [IO.File]::WriteAllText($legacyShot,'legacy file')
+        [IO.File]::SetLastWriteTimeUtc($legacyShot,[DateTime]::UtcNow.AddHours(-25))
+        $created+=$legacyShot
+    }
     $expired = Join-Path $output 'shot_1_1_1.png'
     $abandoned = Join-Path $output 'shot_1_1_2.png.part'
     $fresh = Join-Path $output 'shot_1_1_3.png'
@@ -2572,7 +2600,8 @@ try {
     Write-Host 'PASS: real app startup cleans expired files, preserves recent/unrelated/locked files'
     Start-Sleep -Milliseconds 350
     if ($Layout) { Test-Layout }
-    if ($PlacementOnly) { Test-Placement }
+    if ($BrandOnly) { Test-Brand }
+    elseif ($PlacementOnly) { Test-Placement }
     elseif ($QuickAccessOnly) { Test-DragDrop -PreviewOnly }
     elseif ($ThemeOnly) { Test-Theme }
     elseif ($EditorOnly) { Test-Editor }

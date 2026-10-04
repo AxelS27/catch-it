@@ -44,7 +44,7 @@ pub const CONTEXT_MENU: u32 = WM_APP + 10;
 pub const SAVE: u32 = WM_APP + 14;
 pub const COPY: u32 = WM_APP + 15;
 pub const ANNOTATE: u32 = WM_APP + 16;
-const CLASS_NAME: windows::core::PCWSTR = w!("SimpleScreenshot.Thumbnail");
+const CLASS_NAME: windows::core::PCWSTR = w!("CatchIt.Thumbnail");
 
 /// Published only after the complete PNG has been saved by the worker.
 pub struct SavedScreenshot {
