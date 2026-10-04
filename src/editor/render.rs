@@ -48,6 +48,9 @@ pub struct ChromeState<'a> {
 
 pub struct Renderer {
     target: ID2D1HwndRenderTarget,
+    factory: ID2D1Factory,
+    sample_style: ID2D1StrokeStyle,
+    sample_path: RefCell<Option<(f32, f32, ID2D1PathGeometry)>>,
     brush: ID2D1SolidColorBrush,
     font: IDWriteTextFormat,
     label: IDWriteTextFormat,
@@ -119,6 +122,18 @@ impl Renderer {
                 },
             )?;
             let brush = target.CreateSolidColorBrush(&color(0x24252a), None)?;
+            let sample_style = factory.CreateStrokeStyle(
+                &D2D1_STROKE_STYLE_PROPERTIES {
+                    startCap: D2D1_CAP_STYLE_ROUND,
+                    endCap: D2D1_CAP_STYLE_ROUND,
+                    dashCap: D2D1_CAP_STYLE_ROUND,
+                    lineJoin: D2D1_LINE_JOIN_ROUND,
+                    miterLimit: 1.0,
+                    dashStyle: D2D1_DASH_STYLE_SOLID,
+                    dashOffset: 0.0,
+                },
+                None,
+            )?;
             let write: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
             let make_font = |size| -> Result<IDWriteTextFormat> {
                 let font = write.CreateTextFormat(
@@ -173,6 +188,9 @@ impl Renderer {
             }
             let mut renderer = Self {
                 target,
+                factory,
+                sample_style,
+                sample_path: RefCell::new(None),
                 brush,
                 swatches,
                 picker_bitmap: RefCell::new(None),
@@ -762,9 +780,9 @@ impl Renderer {
         self.text("Done", done, 0xffffff, false);
         Ok(())
     }
-    fn stroke_panel(&self, layout: &Layout, width: f32, rgb: u32, text_size: bool) {
+    fn stroke_panel(&self, layout: &Layout, width: f32, rgb: u32, text_size: bool) -> Result<()> {
         let Some(r) = layout.stroke_rect() else {
-            return;
+            return Ok(());
         };
         self.pill(
             Rect {
@@ -777,27 +795,22 @@ impl Renderer {
         );
         self.pill(r, 0x25252d, 16.0);
         self.rounded_outline(r, 0x595965, 16.0);
-        self.text(
-            if text_size {
-                "Text size"
-            } else {
-                "Stroke width"
-            },
+        self.label(
+            if text_size { "Text size" } else { "Size" },
             Rect {
-                x: r.x + 16.0,
-                y: r.y + 10.0,
-                w: 125.0,
+                x: r.x + 18.0,
+                y: r.y + 11.0,
+                w: 180.0,
                 h: 22.0,
             },
             0xf2f2f5,
-            false,
         );
         self.text(
             &format!("{width:.1} {}", if text_size { "pt" } else { "px" }),
             Rect {
-                x: r.x + 150.0,
-                y: r.y + 10.0,
-                w: 60.0,
+                x: r.x + 217.0,
+                y: r.y + 11.0,
+                w: 68.0,
                 h: 22.0,
             },
             0xaab0ba,
@@ -806,8 +819,8 @@ impl Renderer {
         self.pill(
             Rect {
                 x: r.x + 18.0,
-                y: r.y + 67.0,
-                w: 180.0,
+                y: r.y + 119.0,
+                w: 268.0,
                 h: 4.0,
             },
             0x555561,
@@ -821,35 +834,84 @@ impl Renderer {
         self.pill(
             Rect {
                 x: r.x + 18.0,
-                y: r.y + 67.0,
-                w: 180.0 * value,
+                y: r.y + 119.0,
+                w: 268.0 * value,
                 h: 4.0,
             },
             0x007aff,
             2.0,
         );
-        self.circle(r.x + 18.0 + 180.0 * value, r.y + 69.0, 7.0, 0x007aff, true);
-        self.circle(r.x + 18.0 + 180.0 * value, r.y + 69.0, 4.5, 0xffffff, true);
+        self.circle(r.x + 18.0 + 268.0 * value, r.y + 121.0, 7.0, 0x007aff, true);
+        self.circle(r.x + 18.0 + 268.0 * value, r.y + 121.0, 4.5, 0xffffff, true);
         if text_size {
             self.text(
                 "Aa",
                 Rect {
                     x: r.x + 18.0,
-                    y: r.y + 81.0,
-                    w: 180.0,
-                    h: 26.0,
+                    y: r.y + 52.0,
+                    w: 268.0,
+                    h: 36.0,
                 },
                 rgb,
                 true,
             );
         } else {
-            self.line(
-                (r.x + 18.0, r.y + 93.0),
-                (r.x + 198.0, r.y + 93.0),
-                rgb,
-                (width / 2.0).clamp(1.0, 9.0),
-            );
+            // One native cubic path with rounded caps, cached across slider drags.
+            let x = r.x + 28.0;
+            let y = r.y + 68.0;
+            let mut cached = self.sample_path.borrow_mut();
+            if cached
+                .as_ref()
+                .is_none_or(|(cx, cy, _)| *cx != x || *cy != y)
+            {
+                unsafe {
+                    let path = self.factory.CreatePathGeometry()?;
+                    let sink = path.Open()?;
+                    sink.BeginFigure(Vector2 { X: x, Y: y + 10.0 }, D2D1_FIGURE_BEGIN_HOLLOW);
+                    sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+                        point1: Vector2 {
+                            X: x + 52.0,
+                            Y: y - 34.0,
+                        },
+                        point2: Vector2 {
+                            X: x + 92.0,
+                            Y: y - 12.0,
+                        },
+                        point3: Vector2 {
+                            X: x + 126.0,
+                            Y: y - 1.0,
+                        },
+                    });
+                    sink.AddBezier(&D2D1_BEZIER_SEGMENT {
+                        point1: Vector2 {
+                            X: x + 169.0,
+                            Y: y + 18.0,
+                        },
+                        point2: Vector2 {
+                            X: x + 205.0,
+                            Y: y + 16.0,
+                        },
+                        point3: Vector2 {
+                            X: x + 248.0,
+                            Y: y - 13.0,
+                        },
+                    });
+                    sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                    sink.Close()?;
+                    *cached = Some((x, y, path));
+                }
+            }
+            unsafe {
+                self.brush.SetColor(&color(rgb));
+                self.target.DrawGeometry(
+                    &cached.as_ref().unwrap().2,
+                    &self.brush,
+                    width.clamp(1.0, 24.0),
+                    &self.sample_style,
+                );
+            }
         }
+        Ok(())
     }
     fn overlay_bitmap(&self, overlay: &Arc<Raster>) -> Result<ID2D1Bitmap> {
         let key = Arc::as_ptr(overlay) as usize;
@@ -1952,7 +2014,7 @@ impl Renderer {
                     .copied()
                     .unwrap_or(custom_color),
                 text_property,
-            );
+            )?;
         }
         if picker.open {
             self.picker(layout, picker, selected_color)?;

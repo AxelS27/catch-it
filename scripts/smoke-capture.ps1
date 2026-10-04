@@ -1398,13 +1398,15 @@ function Test-Picker {
     Press-Key 13
     [CaptureInput]::ClickAt([int]($pickerX+270*$s),[int]($pickerY+339*$s))
     Click-EditorAction $editor 'Stroke'
+    Start-Sleep -Milliseconds 180
     Save-GalleryScreenshot 'editor-stroke-slider.png'
-    $sliderX=[int]($bounds.Left+($origin+423-108)*$s)
+    $sliderX=[int]($bounds.Left+($origin+423-152)*$s)
     $sliderY=[int]($bounds.Top+52*$s)
-    $startX=[int]($sliderX+18*$s);$dragX=[int]($sliderX+105*$s);$trackY=[int]($sliderY+69*$s)
+    $startX=[int]($sliderX+18*$s);$dragX=[int]($sliderX+156*$s);$trackY=[int]($sliderY+121*$s)
     [CaptureInput]::HoldAt($startX,$trackY)
     for($i=1;$i -le 10;$i++){[CaptureInput]::MouseAt([int]($startX+($dragX-$startX)*$i/10),$trackY,0)}
     [CaptureInput]::DropAt($dragX,$trackY)
+    Save-GalleryScreenshot 'editor-stroke-slider-thick.png'
     [CaptureInput]::ClickAt([int]($bounds.Left+50*$s),[int]($bounds.Top+340*$s))
     $before=@(Get-Shots);[CaptureInput]::Chord(0x43,[ushort[]]@(0x11,0x10));$rendered=Wait-NewShot $before
     $image=[Drawing.Bitmap]::new($rendered)

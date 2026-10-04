@@ -887,7 +887,7 @@ pub(super) unsafe extern "system" fn window_proc(
                         if let Some(r) = s.layout.stroke_rect()
                             && r.contains(p.0, p.1)
                         {
-                            if p.1 >= r.y + 43.0 && p.1 <= r.y + 85.0 {
+                            if p.1 >= r.y + 103.0 && p.1 <= r.y + 143.0 {
                                 s.stroke_dragging = true;
                                 if let Some(width) = s.layout.stroke_at(p.0, s.is_text_property()) {
                                     s.live_stroke(width);

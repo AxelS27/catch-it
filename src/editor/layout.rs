@@ -370,16 +370,16 @@ impl Layout {
     pub fn stroke_rect(&self) -> Option<Rect> {
         let control = self.rect(Control::Stroke)?;
         Some(Rect {
-            x: (control.x + control.w / 2.0 - 108.0).clamp(8.0, (self.width - 224.0).max(8.0)),
+            x: (control.x + control.w / 2.0 - 152.0).clamp(8.0, (self.width - 312.0).max(8.0)),
             y: TOP + 4.0,
-            w: 216.0,
-            h: 112.0,
+            w: 304.0,
+            h: 152.0,
         })
     }
     pub fn stroke_at(&self, x: f32, text: bool) -> Option<f32> {
         let r = self.stroke_rect()?;
         let (min, range) = if text { (8.0, 64.0) } else { (1.0, 23.0) };
-        Some(min + ((x - r.x - 18.0) / 180.0).clamp(0.0, 1.0) * range)
+        Some(min + ((x - r.x - 18.0) / 268.0).clamp(0.0, 1.0) * range)
     }
     pub fn palette_rect(&self) -> Option<Rect> {
         let color = self.rect(Control::Color)?;
