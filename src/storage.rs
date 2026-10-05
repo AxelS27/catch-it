@@ -32,6 +32,13 @@ impl Drop for ComApartment {
 }
 
 pub fn temp_directory() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("Cannot locate Catch It executable")?;
+    if let Some(install_dir) = executable.parent()
+        && install_dir.join("install-layout.txt").is_file()
+    {
+        return Ok(install_dir.join("Temp"));
+    }
+    // Development builds and existing unpackaged installs keep the original layout.
     Ok(
         PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?)
             .join("CatchIt")

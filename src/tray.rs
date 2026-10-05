@@ -1,5 +1,5 @@
 //! Native notification-area icon and menu. No polling or App borrows in modal loops.
-use crate::settings::{AutoClose, Placement};
+use crate::settings::{AutoClose, CaptureShortcut, Placement};
 use anyhow::Result;
 use std::cell::Cell;
 use windows::{
@@ -31,12 +31,18 @@ pub struct Tray {
     timeout: Cell<AutoClose>,
     placement: Cell<Placement>,
     count: Cell<usize>,
+    shortcut: CaptureShortcut,
 }
 
 impl Tray {
     /// The controller must be a hidden top-level window, not HWND_MESSAGE,
     /// so it receives Explorer's TaskbarCreated broadcast.
-    pub fn new(hwnd: HWND, timeout: AutoClose, placement: Placement) -> Result<Box<Self>> {
+    pub fn new(
+        hwnd: HWND,
+        timeout: AutoClose,
+        placement: Placement,
+        shortcut: CaptureShortcut,
+    ) -> Result<Box<Self>> {
         let pixels = icon_pixels();
         let mask = [0u8; 128]; // 32 x 32 monochrome AND mask, alpha supplies transparency.
         let icon = unsafe { CreateIcon(None, 32, 32, 1, 32, mask.as_ptr(), pixels.as_ptr()) }?;
@@ -47,6 +53,7 @@ impl Tray {
             timeout: Cell::new(timeout),
             placement: Cell::new(placement),
             count: Cell::new(0),
+            shortcut,
         });
         anyhow::ensure!(
             tray.taskbar_created != 0,
@@ -95,7 +102,9 @@ impl Tray {
             hIcon: self.icon,
             ..Default::default()
         };
-        let tip: Vec<_> = "Catch It - Alt + Shift + S".encode_utf16().collect();
+        let tip: Vec<_> = format!("Catch It - {}", self.shortcut.label())
+            .encode_utf16()
+            .collect();
         data.szTip[..tip.len()].copy_from_slice(&tip);
         data
     }
@@ -161,7 +170,12 @@ impl Tray {
                 GetCursorPos(&mut point)?;
             }
         }
-        let menu = Menu::new(self.timeout.get(), self.placement.get(), self.count.get())?;
+        let menu = Menu::new(
+            self.timeout.get(),
+            self.placement.get(),
+            self.count.get(),
+            self.shortcut,
+        )?;
         let previous = unsafe { GetForegroundWindow() };
         // Required by the shell for outside-click/Escape dismissal of tray menus.
         unsafe {
@@ -206,14 +220,23 @@ impl Drop for Tray {
 
 struct Menu(HMENU);
 impl Menu {
-    fn new(timeout: AutoClose, placement: Placement, count: usize) -> Result<Self> {
+    fn new(
+        timeout: AutoClose,
+        placement: Placement,
+        count: usize,
+        shortcut: CaptureShortcut,
+    ) -> Result<Self> {
         let menu = Self(unsafe { CreatePopupMenu() }?);
         unsafe {
+            let capture_label: Vec<u16> = format!("Take screenshot\t{}", shortcut.label())
+                .encode_utf16()
+                .chain(Some(0))
+                .collect();
             AppendMenuW(
                 menu.0,
                 MF_STRING,
                 CAPTURE_ITEM,
-                w!("Take screenshot\tAlt+Shift+S"),
+                PCWSTR(capture_label.as_ptr()),
             )?;
             let timers = Self(CreatePopupMenu()?);
             for (index, choice) in AutoClose::ALL.into_iter().enumerate() {
@@ -358,8 +381,13 @@ mod tests {
 
     #[test]
     fn native_menu_has_checked_timer_and_placement_submenus() -> Result<()> {
-        let menu = Menu::new(AutoClose::Never, Placement::TopLeft, 5)
-            .context("Cannot create tray menu")?;
+        let menu = Menu::new(
+            AutoClose::Never,
+            Placement::TopLeft,
+            5,
+            CaptureShortcut::AltShiftS,
+        )
+        .context("Cannot create tray menu")?;
         unsafe {
             assert_eq!(GetMenuItemCount(Some(menu.0)), 6);
             assert_eq!(GetMenuItemID(menu.0, 0), CAPTURE_ITEM as u32);

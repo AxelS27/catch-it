@@ -1,10 +1,18 @@
 //! Follow the Windows *app* appearance, not wallpaper or system taskbar color.
+use std::sync::OnceLock;
+
 use windows::{
     Win32::{Foundation::ERROR_SUCCESS, System::Registry::*},
     core::w,
 };
 
 pub fn dark() -> bool {
+    static APPEARANCE: OnceLock<crate::settings::Appearance> = OnceLock::new();
+    match *APPEARANCE.get_or_init(|| crate::settings::Settings::load().appearance) {
+        crate::settings::Appearance::Dark => return true,
+        crate::settings::Appearance::Light => return false,
+        crate::settings::Appearance::System => {}
+    }
     let mut value = 1u32; // Windows defaults to light apps if this key is absent.
     let mut size = std::mem::size_of::<u32>() as u32;
     let status = unsafe {

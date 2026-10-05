@@ -57,6 +57,15 @@ pub fn save_as(owner: HWND, source: &Path) -> Result<Option<PathBuf>> {
         }])?;
         dialog.SetDefaultExtension(w!("png"))?;
         dialog.SetFileName(w!("Screenshot.png"))?;
+        // Start new saves in the user's real Pictures known folder (including
+        // redirected/OneDrive folders). The dialog still lets users pick anywhere.
+        if let Ok(pictures) = SHGetKnownFolderPath(&FOLDERID_Pictures, KNOWN_FOLDER_FLAG(0), None) {
+            let folder: Result<IShellItem, _> = SHCreateItemFromParsingName(pictures, None);
+            if let Ok(folder) = folder {
+                let _ = dialog.SetDefaultFolder(&folder);
+            }
+            CoTaskMemFree(Some(pictures.0.cast()));
+        }
         dialog.SetOptions(
             FOS_FORCEFILESYSTEM
                 | FOS_PATHMUSTEXIST

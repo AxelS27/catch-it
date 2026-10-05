@@ -8,6 +8,7 @@ mod editor;
 mod export;
 mod gallery;
 mod geometry;
+mod onboarding;
 mod overlay;
 mod settings;
 mod storage;
@@ -78,6 +79,7 @@ struct App {
     clipboard: Option<PendingClipboard>,
     editors: Vec<editor::Editor>,
     editor_capture_focus: Option<(HWND, HWND)>,
+    preferences: settings::Settings,
 }
 
 impl App {
@@ -503,11 +505,8 @@ impl App {
         let Some(timeout) = settings::AutoClose::ALL.get(index).copied() else {
             return Ok(());
         };
-        settings::Settings {
-            auto_close: timeout,
-            placement: self.gallery.placement(),
-        }
-        .save()?;
+        self.preferences.auto_close = timeout;
+        self.preferences.save()?;
         self.gallery.configure(timeout)?;
         self.schedule_thumbnail_timer()
     }
@@ -516,11 +515,8 @@ impl App {
         let Some(placement) = settings::Placement::ALL.get(index).copied() else {
             return Ok(());
         };
-        settings::Settings {
-            auto_close: self.gallery.timeout(),
-            placement,
-        }
-        .save()?;
+        self.preferences.placement = placement;
+        self.preferences.save()?;
         self.gallery.set_placement(placement)?;
         self.schedule_thumbnail_timer()
     }
@@ -641,6 +637,9 @@ fn run() -> Result<()> {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
     }
+    if !onboarding::run_if_needed()? {
+        return Ok(());
+    }
     let _ole = drag_drop::OleApartment::new()?;
     let _cleanup = cleanup::CleanupWorker::start(storage::temp_directory()?)?;
     overlay::register_class()?;
@@ -695,15 +694,26 @@ fn run() -> Result<()> {
         clipboard: None,
         editors: Vec::new(),
         editor_capture_focus: None,
+        preferences,
     };
     unsafe {
+        let modifiers = match preferences.shortcut {
+            settings::CaptureShortcut::AltShiftS => MOD_ALT | MOD_SHIFT,
+            settings::CaptureShortcut::CtrlShiftS => MOD_CONTROL | MOD_SHIFT,
+            settings::CaptureShortcut::CtrlAltS => MOD_CONTROL | MOD_ALT,
+        };
         RegisterHotKey(
             Some(controller),
             CAPTURE_HOTKEY,
-            MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
+            modifiers | MOD_NOREPEAT,
             u32::from(b'S'),
         )
-        .context("Alt + Shift + S is already registered by another application")?;
+        .with_context(|| {
+            format!(
+                "{} is already registered by another application",
+                preferences.shortcut.label()
+            )
+        })?;
         RegisterHotKey(
             Some(controller),
             QUIT_HOTKEY,
@@ -716,11 +726,17 @@ fn run() -> Result<()> {
         controller,
         app.gallery.timeout(),
         app.gallery.placement(),
+        preferences.shortcut,
     )?);
     println!("Catch It - running in the notification area");
-    println!("Alt + Shift + S: select a region on the monitor under the pointer");
+    println!(
+        "{}: select a region on the monitor under the pointer",
+        preferences.shortcut.label()
+    );
     println!("Esc / right-click: cancel. Ctrl + Alt + Q: quit.");
-    println!("Output: %LOCALAPPDATA%\\CatchIt\\Temp\\");
+    if let Ok(folder) = storage::temp_directory() {
+        println!("Temporary captures: {}", folder.display());
+    }
     println!(
         "Preview: auto-copy image, hover for Copy/Save/pin/close, drag to copy file. Timing is provisional."
     );

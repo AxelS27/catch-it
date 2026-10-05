@@ -56,13 +56,9 @@ Implemented:
 - Only generated PNGs and abandoned `.png.part` writes with a last-modified age of at least 24 hours are removed. Recent/future-dated files, unrelated names, directories, and reparse points are left alone.
 - Pending entries, pins, and drags hold a native file handle that prevents deletion while still allowing reading/copying. Locked or inaccessible expired files are deferred until a later sweep; cleanup errors are logged without interrupting capture.
 
-Output directory:
+Temporary capture directory: packaged installs use `Temp` inside the chosen install folder (default `%LOCALAPPDATA%\Programs\Catch It\Temp`); development/unpackaged builds continue using `%LOCALAPPDATA%\CatchIt\Temp`. Choose a writable, per-user install folder. Never choose `Program Files` for this layout. The Save As dialog starts in the Windows Pictures known folder by default, including redirected Pictures folders, but every screenshot can be saved elsewhere.
 
-```text
-%LOCALAPPDATA%\CatchIt\Temp\
-```
-
-The auto-close and Quick Access position preferences are atomically saved together in `%LOCALAPPDATA%\CatchIt\settings.txt` and loaded on startup. On the first run of Catch It, the app imports existing preferences from `%LOCALAPPDATA%\SimpleScreenshot\settings.txt` if the new file is absent. Previous PNGs remain untouched at `%LOCALAPPDATA%\SimpleScreenshot\Temp\`; they are not moved or deleted, because clipboard contents or other apps may still reference their paths. New captures go to the new folder. Older timer-only settings default to bottom-right. The queue and pins are session-only, not a screenshot history/library, and are not restored after restart.
+The auto-close, Quick Access position, appearance, and capture shortcut preferences are saved together in `%LOCALAPPDATA%\CatchIt\settings.txt` and loaded on startup. On the first run of Catch It, the app imports existing preferences from `%LOCALAPPDATA%\SimpleScreenshot\settings.txt` if the new file is absent. Previous PNGs remain untouched at `%LOCALAPPDATA%\SimpleScreenshot\Temp\`; they are not moved or deleted, because clipboard contents or other apps may still reference their paths. New captures go to the new folder. Older timer-only settings default to bottom-right. The queue and pins are session-only, not a screenshot history/library, and are not restored after restart.
 
 The native editor shell, basic drawing, and a limited Background Tool are implemented; text, redaction, crop, additional arrow styles, opacity/lock controls, and a settings window remain pending. Files survive preview dismissal and app shutdown until their 24-hour retention expires. Cleanup runs only while the application is running, so expired files may remain until the next startup or hourly sweep. Files copied elsewhere are not cleaned.
 
@@ -81,6 +77,12 @@ The floating implementation is functional, but exact macOS or CleanShot parity i
 | Manual dismissal | Hover close control, context-menu Close, or Close all |
 
 These values are not measured native macOS specifications. Geometry, gestures, animation curves, and timing must still be compared against a versioned macOS reference. Clicking the card background does not open an editor; its Annotate pencil does. Holding the left button and moving beyond the system threshold initiates a file drag. When Windows disables client-area animation, transitions become effectively immediate without changing the idle lifetime.
+
+## Windows installer (initial packaging slice)
+
+Run `pwsh -NoProfile -File ./scripts/build-installer.ps1` with Inno Setup 6 installed. It builds from a separate release target and outputs `dist/CatchIt-Setup-0.1.0.exe`. The per-user installer only chooses a writable app folder, copies the app, creates `Temp` within it, and adds an uninstaller and Start Menu shortcut. On first packaged launch, the **app itself** shows a five-step, mobile-inspired native onboarding with bottom progress dots and no sidebar: an official-artwork **Sign in with Google** button that honestly reports sign-in unavailable and **Continue in preview**; three side-by-side Windows-following/Light/Dark appearance cards; then separate screens for the capture shortcut, Quick Access corner, and auto-close duration. Finishing writes preferences and a separate completion marker to `%LOCALAPPDATA%\CatchIt`; closing early leaves onboarding pending for the next launch. Existing preferences are preselected. To inspect this UI without installing or saving choices, run `target/debug/catch-it.exe --onboarding-preview` after `cargo build`. Existing temp captures from unpackaged builds are not migrated or removed.
+
+**Not yet included:** functioning Google sign-in, purchase verification, 3-device entitlement, and an in-app settings window. The capture hotkey defaults to `Alt + Shift + S`; Quick Access corner and timer can also be changed later in the tray. To change theme or shortcut after onboarding, an in-app settings UI remains future work. The preview Google button is not a genuine sign-in or license check. Before selling, review [Inno Setup's commercial licensing](https://jrsoftware.org/isorder.php) and sign the final binaries to reduce Windows trust warnings. Do not present this package as purchase-gated yet.
 
 ## Run
 
