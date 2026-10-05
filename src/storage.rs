@@ -32,9 +32,16 @@ impl Drop for ComApartment {
 }
 
 pub fn temp_directory() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("Cannot locate Catch It executable")?;
+    if let Some(install_dir) = executable.parent()
+        && install_dir.join("install-layout.txt").is_file()
+    {
+        return Ok(install_dir.join("Temp"));
+    }
+    // Development builds and existing unpackaged installs keep the original layout.
     Ok(
         PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?)
-            .join("SimpleScreenshot")
+            .join("CatchIt")
             .join("Temp"),
     )
 }
@@ -195,7 +202,7 @@ mod tests {
     fn wic_round_trip_preserves_bgra_and_unicode_paths() -> Result<()> {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let file = TestFile(std::env::temp_dir().join(format!(
-            "simple screenshot 日本 {} {timestamp}.png",
+            "catch it 日本 {} {timestamp}.png",
             std::process::id()
         )));
         let original = [

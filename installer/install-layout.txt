@@ -1,0 +1,3 @@
+Catch It per-user install layout v1
+The Temp directory next to this file stores temporary captures.
+Settings remain in %LOCALAPPDATA%\CatchIt\settings.txt.

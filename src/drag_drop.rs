@@ -171,7 +171,7 @@ impl PreparedDrag {
     }
 }
 
-const DRAG_CLASS: PCWSTR = w!("SimpleScreenshot.DragImage");
+const DRAG_CLASS: PCWSTR = w!("CatchIt.DragImage");
 
 pub fn register_class() -> Result<()> {
     unsafe {

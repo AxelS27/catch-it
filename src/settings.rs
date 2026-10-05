@@ -107,21 +107,83 @@ impl Placement {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Appearance {
+    #[default]
+    System,
+    Dark,
+    Light,
+}
+impl Appearance {
+    fn value(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "system" => Ok(Self::System),
+            "dark" => Ok(Self::Dark),
+            "light" => Ok(Self::Light),
+            _ => anyhow::bail!("Unsupported appearance"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureShortcut {
+    #[default]
+    AltShiftS,
+    CtrlShiftS,
+    CtrlAltS,
+}
+impl CaptureShortcut {
+    fn value(self) -> &'static str {
+        match self {
+            Self::AltShiftS => "alt_shift_s",
+            Self::CtrlShiftS => "ctrl_shift_s",
+            Self::CtrlAltS => "ctrl_alt_s",
+        }
+    }
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "alt_shift_s" => Ok(Self::AltShiftS),
+            "ctrl_shift_s" => Ok(Self::CtrlShiftS),
+            "ctrl_alt_s" => Ok(Self::CtrlAltS),
+            _ => anyhow::bail!("Unsupported capture shortcut"),
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AltShiftS => "Alt + Shift + S",
+            Self::CtrlShiftS => "Ctrl + Shift + S",
+            Self::CtrlAltS => "Ctrl + Alt + S",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
     pub auto_close: AutoClose,
     pub placement: Placement,
+    pub appearance: Appearance,
+    pub shortcut: CaptureShortcut,
 }
 impl Settings {
     fn path() -> Result<PathBuf> {
-        Ok(crate::storage::temp_directory()?
-            .parent()
-            .context("Missing settings directory")?
-            .join("settings.txt"))
+        Ok(
+            PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?)
+                .join("CatchIt")
+                .join("settings.txt"),
+        )
     }
     fn parse(text: &str) -> Result<Self> {
         let mut settings = Self::default();
         let mut timeout_seen = false;
         let mut placement_seen = false;
+        let mut appearance_seen = false;
+        let mut shortcut_seen = false;
         for line in text.lines() {
             if let Some(value) = line.strip_prefix("auto_close=") {
                 anyhow::ensure!(!timeout_seen, "Duplicate auto-close setting");
@@ -131,6 +193,14 @@ impl Settings {
                 anyhow::ensure!(!placement_seen, "Duplicate Quick Access position");
                 settings.placement = Placement::parse(value)?;
                 placement_seen = true;
+            } else if let Some(value) = line.strip_prefix("appearance=") {
+                anyhow::ensure!(!appearance_seen, "Duplicate appearance setting");
+                settings.appearance = Appearance::parse(value)?;
+                appearance_seen = true;
+            } else if let Some(value) = line.strip_prefix("shortcut=") {
+                anyhow::ensure!(!shortcut_seen, "Duplicate shortcut setting");
+                settings.shortcut = CaptureShortcut::parse(value)?;
+                shortcut_seen = true;
             } else {
                 anyhow::bail!("Unknown screenshot setting");
             }
@@ -140,16 +210,30 @@ impl Settings {
     }
     pub fn load() -> Self {
         let result = (|| -> Result<Self> {
-            let path = Self::path()?;
-            if !path.exists() {
-                return Ok(Self::default());
-            }
-            Self::parse(&std::fs::read_to_string(path)?)
+            let local =
+                PathBuf::from(std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA is not set")?);
+            Self::load_from(
+                &Self::path()?,
+                &local.join("SimpleScreenshot").join("settings.txt"),
+            )
         })();
         result.unwrap_or_else(|error| {
             eprintln!("Settings ignored: {error:#}");
             Self::default()
         })
+    }
+    fn load_from(path: &std::path::Path, legacy: &std::path::Path) -> Result<Self> {
+        if path.exists() {
+            return Self::parse(&std::fs::read_to_string(path)?);
+        }
+        if legacy.exists() {
+            // Copy only preferences, never move the old PNGs: other programs may
+            // still hold paths to those files. Repeated starts use the new copy.
+            let settings = Self::parse(&std::fs::read_to_string(legacy)?)?;
+            settings.save_to(path)?;
+            return Ok(settings);
+        }
+        Ok(Self::default())
     }
     pub fn save(self) -> Result<()> {
         self.save_to(&Self::path()?)
@@ -160,9 +244,11 @@ impl Settings {
         std::fs::write(
             &pending,
             format!(
-                "auto_close={}\nplacement={}\n",
+                "auto_close={}\nplacement={}\nappearance={}\nshortcut={}\n",
                 self.auto_close.value(),
-                self.placement.value()
+                self.placement.value(),
+                self.appearance.value(),
+                self.shortcut.value()
             ),
         )?;
         let result = std::fs::rename(&pending, path).context("Cannot publish screenshot settings");
@@ -183,7 +269,8 @@ mod tests {
                 Settings::parse(&format!("auto_close={}\n", timeout.value())).unwrap(),
                 Settings {
                     auto_close: timeout,
-                    placement: Placement::BottomRight
+                    placement: Placement::BottomRight,
+                    ..Settings::default()
                 }
             );
             for placement in Placement::ALL {
@@ -196,7 +283,8 @@ mod tests {
                     .unwrap(),
                     Settings {
                         auto_close: timeout,
-                        placement
+                        placement,
+                        ..Settings::default()
                     }
                 );
             }
@@ -207,11 +295,62 @@ mod tests {
             "auto_close=999999",
             "auto_close=5\nextra=true",
             "auto_close=5\nplacement=somewhere",
+            "auto_close=5\nappearance=blue",
+            "auto_close=5\nshortcut=unregistered",
+            "auto_close=5\nappearance=light\nappearance=dark",
             "auto_close=5\nauto_close=15",
         ] {
             assert!(Settings::parse(text).is_err(), "{text}");
         }
         assert_eq!(AutoClose::Never.duration(), None);
+    }
+    #[test]
+    fn installer_choices_round_trip_and_older_settings_keep_defaults() {
+        let selected = Settings::parse(
+            "auto_close=300\nplacement=top_left\nappearance=dark\nshortcut=ctrl_shift_s\n",
+        )
+        .unwrap();
+        assert_eq!(selected.appearance, Appearance::Dark);
+        assert_eq!(selected.shortcut, CaptureShortcut::CtrlShiftS);
+        assert_eq!(selected.auto_close, AutoClose::FiveMinutes);
+        assert_eq!(selected.placement, Placement::TopLeft);
+        let old = Settings::parse("auto_close=5\nplacement=bottom_right\n").unwrap();
+        assert_eq!(old.appearance, Appearance::System);
+        assert_eq!(old.shortcut, CaptureShortcut::AltShiftS);
+    }
+
+    #[test]
+    fn rebrand_imports_preferences_once_without_moving_legacy_data() -> Result<()> {
+        let folder = std::env::temp_dir().join(format!(
+            "catch it migration {} {}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        ));
+        let legacy = folder.join("SimpleScreenshot").join("settings.txt");
+        let current = folder.join("CatchIt").join("settings.txt");
+        std::fs::create_dir_all(legacy.parent().unwrap())?;
+        std::fs::write(&legacy, "auto_close=never\nplacement=top_left\n")?;
+        assert_eq!(
+            Settings::load_from(&current, &legacy)?,
+            Settings {
+                auto_close: AutoClose::Never,
+                placement: Placement::TopLeft,
+                ..Settings::default()
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(&legacy)?,
+            "auto_close=never\nplacement=top_left\n"
+        );
+        std::fs::write(&legacy, "auto_close=5\n")?;
+        assert_eq!(
+            Settings::load_from(&current, &legacy)?.placement,
+            Placement::TopLeft
+        );
+        std::fs::remove_dir_all(folder)?;
+        Ok(())
     }
     #[test]
     fn saving_one_choice_preserves_the_other() -> Result<()> {
@@ -226,6 +365,7 @@ mod tests {
         let mut settings = Settings {
             auto_close: AutoClose::Never,
             placement: Placement::TopLeft,
+            ..Settings::default()
         };
         settings.save_to(&path)?;
         settings.auto_close = AutoClose::FifteenSeconds;

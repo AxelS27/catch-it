@@ -57,6 +57,15 @@ pub fn save_as(owner: HWND, source: &Path) -> Result<Option<PathBuf>> {
         }])?;
         dialog.SetDefaultExtension(w!("png"))?;
         dialog.SetFileName(w!("Screenshot.png"))?;
+        // Start new saves in the user's real Pictures known folder (including
+        // redirected/OneDrive folders). The dialog still lets users pick anywhere.
+        if let Ok(pictures) = SHGetKnownFolderPath(&FOLDERID_Pictures, KNOWN_FOLDER_FLAG(0), None) {
+            let folder: Result<IShellItem, _> = SHCreateItemFromParsingName(pictures, None);
+            if let Ok(folder) = folder {
+                let _ = dialog.SetDefaultFolder(&folder);
+            }
+            CoTaskMemFree(Some(pictures.0.cast()));
+        }
         dialog.SetOptions(
             FOS_FORCEFILESYSTEM
                 | FOS_PATHMUSTEXIST
@@ -98,10 +107,7 @@ pub fn save_copy(source: &Path, destination: &Path) -> Result<()> {
         .parent()
         .context("Save destination has no folder")?;
     let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let pending = folder.join(format!(
-        ".simple-screenshot-save-{}-{seq}.tmp",
-        std::process::id()
-    ));
+    let pending = folder.join(format!(".catch-it-save-{}-{seq}.tmp", std::process::id()));
     // Never truncate the chosen target. The temporary copy must be fully written
     // and closed before an atomic same-directory rename replaces an approved file.
     let file = std::fs::OpenOptions::new()
