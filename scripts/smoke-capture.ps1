@@ -2471,7 +2471,32 @@ function Test-DragDrop([switch]$PreviewOnly) {
     if ((Get-FileHash -LiteralPath $copy).Hash -ne $hash) { throw 'Explorer copy has incorrect bytes.' }
     Write-Host 'PASS: real Explorer drop copies identical PNG bytes and keeps the source'
     Remove-Item -LiteralPath $copy
-    if ($PreviewOnly) { return }
+    if ($PreviewOnly) {
+        $source = New-TestPreview
+        Click-PreviewAction $source.Window 'Annotate'
+        $editor = Wait-Editor
+        $record = New-TestPreview
+        # Capture fixtures raise the scene for DXGI; leave it below the active editor.
+        [void][CaptureInput]::SetWindowPos($sceneWindow, [IntPtr](-2), 0, 0, 0, 0, 0x13)
+        [void][CaptureInput]::SetForegroundWindow($editor)
+        Start-Sleep -Milliseconds 120
+        $hoverX = $sceneRect.Left + 35
+        $hoverY = $sceneRect.Top + 35
+        Begin-PreviewDrag $record.Window $hoverX $hoverY
+        Wait-DragLog 'Drag started:'
+        [CaptureInput]::MouseAt($hoverX, $hoverY, 0)
+        Start-Sleep -Milliseconds 900
+        if ([CaptureInput]::GetForegroundWindow() -ne $sceneWindow) {
+            Save-GalleryScreenshot 'drag-hover-activation-failure.png'
+            [CaptureInput]::DropAt($hoverX, $hoverY)
+            throw 'Hovering another application during thumbnail drag did not bring it to the foreground.'
+        }
+        Press-Key 0x1B
+        [CaptureInput]::DropAt($hoverX, $hoverY)
+        Wait-DragLog 'Drag result: canceled'
+        Write-Host 'PASS: hovering another window during thumbnail drag activates it above the editor'
+        return
+    }
 
     $record=New-TestPreview
     Click-PreviewControl $record.Window -Pin

@@ -11,7 +11,7 @@ use std::{
         mpsc,
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -58,6 +58,7 @@ pub enum Outcome {
 #[implement(IDropSource, Agile = false)]
 struct DropSource {
     cancel: Rc<Cell<bool>>,
+    hover: RefCell<Option<(HWND, Instant)>>,
 }
 
 impl IDropSource_Impl for DropSource_Impl {
@@ -67,12 +68,46 @@ impl IDropSource_Impl for DropSource_Impl {
         } else if keys.0 & MK_LBUTTON.0 == 0 {
             DRAGDROP_S_DROP
         } else {
+            self.activate_hovered_window();
             S_OK
         }
     }
 
     fn GiveFeedback(&self, _effect: DROPEFFECT) -> HRESULT {
         DRAGDROP_S_USEDEFAULTCURSORS
+    }
+}
+
+impl DropSource_Impl {
+    fn activate_hovered_window(&self) {
+        unsafe {
+            let mut cursor = POINT::default();
+            if GetCursorPos(&mut cursor).is_err() {
+                return;
+            }
+            let target = GetAncestor(WindowFromPoint(cursor), GA_ROOT);
+            let mut process = 0;
+            if target.is_invalid()
+                || GetWindowThreadProcessId(target, Some(&mut process)) == 0
+                || process == std::process::id()
+                || target == GetForegroundWindow()
+            {
+                self.hover.borrow_mut().take();
+                return;
+            }
+            let mut hover = self.hover.borrow_mut();
+            match *hover {
+                Some((previous, since)) if previous == target => {
+                    if since.elapsed() >= Duration::from_millis(400) {
+                        // OLE leaves the source foreground during a drag. Raise only
+                        // a stable external target, never the thumbnail or editor.
+                        let _ = SetForegroundWindow(target);
+                        hover.take();
+                    }
+                }
+                _ => *hover = Some((target, Instant::now())),
+            }
+        }
     }
 }
 
@@ -148,7 +183,11 @@ impl PreparedDrag {
     ) -> Result<Self> {
         let data = file_data_object(path)?;
         let visual = DragVisualWorker::new(pixels.to_vec(), width, height, offset)?;
-        let source = DropSource { cancel }.into();
+        let source = DropSource {
+            cancel,
+            hover: RefCell::new(None),
+        }
+        .into();
         Ok(Self {
             data,
             source,
@@ -462,6 +501,7 @@ mod tests {
         let cancel = Rc::new(Cell::new(false));
         let source: IDropSource = DropSource {
             cancel: Rc::clone(&cancel),
+            hover: RefCell::new(None),
         }
         .into();
         unsafe {
