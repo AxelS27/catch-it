@@ -9,8 +9,10 @@ param(
     [switch]$FifoOnly,
     [switch]$ActionsOnly,
     [switch]$QuickAccessOnly,
+    [switch]$HoverCycleOnly,
     [switch]$ThemeOnly,
     [switch]$EditorOnly,
+    [switch]$EditorDragOnly,
     [switch]$BackgroundOnly,
     [switch]$DrawOnly,
     [switch]$HoverOnly,
@@ -27,7 +29,7 @@ param(
     [switch]$BrandOnly
 )
 
-$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $ThemeOnly -or $EditorOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly -or $PolishOnly -or $SliderOnly -or $WebDragOnly -or $PlacementOnly -or $BrandOnly
+$GalleryOnly = $GalleryOnly -or $FifoOnly -or $ActionsOnly -or $QuickAccessOnly -or $HoverCycleOnly -or $ThemeOnly -or $EditorOnly -or $EditorDragOnly -or $BackgroundOnly -or $DrawOnly -or $HoverOnly -or $PickerOnly -or $MosaicOnly -or $TextOnly -or $CropOnly -or $ImageOnly -or $EditableOnly -or $PolishOnly -or $SliderOnly -or $WebDragOnly -or $PlacementOnly -or $BrandOnly
 
 $ErrorActionPreference = 'Stop'
 Add-Type @'
@@ -38,7 +40,13 @@ public static class CaptureInput {
     public struct Rect { public int Left, Top, Right, Bottom; }
     [StructLayout(LayoutKind.Sequential)] public struct Point { public int X, Y; }
     [DllImport("user32.dll")] private static extern bool GetCursorPos(out Point point);
+    [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int key);
+    public static bool IsLeftDown() { return GetAsyncKeyState(1) < 0; }
     [DllImport("user32.dll")] private static extern IntPtr WindowFromPoint(Point point);
+    [DllImport("user32.dll")] private static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+    [DllImport("user32.dll", EntryPoint="GetWindowLongPtrW")] private static extern IntPtr GetWindowLongPtr(IntPtr hwnd, int index);
+    public static bool IsTopmost(IntPtr hwnd) { return (GetWindowLongPtr(hwnd,-20).ToInt64() & 8) != 0; }
+    public static IntPtr WindowAt(int x, int y) { return GetAncestor(WindowFromPoint(new Point { X=x, Y=y }), 2); }
     public static IntPtr CursorWindow() { Point point; GetCursorPos(out point); return WindowFromPoint(point); }
     public static string CursorInfo() { Point point; GetCursorPos(out point); return point.X + "," + point.Y + " window=" + WindowFromPoint(point); }
     [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr context);
@@ -1159,6 +1167,7 @@ document.addEventListener('drop',e=>{e.preventDefault();let files=e.dataTransfer
             Start-Sleep -Milliseconds 20
         }
         if(-not $hovered){Save-GalleryScreenshot 'web-drop-hover-failure.png';throw 'Chrome did not receive the native file drag-over event.'}
+        Save-DragVisual 'web-drag-visual.png' $tx $ty
         [CaptureInput]::DropAt($tx,$ty)
         $received=$false
         for($i=0;$i -lt 100;$i++){
@@ -1334,6 +1343,25 @@ function Test-Sliders {
         Write-Host "PASS: $label follows large-capture drag (median=$($sorted[7]) ms, max=$($sorted[-1]) ms)"
         Start-Sleep -Milliseconds 120
     }
+    # Burst movements must not queue a full bitmap composition per stale point.
+    $burstLeft=[int]($r.Left+44*$s);$burstRight=[int]($r.Left+218*$s)
+    [CaptureInput]::HoldAt($burstLeft,$sliderY)
+    Start-Sleep -Milliseconds 100
+    $burst=[Diagnostics.Stopwatch]::StartNew()
+    for($i=0;$i -lt 100;$i++){
+        [CaptureInput]::MouseAt($(if($i%2 -eq 0){$burstLeft}else{$burstRight}),$sliderY,0)
+    }
+    $seen=$false
+    while($burst.ElapsedMilliseconds -lt 3000){
+        $rgb=[CaptureInput]::ScreenPixel(($burstRight-[int](4*$s)),($sliderY+[int](4*$s)))
+        if(($rgb -band 255) -gt 215 -and (($rgb -shr 8) -band 255) -gt 215 -and (($rgb -shr 16) -band 255) -gt 215){$seen=$true;break}
+        Start-Sleep -Milliseconds 3
+    }
+    $burstElapsed=$burst.ElapsedMilliseconds
+    if($seen){Save-GalleryScreenshot 'background-slider-burst-large.png'}
+    [CaptureInput]::DropAt($burstRight,$sliderY)
+    if(-not $seen){throw 'Burst slider drag did not paint the final thumb within 3 seconds.'}
+    Write-Host "PASS: rapid back-and-forth drag reaches latest thumb in $burstElapsed ms (100 moves)"
 }
 function Test-Background {
     if([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA'){throw 'Run BackgroundOnly with pwsh -Sta.'}
@@ -2061,10 +2089,16 @@ function Test-Editor {
     [CaptureInput]::MouseAt(($x+60),($y-60),0);Start-Sleep -Milliseconds 100
     for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
     if([CaptureInput]::DragWindow() -eq [IntPtr]::Zero){throw 'Drag Me did not start native OLE file drag.'}
-    Press-Key 27;[CaptureInput]::DropAt(($x+60),($y-60))
+    if([CaptureInput]::IsWindowVisible($editor) -or [CaptureInput]::IsIconic($editor)){throw 'Drag Me did not hide editor without adding a taskbar entry.'}
+    Start-Sleep -Milliseconds 120 # wait until the OLE loop is armed after the visual appears
+    [CaptureInput]::keybd_event(27,0,0,[UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 180
+    [CaptureInput]::keybd_event(27,0,2,[UIntPtr]::Zero)
     for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -ne [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
-    if([CaptureInput]::DragWindow() -ne [IntPtr]::Zero -or -not [CaptureInput]::IsWindow($editor)){throw 'Canceled Drag Me did not preserve editor.'}
-    Write-Host 'PASS: Drag Me starts actual OLE drag; Escape preserves original image and session'
+    [CaptureInput]::DropAt(($x+60),($y-60))
+    for($i=0;$i -lt 100 -and -not [CaptureInput]::IsWindowVisible($editor);$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::DragWindow() -ne [IntPtr]::Zero -or -not [CaptureInput]::IsWindowVisible($editor) -or [CaptureInput]::IsIconic($editor)){throw 'Canceled Drag Me did not restore editor.'}
+    Write-Host 'PASS: Drag Me hides editor during OLE drag; Escape restores editor and session'
     if($DragDrop){
         $folder=Join-Path $artifacts ('Editor drop '+[Guid]::NewGuid().ToString('N'))
         [void](New-Item -ItemType Directory -Force $folder)
@@ -2090,11 +2124,14 @@ function Test-Editor {
         [CaptureInput]::MouseAt($tx,$ty,0)
         for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
         if([CaptureInput]::DragWindow() -eq [IntPtr]::Zero){throw 'Editor Explorer drag never started.'}
+        for($i=0;$i -lt 100 -and [CaptureInput]::IsWindowVisible($editor);$i++){Start-Sleep -Milliseconds 25}
+        if([CaptureInput]::IsWindowVisible($editor) -or [CaptureInput]::IsIconic($editor)){throw 'Editor still covers Explorer or entered taskbar while dragging.'}
         Start-Sleep -Milliseconds 200;[CaptureInput]::DropAt($tx,$ty)
         $copied=Join-Path $folder (Split-Path $first.Shot -Leaf);$script:created+=$copied
         Assert-SavedCopy $copied $first.Shot
-        if(-not [CaptureInput]::IsWindow($editor) -or -not (Test-Path $first.Shot)){throw 'Accepted editor drag lost session or original.'}
-        Write-Host 'PASS: actual Drag Me drop into Explorer copies exact original PNG and preserves editor'
+        for($i=0;$i -lt 100 -and -not [CaptureInput]::IsWindowVisible($editor);$i++){Start-Sleep -Milliseconds 25}
+        if(-not [CaptureInput]::IsWindowVisible($editor) -or [CaptureInput]::IsIconic($editor) -or -not (Test-Path $first.Shot)){throw 'Successful editor drop did not restore its session or preserve source.'}
+        Write-Host 'PASS: Explorer copies exact PNG; successful drop restores editor'
     }
 
     Set-AutoClose '5 seconds' '5';[CaptureInput]::MouseAt(100,100,0)
@@ -2146,6 +2183,100 @@ function Test-Editor {
     if([CaptureInput]::EditorCount() -ne 0 -or -not (Test-Path $first.Shot)){throw 'Shutdown left editor windows or removed original.'}
     Assert-ClipboardImage $first.Shot
     Write-Host 'PASS: independent source protection and copy survive preview close; quit cancels modal output and releases editor windows'
+}
+function Test-EditorDrag {
+    Close-AllPreviews;Set-AutoClose 'Never' 'never'
+    $screen=[Windows.Forms.Screen]::PrimaryScreen.Bounds
+    $x1=$screen.Left+80;$y1=$screen.Top+80
+    $x2=[Math]::Min($screen.Right-60,$x1+1600);$y2=[Math]::Min($screen.Bottom-60,$y1+800)
+    $beforeWindows=[CaptureInput]::ThumbnailWindows($false);$before=@(Get-Shots)
+    [void](Start-Selection)
+    [CaptureInput]::HoldAt($x1,$y1);[CaptureInput]::MouseAt($x2,$y2,0);[CaptureInput]::DropAt($x2,$y2)
+    $shot=Wait-NewShot $before;$script:created+=$shot
+    $capture=@{Shot=$shot;Window=(Wait-NewPreview $beforeWindows)}
+    $hash=(Get-FileHash -LiteralPath $capture.Shot -Algorithm SHA256).Hash
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    Click-PreviewAction $capture.Window 'Annotate'
+    $editor=Wait-Editor
+    $r=[CaptureInput]::ClientBounds($editor);$s=[CaptureInput]::GetDpiForWindow($editor)/96.0
+    [CaptureInput]::ClickAt([int]($r.Left+88*$s),[int]($r.Top+24*$s));Start-Sleep -Milliseconds 120
+    $r=[CaptureInput]::ClientBounds($editor)
+    [CaptureInput]::ClickAt([int]($r.Left+131*$s),[int]($r.Top+285*$s))
+    $x=[int](($r.Left+$r.Right)/2);$y=[int]($r.Bottom-24*$s)
+    [CaptureInput]::HoldAt($x,$y);Start-Sleep -Milliseconds 70
+    $hideClock=[Diagnostics.Stopwatch]::StartNew()
+    [CaptureInput]::MouseAt(($x+60),($y-60),0)
+    for($i=0;$i -lt 100 -and [CaptureInput]::IsWindowVisible($editor);$i++){Start-Sleep -Milliseconds 25}
+    $hideMs=$hideClock.ElapsedMilliseconds
+    if([CaptureInput]::IsWindowVisible($editor) -or [CaptureInput]::IsIconic($editor)){throw 'Editor Drag Me did not fade away without minimizing to taskbar.'}
+    for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::DragWindow() -eq [IntPtr]::Zero){throw 'Drag image did not appear after hiding editor.'}
+    Write-Host "Editor hide latency on large background image: $hideMs ms"
+    Save-GalleryScreenshot 'editor-drag-active.png'
+    Start-Sleep -Milliseconds 120
+    [CaptureInput]::keybd_event(27,0,0,[UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 180
+    [CaptureInput]::keybd_event(27,0,2,[UIntPtr]::Zero)
+    for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -ne [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+    [CaptureInput]::DropAt(($x+60),($y-60))
+    for($i=0;$i -lt 100 -and -not [CaptureInput]::IsWindowVisible($editor);$i++){Start-Sleep -Milliseconds 25}
+    if(-not [CaptureInput]::IsWindowVisible($editor) -or [CaptureInput]::IsIconic($editor)){throw 'Cancel did not fade the editor back in.'}
+    for($i=0;$i -lt 100 -and -not (Get-Content (Join-Path $artifacts 'stdout.log') -Raw).Contains('Editor drag result: canceled');$i++){Start-Sleep -Milliseconds 20}
+    Save-GalleryScreenshot 'editor-drag-canceled-restored.png'
+    Write-Host 'PASS: Drag Me fades editor out without taskbar entry; Escape restores it'
+
+    $folder=Join-Path $artifacts ('Editor drag destination '+[Guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Force $folder)
+    $shellApp=New-Object -ComObject Shell.Application
+    $shellApp.Explore($folder)
+    for($i=0;$i -lt 200;$i++){
+        foreach($window in $shellApp.Windows()){
+            try{if($window.Document.Folder.Self.Path -eq $folder){$script:explorerWindow=$window;break}}catch{}
+        }
+        if($script:explorerWindow){break};Start-Sleep -Milliseconds 25
+    }
+    if(-not $script:explorerWindow){throw 'Explorer drop destination did not open.'}
+    $script:closeExplorer=$true
+    $explorer=[IntPtr]$script:explorerWindow.HWND
+    $screen=[Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    [void][CaptureInput]::MoveWindow($explorer,($screen.Right-720),($screen.Top+60),700,650,$true)
+    # Other apps may cover Explorer after hiding the editor. Keep the isolated
+    # drop target above them so this test measures editor behavior, not z-order.
+    [void][CaptureInput]::SetWindowPos($explorer,[IntPtr](-1),0,0,0,0,0x13)
+    [void][CaptureInput]::SetForegroundWindow($explorer);Start-Sleep -Milliseconds 120
+    $bounds=Preview-Rect $explorer;$tx=[int]($bounds.Left+($bounds.Right-$bounds.Left)*0.8);$ty=[int]($bounds.Top+($bounds.Bottom-$bounds.Top)*0.6)
+    [void][CaptureInput]::SetForegroundWindow($editor)
+    [CaptureInput]::HoldAt($x,$y);Start-Sleep -Milliseconds 70
+    [CaptureInput]::MouseAt($tx,$ty,0)
+    for($i=0;$i -lt 100 -and [CaptureInput]::IsWindowVisible($editor);$i++){Start-Sleep -Milliseconds 25}
+    for($i=0;$i -lt 100 -and [CaptureInput]::DragWindow() -eq [IntPtr]::Zero;$i++){Start-Sleep -Milliseconds 25}
+    if([CaptureInput]::IsWindowVisible($editor) -or [CaptureInput]::IsIconic($editor) -or [CaptureInput]::DragWindow() -eq [IntPtr]::Zero){throw 'Editor covered Explorer or entered taskbar during drop.'}
+    for($i=0;$i -lt 80;$i++){
+        [CaptureInput]::MouseAt(($tx+($i%2)*8),$ty,0)
+        if(-not [CaptureInput]::IsLeftDown()){throw 'Test released the mouse before the drag hold ended.'}
+        if([CaptureInput]::IsWindowVisible($editor) -or [CaptureInput]::DragWindow() -eq [IntPtr]::Zero){
+            throw "Editor reappeared while Drag Me was still held after $($i*25) ms over Explorer."
+        }
+        Start-Sleep -Milliseconds 25
+    }
+    Save-GalleryScreenshot 'editor-drag-explorer.png'
+    [CaptureInput]::DropAt($tx,$ty)
+    $copy=$null
+    for($i=0;$i -lt 200;$i++){
+        $copy=Get-ChildItem -LiteralPath $folder -Filter '*.png' -File | Select-Object -First 1
+        if($copy){break}
+        Start-Sleep -Milliseconds 25
+    }
+    if(-not $copy){throw 'Explorer did not receive the composed PNG.'}
+    $copied=$copy.FullName;$script:created+=$copied
+    $source=[Drawing.Bitmap]::new($capture.Shot);$output=[Drawing.Bitmap]::new($copied)
+    try{if($output.Width -le $source.Width -or $output.Height -le $source.Height){throw 'Explorer copy lost full-resolution background padding.'}}
+    finally{$source.Dispose();$output.Dispose()}
+    for($i=0;$i -lt 100 -and -not [CaptureInput]::IsWindowVisible($editor);$i++){Start-Sleep -Milliseconds 25}
+    if(-not [CaptureInput]::IsWindowVisible($editor) -or [CaptureInput]::IsIconic($editor) -or [CaptureInput]::EditorCount() -ne 1 -or (Get-FileHash -LiteralPath $capture.Shot -Algorithm SHA256).Hash -ne $hash){throw 'Successful drop did not restore editor or preserve original.'}
+    for($i=0;$i -lt 100 -and -not (Get-Content (Join-Path $artifacts 'stdout.log') -Raw).Contains('Editor drag result: copied');$i++){Start-Sleep -Milliseconds 20}
+    Save-GalleryScreenshot 'editor-drag-copied-restored.png'
+    Write-Host 'PASS: Explorer receives composed PNG; successful drop restores the editor session'
 }
 function Test-Fifo {
     Close-AllPreviews
@@ -2402,6 +2533,56 @@ function Test-Theme {
     Save-GalleryScreenshot 'theme-annotate-palette.png'
     Write-Host 'PASS: Quick Access neutral border and Annotate chrome/palette follow Windows app theme'
 }
+function Test-HoverCycle {
+    $destination=Join-Path $artifacts ('Hover target '+[Guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Force $destination)
+    $shellApp=New-Object -ComObject Shell.Application
+    $shellApp.Explore($destination)
+    for($i=0;$i -lt 200;$i++){
+        foreach($window in $shellApp.Windows()){
+            try{if($window.Document.Folder.Self.Path -eq $destination){$script:explorerWindow=$window;break}}catch{}
+        }
+        if($script:explorerWindow){break};Start-Sleep -Milliseconds 25
+    }
+    if(-not $script:explorerWindow){throw 'Explorer hover target did not open.'}
+    $script:closeExplorer=$true
+    $explorer=[IntPtr]$script:explorerWindow.HWND
+    [void][CaptureInput]::MoveWindow($explorer,650,140,700,620,$true)
+    $record=New-TestPreview
+    $sceneX=$sceneRect.Left+190;$sceneY=$sceneRect.Top+185
+    $explorerX=1200;$explorerY=460
+    # Keep both exposed even if unrelated user apps are open on the desktop.
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-2),0,0,0,0,0x13)
+    [void][CaptureInput]::SetWindowPos($explorer,[IntPtr](-2),0,0,0,0,0x13)
+    [CaptureInput]::ClickAt($sceneX,$sceneY)
+    [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr]::Zero,0,0,0,0,0x13)
+    if([CaptureInput]::GetForegroundWindow() -ne $sceneWindow){throw 'Could not focus the scene before hover-cycle drag.'}
+    if([CaptureInput]::WindowAt($explorerX,$explorerY) -ne $explorer -or [CaptureInput]::WindowAt(700,460) -ne $sceneWindow){throw "Hover-cycle fixture obscured: explorer=$explorer scene=$sceneWindow atExplorer=$([CaptureInput]::WindowAt($explorerX,$explorerY)) overlap=$([CaptureInput]::WindowAt(700,460))"}
+    Begin-PreviewDrag $record.Window $explorerX $explorerY
+    Wait-DragLog 'Drag started:'
+    foreach($target in @(@($explorer,$explorerX,$explorerY,'Explorer first'),@($sceneWindow,$sceneX,$sceneY,'Scene second'),@($explorer,$explorerX,$explorerY,'Explorer third'),@($sceneWindow,$sceneX,$sceneY,'Scene fourth'))) {
+        $clock=[Diagnostics.Stopwatch]::StartNew();$activated=$false
+        $sample=0
+        while($clock.ElapsedMilliseconds -lt 1700){
+            [CaptureInput]::MouseAt(([int]$target[1]+($sample%2)*8),[int]$target[2],0);$sample++
+            if([CaptureInput]::WindowAt(700,460) -eq [IntPtr]$target[0]){$activated=$true;break}
+            Start-Sleep -Milliseconds 20
+        }
+        if(-not $activated){
+            Save-GalleryScreenshot 'hover-cycle-failure.png'
+            Press-Key 27;[CaptureInput]::DropAt([int]$target[1],[int]$target[2])
+            throw "$($target[3]) did not rise during same screenshot drag; foreground=$([CaptureInput]::GetForegroundWindow()) overlap=$([CaptureInput]::WindowAt(700,460)) cursorWindow=$([CaptureInput]::CursorWindow()) expected=$($target[0])"
+        }
+        Write-Host "PASS: $($target[3]) on top in $($clock.ElapsedMilliseconds) ms (foreground=$([CaptureInput]::GetForegroundWindow()))"
+        [CaptureInput]::MouseAt([int]$target[1],[int]$target[2],0)
+        Start-Sleep -Milliseconds 70
+        Save-DragVisual ('hover-visual-'+$target[3].Replace(' ','-')+'.png') ([int]$target[1]) ([int]$target[2])
+    }
+    [CaptureInput]::DropAt($sceneX,$sceneY)
+    Wait-DragLog 'Drag result: canceled or rejected'
+    if([CaptureInput]::IsTopmost($sceneWindow) -or [CaptureInput]::IsTopmost($explorer)){throw 'Drag left a target permanently topmost.'}
+    Write-Host 'PASS: temporary hover raise is cleared after drag ends'
+}
 function Test-DragDrop([switch]$PreviewOnly) {
     $targetX = $sceneRect.Left + 400
     $targetY = $sceneRect.Top + 250
@@ -2628,8 +2809,10 @@ try {
     if ($BrandOnly) { Test-Brand }
     elseif ($PlacementOnly) { Test-Placement }
     elseif ($QuickAccessOnly) { Test-DragDrop -PreviewOnly }
+    elseif ($HoverCycleOnly) { Test-HoverCycle }
     elseif ($ThemeOnly) { Test-Theme }
     elseif ($EditorOnly) { Test-Editor }
+    elseif ($EditorDragOnly) { Test-EditorDrag }
     elseif ($BackgroundOnly) { Test-Background }
     elseif ($DrawOnly) { Test-Drawing }
     elseif ($HoverOnly) { Test-Hover }

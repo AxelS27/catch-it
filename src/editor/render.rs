@@ -26,6 +26,7 @@ use windows_numerics::Vector2;
 
 pub struct ChromeState<'a> {
     pub source: Option<&'a Raster>,
+    pub preview_background: bool,
     pub document: &'a Document,
     pub pending: Option<&'a Mark>,
     pub editing_text: Option<usize>,
@@ -1539,6 +1540,7 @@ impl Renderer {
     ) -> Result<()> {
         let ChromeState {
             source,
+            preview_background,
             document,
             pending,
             editing_text,
@@ -1714,7 +1716,7 @@ impl Renderer {
                     self.target
                         .PushAxisAlignedClip(&rect(r), D2D1_ANTIALIAS_MODE_ALIASED);
                 }
-                if background.dragging.is_some()
+                if preview_background
                     && background.selected()
                     && let Some(bitmap) = &self.source_bitmap
                 {

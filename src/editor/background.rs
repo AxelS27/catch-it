@@ -1,5 +1,6 @@
 //! Background Tool model and lossless, non-destructive raster composition.
-//! Source pixels stay untouched; the same composed raster drives preview/output.
+//! Source pixels stay untouched; display uses a bounded backdrop preview and
+//! exports compose at full original resolution.
 use super::layout::Rect;
 use crate::storage::Raster;
 use anyhow::{Context, Result};
@@ -349,6 +350,11 @@ pub fn source_origin(width: u32, height: u32, settings: &Background) -> Result<(
 
 /// Bounded working raster for responsive live drags. Never used for saved output.
 pub fn drag_source(source: &Raster) -> Raster {
+    preview_source(source, 300)
+}
+
+/// Work at display resolution for the idle editor; export still uses original pixels.
+pub fn preview_source(source: &Raster, max_dimension: u32) -> Raster {
     if source.width == 0 || source.height == 0 {
         return Raster {
             width: source.width,
@@ -356,7 +362,7 @@ pub fn drag_source(source: &Raster) -> Raster {
             pixels: source.pixels.clone(),
         };
     }
-    let factor = (300.0 / source.width.max(source.height) as f32).min(1.0);
+    let factor = (max_dimension as f32 / source.width.max(source.height) as f32).min(1.0);
     let width = (source.width as f32 * factor).round().max(1.0) as u32;
     let height = (source.height as f32 * factor).round().max(1.0) as u32;
     let mut pixels = vec![0; width as usize * height as usize * 4];
@@ -679,6 +685,9 @@ mod tests {
         let reduced = drag_source(&source);
         assert_eq!((reduced.width, reduced.height), (300, 150));
         assert_eq!(reduced.pixels.len(), 300 * 150 * 4);
+        let idle = preview_source(&source, 900);
+        assert_eq!((idle.width, idle.height), (900, 450));
+        assert_eq!(idle.pixels.len(), 900 * 450 * 4);
         b.style = Style::Gradient(0);
         let full = output_size(source.width, source.height, &b).unwrap();
         let rendered = compose(&source, &b).unwrap();

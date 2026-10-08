@@ -3,6 +3,32 @@ use super::*;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 
 const TEXT_DONE: u32 = WM_APP + 52;
+
+fn queue_background_frame(
+    hwnd: HWND,
+    s: &mut WindowState,
+    slider: background::Slider,
+    x: f32,
+) -> Result<()> {
+    let rect = s.background.slider_rect(slider);
+    let value = ((x - rect.x) / rect.w).clamp(0.0, 1.0);
+    if s.background_pending_x.is_none() && s.background.slider_value(slider) == value {
+        return Ok(());
+    }
+    // Keep the rendered background, its geometry, and the slider value in one
+    // snapshot until we can publish the next complete frame. Otherwise the
+    // original image moves over a backdrop rendered at the previous position.
+    s.background_pending_x = Some(x);
+    if !s.background_frame_pending {
+        // Post one update after input handling, rather than waiting for a low
+        // priority WM_TIMER. Later mouse moves replace the pending coordinate.
+        unsafe {
+            PostMessageW(Some(hwnd), BACKGROUND_DRAG_FRAME, WPARAM(0), LPARAM(0))?;
+        }
+        s.background_frame_pending = true;
+    }
+    Ok(())
+}
 pub(super) unsafe extern "system" fn text_subclass(
     hwnd: HWND,
     message: u32,
@@ -518,6 +544,7 @@ pub(super) unsafe extern "system" fn window_proc(
                                 &s.background,
                                 render::ChromeState {
                                     source: s.image.as_ref(),
+                                    preview_background: s.preview_geometry.is_some(),
                                     document: &s.document,
                                     pending: s.pending_mark.as_ref(),
                                     editing_text: s
@@ -633,7 +660,11 @@ pub(super) unsafe extern "system" fn window_proc(
                 s.stroke_dragging = false;
                 s.palette_open = false;
                 s.focus = None;
-                (&*ptr).cancel_drag.set(true);
+                // Raising a drop target changes focus while OLE still owns the
+                // held-button drag. Do not interpret that as an editor cancel.
+                if !(&*ptr).drag_active.get() {
+                    (&*ptr).cancel_drag.set(true);
+                }
                 if GetCapture() == hwnd {
                     let _ = ReleaseCapture();
                 }
@@ -917,9 +948,7 @@ pub(super) unsafe extern "system" fn window_proc(
                         s.background_pressed = s.background.hit(p.0, p.1);
                         if let Some(background::Target::Slider(slider)) = s.background_pressed {
                             s.background.dragging = Some(slider);
-                            if s.background.set_slider(slider, p.0)
-                                && let Err(error) = refresh_background_drag(hwnd, s)
-                            {
+                            if let Err(error) = queue_background_frame(hwnd, s, slider, p.0) {
                                 s.error = Some(format!("{error:#}"));
                                 s.request(hwnd, ERROR);
                             }
@@ -1109,6 +1138,22 @@ pub(super) unsafe extern "system" fn window_proc(
                 }
                 LRESULT(0)
             }
+            BACKGROUND_DRAG_FRAME => {
+                let s = &mut *ptr;
+                if !s.background_frame_pending {
+                    return LRESULT(0);
+                }
+                s.background_frame_pending = false;
+                if let (Some(slider), Some(x)) =
+                    (s.background.dragging, s.background_pending_x.take())
+                    && s.background.set_slider(slider, x)
+                    && let Err(error) = refresh_background_drag(hwnd, s)
+                {
+                    s.error = Some(format!("{error:#}"));
+                    s.request(hwnd, ERROR);
+                }
+                LRESULT(0)
+            }
             WM_TIMER if wparam.0 == HOVER_TIMER => {
                 let s = &mut *ptr;
                 let hovering = s.advance_hover();
@@ -1160,8 +1205,7 @@ pub(super) unsafe extern "system" fn window_proc(
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                     if let Some(slider) = s.background.dragging
-                        && s.background.set_slider(slider, p.0)
-                        && let Err(error) = refresh_background_drag(hwnd, s)
+                        && let Err(error) = queue_background_frame(hwnd, s, slider, p.0)
                     {
                         s.error = Some(format!("{error:#}"));
                         s.request(hwnd, ERROR);
@@ -1275,6 +1319,11 @@ pub(super) unsafe extern "system" fn window_proc(
                         return LRESULT(0);
                     }
                     if let Some(pressed) = s.background_pressed.take() {
+                        s.background_frame_pending = false;
+                        s.background_pending_x = None;
+                        if let background::Target::Slider(slider) = pressed {
+                            s.background.set_slider(slider, p.0);
+                        }
                         s.background.dragging = None;
                         if s.background.hit(p.0, p.1) == Some(pressed)
                             || matches!(pressed, background::Target::Slider(_))

@@ -27,7 +27,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use windows::{
     Win32::{
@@ -52,6 +52,7 @@ const CLASS: PCWSTR = w!("CatchIt.Editor");
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 const ZOOM_VALUES: [f32; 8] = [0.1, 0.25, 0.5, 1.0, 1.5, 2.0, 4.0, 8.0];
 const HOVER_TIMER: usize = 51;
+const BACKGROUND_DRAG_FRAME: u32 = WM_APP + 53;
 
 struct TextEdit {
     hwnd: HWND,
@@ -192,6 +193,8 @@ struct WindowState {
     preview_geometry: Option<Raster>,
     background_revision: u64,
     background_pressed: Option<background::Target>,
+    background_frame_pending: bool,
+    background_pending_x: Option<f32>,
     pan_start: Option<((f32, f32), (f32, f32))>,
     drag_start: Option<(f32, f32)>,
     error: Option<String>,
@@ -200,6 +203,7 @@ struct WindowState {
     hidden: bool,
     capture_restore: bool,
     cancel_drag: Rc<Cell<bool>>,
+    drag_active: Cell<bool>,
 }
 impl WindowState {
     fn set_hover(&mut self, hwnd: HWND, hit: Option<Control>) {
@@ -438,6 +442,8 @@ impl WindowState {
         }
         self.background_pressed = None;
         self.background.dragging = None;
+        self.background_frame_pending = false;
+        self.background_pending_x = None;
     }
 }
 
@@ -501,6 +507,8 @@ impl Editor {
             preview_geometry: None,
             background_revision: 0,
             background_pressed: None,
+            background_frame_pending: false,
+            background_pending_x: None,
             pan_start: None,
             drag_start: None,
             error: None,
@@ -509,6 +517,7 @@ impl Editor {
             hidden: false,
             capture_restore: false,
             cancel_drag: Rc::new(Cell::new(false)),
+            drag_active: Cell::new(false),
         });
         unsafe {
             let monitor = MonitorFromWindow(source, MONITOR_DEFAULTTONEAREST);
@@ -600,16 +609,22 @@ impl Editor {
             self.state.exported = None;
             self.output_revision = revision;
         }
+        // The editor's bounded preview is never an export. Compose original pixels
+        // lazily, once per background revision, even when there are no marks.
+        if self.state.background.selected() && self.state.composed.is_none() {
+            let source = self
+                .state
+                .image
+                .as_ref()
+                .context("Screenshot is still opening")?;
+            self.state.composed = Some(background::compose(source, &self.state.background)?);
+        }
         if !self.state.document.marks.is_empty() && self.state.exported.is_none() {
             let source = self
                 .state
                 .image
                 .as_ref()
                 .context("Screenshot is still opening")?;
-            // A live drag bitmap is intentionally small and must never reach output.
-            if self.state.background.selected() && self.state.composed.is_none() {
-                self.state.composed = Some(background::compose(source, &self.state.background)?);
-            }
             let base = self.state.composed.as_ref().unwrap_or(source);
             let (x, y) =
                 background::source_origin(source.width, source.height, &self.state.background)?;
@@ -962,44 +977,101 @@ impl Editor {
         if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
             return Ok(Outcome::Canceled);
         }
-        let composed = self.state.background.selected() || !self.state.document.marks.is_empty();
-        let (path, image) = self.output()?;
-        let path = path.to_path_buf();
-        let preview = if composed {
-            drag_preview(image)
-        } else {
-            self.drag_image
-                .as_ref()
-                .context("Image is not ready for dragging")?
-                .clone()
-        };
-        let (width, height, pixels) = preview;
+        // Hide before full-resolution export or drag-image preparation. A large
+        // background composition can otherwise leave the editor covering the
+        // target for hundreds of milliseconds after the pointer starts moving.
+        // Keep normal/maximized placement for cancel.
+        self.state.drag_active.set(true);
+        self.fade_for_drag(false);
+        // Hiding sends WM_KILLFOCUS; it occurs before DoDragDrop, so re-arm
+        // cancellation after the transition. Any preparation failure must also
+        // restore the editor rather than leaving a hidden session behind.
         self.state.cancel_drag.set(false);
-        let drag = PreparedDrag::new(
-            &path,
-            width,
-            height,
-            &pixels,
-            POINT {
-                x: (width / 2) as i32,
-                y: (height / 2) as i32,
-            },
-            Rc::clone(&self.state.cancel_drag),
-        )?;
-        if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
-            return Ok(Outcome::Canceled);
-        }
-        println!("Editor drag started: {}", self.path.display());
-        let outcome = drag.run()?;
-        println!(
-            "Editor drag result: {}",
-            if outcome == Outcome::Copied {
-                "copied"
-            } else {
-                "canceled"
+        let result = (|| {
+            if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
+                return Ok(Outcome::Canceled);
             }
-        );
-        Ok(outcome)
+            let composed =
+                self.state.background.selected() || !self.state.document.marks.is_empty();
+            let (path, image) = self.output()?;
+            let path = path.to_path_buf();
+            let preview = if composed {
+                drag_preview(image)
+            } else {
+                self.drag_image
+                    .as_ref()
+                    .context("Image is not ready for dragging")?
+                    .clone()
+            };
+            let (width, height, pixels) = preview;
+            let drag = PreparedDrag::new(
+                &path,
+                width,
+                height,
+                &pixels,
+                POINT {
+                    x: (width / 2) as i32,
+                    y: (height / 2) as i32,
+                },
+                Rc::clone(&self.state.cancel_drag),
+            )?;
+            if unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) } >= 0 {
+                return Ok(Outcome::Canceled);
+            }
+            println!("Editor drag started: {}", self.path.display());
+            drag.run()
+        })();
+        self.state.drag_active.set(false);
+        if !crate::exit_requested() {
+            self.fade_for_drag(true);
+        }
+        if let Ok(outcome) = &result {
+            println!(
+                "Editor drag result: {}",
+                if *outcome == Outcome::Copied {
+                    "copied"
+                } else {
+                    "canceled"
+                }
+            );
+        }
+        result
+    }
+    fn fade_for_drag(&self, restore: bool) {
+        unsafe {
+            // AnimateWindow composites the standard Win32 title bar instead of
+            // our Direct2D chrome mid-transition. Fade the whole HWND instead.
+            let original_style = GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(
+                self.hwnd,
+                GWL_EXSTYLE,
+                original_style | WS_EX_LAYERED.0 as isize,
+            );
+            let alpha = if restore { 0 } else { 255 };
+            if SetLayeredWindowAttributes(self.hwnd, COLORREF(0), alpha, LWA_ALPHA).is_ok() {
+                if restore {
+                    let _ = ShowWindow(self.hwnd, SW_SHOW);
+                    let _ = SetForegroundWindow(self.hwnd);
+                }
+                for step in 1..=6 {
+                    let alpha = if restore {
+                        step * 255 / 6
+                    } else {
+                        (6 - step) * 255 / 6
+                    };
+                    let _ =
+                        SetLayeredWindowAttributes(self.hwnd, COLORREF(0), alpha as u8, LWA_ALPHA);
+                    std::thread::sleep(Duration::from_millis(12));
+                }
+            } else if restore {
+                let _ = ShowWindow(self.hwnd, SW_SHOW);
+                let _ = SetForegroundWindow(self.hwnd);
+            }
+            if !restore {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, original_style);
+        }
     }
     fn create_tooltips(&mut self) -> Result<()> {
         unsafe {
@@ -1172,23 +1244,43 @@ fn resize_state(hwnd: HWND, state: &mut WindowState, width: u32, height: u32) ->
     }
     Ok(())
 }
+fn background_preview(
+    source: Option<&Raster>,
+    settings: &Background,
+) -> Result<(Option<Raster>, Option<Raster>)> {
+    let Some(source) = source else {
+        return Ok((None, None));
+    };
+    if !settings.selected() {
+        return Ok((None, None));
+    }
+    // Only the backdrop is downsampled; the screenshot itself remains a cached
+    // full-resolution GPU bitmap. Avoid multi-million-pixel CPU shadow work on
+    // every preset click or slider release, even for 4K/8K captures.
+    let reduced = background::preview_source(source, 512);
+    let preview = background::compose_preview(&reduced, source.width.min(source.height), settings)?;
+    let (width, height) = background::output_size(source.width, source.height, settings)?;
+    Ok((
+        Some(preview),
+        Some(Raster {
+            width,
+            height,
+            pixels: Vec::new(),
+        }),
+    ))
+}
 fn refresh_background(hwnd: HWND, state: &mut WindowState) -> Result<()> {
     let result = (|| {
-        let composed = if let Some(image) = &state.image
-            && state.background.selected()
-        {
-            Some(background::compose(image, &state.background)?)
-        } else {
-            None
-        };
-        if let Some(image) = composed.as_ref().or(state.image.as_ref())
+        let source = state.image.as_ref();
+        let (preview, geometry) = background_preview(source, &state.background)?;
+        if let Some(image) = preview.as_ref().or(source)
             && let Some(renderer) = &mut state.renderer
         {
             renderer.set_image(image)?;
         }
-        state.composed = composed;
-        state.drag_preview = None;
-        state.preview_geometry = None;
+        state.composed = None;
+        state.drag_preview = preview;
+        state.preview_geometry = geometry;
         if let Some((w, h)) = state.view_size() {
             state.view.clamp_pan(state.layout.canvas, w, h);
         }
@@ -1204,19 +1296,15 @@ fn refresh_background(hwnd: HWND, state: &mut WindowState) -> Result<()> {
     })();
     if result.is_err() {
         state.background = state.committed_background.clone();
-        state.drag_preview = None;
-        state.preview_geometry = None;
-        state.composed = state.image.as_ref().and_then(|image| {
-            state
-                .background
-                .selected()
-                .then(|| background::compose(image, &state.background).ok())
-                .flatten()
-        });
-        if let Some(renderer) = &mut state.renderer
-            && let Some(image) = state.composed.as_ref().or(state.image.as_ref())
+        if let Ok((preview, geometry)) = background_preview(state.image.as_ref(), &state.background)
         {
-            let _ = renderer.set_image(image);
+            if let Some(renderer) = &mut state.renderer
+                && let Some(image) = preview.as_ref().or(state.image.as_ref())
+            {
+                let _ = renderer.set_image(image);
+            }
+            state.drag_preview = preview;
+            state.preview_geometry = geometry;
         }
     }
     unsafe {
@@ -1224,7 +1312,7 @@ fn refresh_background(hwnd: HWND, state: &mut WindowState) -> Result<()> {
     }
     result
 }
-/// Preview at a bounded source resolution while the pointer moves; commit exactly once on release.
+/// Preview at a bounded source resolution while the pointer moves; compose full output only for export.
 fn refresh_background_drag(hwnd: HWND, state: &mut WindowState) -> Result<()> {
     let result = (|| {
         let source = state

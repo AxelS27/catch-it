@@ -59,6 +59,14 @@ pub enum Outcome {
 struct DropSource {
     cancel: Rc<Cell<bool>>,
     hover: RefCell<Option<(HWND, Instant)>>,
+    raised: RefCell<Option<HWND>>,
+    raise_visual: Arc<AtomicBool>,
+}
+
+impl Drop for DropSource {
+    fn drop(&mut self) {
+        self.restore_raised();
+    }
 }
 
 impl IDropSource_Impl for DropSource_Impl {
@@ -78,6 +86,26 @@ impl IDropSource_Impl for DropSource_Impl {
     }
 }
 
+impl DropSource {
+    fn restore_raised(&self) {
+        if let Some(window) = self.raised.borrow_mut().take() {
+            unsafe {
+                if IsWindow(Some(window)).as_bool() {
+                    let _ = SetWindowPos(
+                        window,
+                        Some(HWND_NOTOPMOST),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+            }
+        }
+    }
+}
+
 impl DropSource_Impl {
     fn activate_hovered_window(&self) {
         unsafe {
@@ -87,11 +115,36 @@ impl DropSource_Impl {
             }
             let target = GetAncestor(WindowFromPoint(cursor), GA_ROOT);
             let mut process = 0;
+            let restore_needed = self.raised.borrow().is_some_and(|raised| raised != target);
+            if restore_needed {
+                self.restore_raised();
+            }
             if target.is_invalid()
                 || GetWindowThreadProcessId(target, Some(&mut process)) == 0
                 || process == std::process::id()
-                || target == GetForegroundWindow()
             {
+                self.hover.borrow_mut().take();
+                return;
+            }
+            if target == GetForegroundWindow() {
+                if restore_needed {
+                    let already_topmost =
+                        GetWindowLongW(target, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
+                    let _ = SetWindowPos(
+                        target,
+                        Some(if already_topmost {
+                            HWND_TOPMOST
+                        } else {
+                            HWND_TOP
+                        }),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                    self.raise_visual.store(true, Ordering::Relaxed);
+                }
                 self.hover.borrow_mut().take();
                 return;
             }
@@ -101,7 +154,43 @@ impl DropSource_Impl {
                     if since.elapsed() >= Duration::from_millis(400) {
                         // OLE leaves the source foreground during a drag. Raise only
                         // a stable external target, never the thumbnail or editor.
-                        let _ = SetForegroundWindow(target);
+                        // The first target can receive focus, but Windows may deny
+                        // later transfers to a drag source that lost foreground
+                        // privileges. Raise a denied target only for this drag.
+                        let focused = SetForegroundWindow(target).as_bool();
+                        let already_topmost =
+                            GetWindowLongW(target, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0;
+                        if !focused && !already_topmost {
+                            if self.raised.borrow().is_none()
+                                && SetWindowPos(
+                                    target,
+                                    Some(HWND_TOPMOST),
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                                )
+                                .is_ok()
+                            {
+                                self.raised.replace(Some(target));
+                            }
+                        } else {
+                            let _ = SetWindowPos(
+                                target,
+                                Some(if already_topmost {
+                                    HWND_TOPMOST
+                                } else {
+                                    HWND_TOP
+                                }),
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                            );
+                        }
+                        self.raise_visual.store(true, Ordering::Relaxed);
                         hover.take();
                     }
                 }
@@ -182,10 +271,19 @@ impl PreparedDrag {
         cancel: Rc<Cell<bool>>,
     ) -> Result<Self> {
         let data = file_data_object(path)?;
-        let visual = DragVisualWorker::new(pixels.to_vec(), width, height, offset)?;
+        let raise_visual = Arc::new(AtomicBool::new(false));
+        let visual = DragVisualWorker::new(
+            pixels.to_vec(),
+            width,
+            height,
+            offset,
+            Arc::clone(&raise_visual),
+        )?;
         let source = DropSource {
             cancel,
             hover: RefCell::new(None),
+            raised: RefCell::new(None),
+            raise_visual,
         }
         .into();
         Ok(Self {
@@ -254,7 +352,13 @@ struct DragVisualWorker {
     thread: RefCell<Option<JoinHandle<()>>>,
 }
 impl DragVisualWorker {
-    fn new(pixels: Vec<u8>, width: u32, height: u32, offset: POINT) -> Result<Self> {
+    fn new(
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        offset: POINT,
+        raise_visual: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let stop_requested = Arc::new(AtomicBool::new(false));
         let stop = Arc::clone(&stop_requested);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -273,7 +377,7 @@ impl DragVisualWorker {
                             y: offset_y,
                         },
                     )?;
-                    visual.move_to_cursor(true)?;
+                    visual.move_to_cursor(true, true)?;
                     Ok::<_, anyhow::Error>(visual)
                 })();
                 match ready {
@@ -281,6 +385,7 @@ impl DragVisualWorker {
                         if ready_tx.send(Ok(())).is_err() {
                             return;
                         }
+                        let mut last_raise = Instant::now();
                         while !stop.load(Ordering::Relaxed) {
                             // This thread owns the HWND. Pump hit-test/window-position
                             // messages so cross-process drop targets remain reachable.
@@ -291,8 +396,15 @@ impl DragVisualWorker {
                                     DispatchMessageW(&message);
                                 }
                             }
-                            if visual.move_to_cursor(false).is_err() {
+                            // Target activation and browser DragOver UI can move
+                            // above our topmost image. Reassert z-order, not focus.
+                            let raise = raise_visual.swap(false, Ordering::Relaxed)
+                                || last_raise.elapsed() >= Duration::from_millis(120);
+                            if visual.move_to_cursor(false, raise).is_err() {
                                 break;
+                            }
+                            if raise {
+                                last_raise = Instant::now();
                             }
                             thread::sleep(Duration::from_millis(8));
                         }
@@ -401,24 +513,28 @@ impl DragVisual {
         }
     }
 
-    fn move_to_cursor(&self, show: bool) -> windows::core::Result<()> {
+    fn move_to_cursor(&self, show: bool, raise: bool) -> windows::core::Result<()> {
         unsafe {
             let mut cursor = POINT::default();
             GetCursorPos(&mut cursor)?;
             let position = (cursor.x - self.offset.x, cursor.y - self.offset.y);
-            if !show && self.last.get() == Some(position) {
+            if !show && !raise && self.last.get() == Some(position) {
                 return Ok(());
             }
             SetWindowPos(
                 self.hwnd,
-                None,
+                if raise { Some(HWND_TOPMOST) } else { None },
                 position.0,
                 position.1,
                 0,
                 0,
                 SWP_NOACTIVATE
                     | SWP_NOSIZE
-                    | SWP_NOZORDER
+                    | if raise {
+                        SET_WINDOW_POS_FLAGS(0)
+                    } else {
+                        SWP_NOZORDER
+                    }
                     | SWP_NOSENDCHANGING
                     | if show {
                         SWP_SHOWWINDOW
@@ -502,6 +618,8 @@ mod tests {
         let source: IDropSource = DropSource {
             cancel: Rc::clone(&cancel),
             hover: RefCell::new(None),
+            raised: RefCell::new(None),
+            raise_visual: Arc::new(AtomicBool::new(false)),
         }
         .into();
         unsafe {

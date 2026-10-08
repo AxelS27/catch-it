@@ -39,6 +39,11 @@ windows = { version = "0.62", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+# Pixel composition runs on the UI thread even in local development builds.
+# Keep the app responsive when testing with `cargo run` / target/debug.
+[profile.dev.package.catch-it]
+opt-level = 2
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
