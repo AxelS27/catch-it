@@ -89,14 +89,34 @@ pub struct Surface {
     target: IDCompositionTarget,
     visual: IDCompositionVisual,
     opacity: IDCompositionEffectGroup,
-    // Keep the content alive until the composition target is detached.
+    hover_opacity: IDCompositionEffectGroup,
+    // Keep both content surfaces alive until the composition target is detached.
     _swap_chain: IDXGISwapChain1,
+    _hover_chain: IDXGISwapChain1,
     layout: Layout,
     timing: Timing,
     started: Option<Instant>,
     drag_pixels: Vec<u8>,
     card: ID2D1Bitmap1,
     controls: (bool, bool, bool, bool),
+    card_transition: Option<OpacityTransition>,
+    hover_transition: Option<OpacityTransition>,
+}
+
+#[derive(Clone, Copy)]
+struct OpacityTransition {
+    started: Instant,
+    from: f32,
+    to: f32,
+    duration: Duration,
+}
+
+impl OpacityTransition {
+    fn sample(self) -> f32 {
+        let t =
+            (self.started.elapsed().as_secs_f32() / self.duration.as_secs_f32()).clamp(0.0, 1.0);
+        self.from + (self.to - self.from) * (1.0 - (1.0 - t).powi(3))
+    }
 }
 
 enum Image<'a> {
@@ -147,6 +167,7 @@ fn compose(
     layout: Layout,
     card: &ID2D1Bitmap1,
     controls: (bool, bool, bool, bool),
+    include_card: bool,
 ) -> Result<()> {
     let (hovered, pinned, highlighted, dark) = controls;
     unsafe {
@@ -167,68 +188,76 @@ fn compose(
                 ..Default::default()
             }),
         )?;
-        let shadow = context.CreateEffect(&CLSID_D2D1Shadow)?;
-        shadow.SetInput(0, card, true);
-        shadow.SetValue(
-            D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION.0 as u32,
-            D2D1_PROPERTY_TYPE_FLOAT,
-            &3.0_f32.to_ne_bytes(),
-        )?;
-        let color: Vec<u8> = [0.0_f32, 0.0, 0.0, 0.32]
-            .into_iter()
-            .flat_map(f32::to_ne_bytes)
-            .collect();
-        shadow.SetValue(
-            D2D1_SHADOW_PROP_COLOR.0 as u32,
-            D2D1_PROPERTY_TYPE_VECTOR4,
-            &color,
-        )?;
-        let shadow_output = shadow.GetOutput()?;
+        let shadow_output = if include_card {
+            let shadow = context.CreateEffect(&CLSID_D2D1Shadow)?;
+            shadow.SetInput(0, card, true);
+            shadow.SetValue(
+                D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION.0 as u32,
+                D2D1_PROPERTY_TYPE_FLOAT,
+                &3.0_f32.to_ne_bytes(),
+            )?;
+            let color: Vec<u8> = [0.0_f32, 0.0, 0.0, 0.32]
+                .into_iter()
+                .flat_map(f32::to_ne_bytes)
+                .collect();
+            shadow.SetValue(
+                D2D1_SHADOW_PROP_COLOR.0 as u32,
+                D2D1_PROPERTY_TYPE_VECTOR4,
+                &color,
+            )?;
+            Some(shadow.GetOutput()?)
+        } else {
+            None
+        };
         context.SetTarget(&target);
         context.BeginDraw();
         context.Clear(Some(&D2D1_COLOR_F::default()));
-        context.DrawImage(
-            &shadow_output,
-            Some(&Vector2 { X: 0.0, Y: 4.0 }),
-            None,
-            D2D1_INTERPOLATION_MODE_LINEAR,
-            D2D1_COMPOSITE_MODE_SOURCE_OVER,
-        );
-        context.DrawImage(
-            card,
-            None,
-            None,
-            D2D1_INTERPOLATION_MODE_LINEAR,
-            D2D1_COMPOSITE_MODE_SOURCE_OVER,
-        );
-        let controls_result = (|| {
-            let neutral = if dark { 0.0 } else { 1.0 };
-            let border = context.CreateSolidColorBrush(
-                &D2D1_COLOR_F {
-                    r: neutral,
-                    g: neutral,
-                    b: neutral,
-                    a: 1.0,
-                },
+        if let Some(shadow_output) = &shadow_output {
+            context.DrawImage(
+                shadow_output,
+                Some(&Vector2 { X: 0.0, Y: 4.0 }),
                 None,
-            )?;
-            let stroke = if highlighted { 3.0 } else { 1.0 };
-            let inset = stroke / 2.0;
-            context.DrawRoundedRectangle(
-                &D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F {
-                        left: layout.card_left + inset,
-                        top: layout.card_top + inset,
-                        right: layout.card_left + layout.card_width - inset,
-                        bottom: layout.card_top + layout.card_height - inset,
-                    },
-                    radiusX: (layout.radius - inset).max(0.0),
-                    radiusY: (layout.radius - inset).max(0.0),
-                },
-                &border,
-                stroke,
-                None,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
             );
+            context.DrawImage(
+                card,
+                None,
+                None,
+                D2D1_INTERPOLATION_MODE_LINEAR,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
+            );
+        }
+        let controls_result = (|| {
+            if include_card {
+                let neutral = if dark { 0.0 } else { 1.0 };
+                let border = context.CreateSolidColorBrush(
+                    &D2D1_COLOR_F {
+                        r: neutral,
+                        g: neutral,
+                        b: neutral,
+                        a: 1.0,
+                    },
+                    None,
+                )?;
+                let stroke = if highlighted { 3.0 } else { 1.0 };
+                let inset = stroke / 2.0;
+                context.DrawRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: layout.card_left + inset,
+                            top: layout.card_top + inset,
+                            right: layout.card_left + layout.card_width - inset,
+                            bottom: layout.card_top + layout.card_height - inset,
+                        },
+                        radiusX: (layout.radius - inset).max(0.0),
+                        radiusY: (layout.radius - inset).max(0.0),
+                    },
+                    &border,
+                    stroke,
+                    None,
+                );
+            }
             draw_controls(compositor, layout, hovered, pinned)
         })();
         let draw_result = context.EndDraw(None, None);
@@ -482,23 +511,29 @@ impl Surface {
         timing: Timing,
     ) -> Result<Self> {
         unsafe {
+            let descriptor = DXGI_SWAP_CHAIN_DESC1 {
+                Width: layout.width,
+                Height: layout.height,
+                Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                BufferCount: 2,
+                Scaling: DXGI_SCALING_STRETCH,
+                SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+                AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+                ..Default::default()
+            };
             let swap_chain = compositor.dxgi_factory.CreateSwapChainForComposition(
                 &compositor.device,
-                &DXGI_SWAP_CHAIN_DESC1 {
-                    Width: layout.width,
-                    Height: layout.height,
-                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    SampleDesc: DXGI_SAMPLE_DESC {
-                        Count: 1,
-                        Quality: 0,
-                    },
-                    BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                    BufferCount: 2,
-                    Scaling: DXGI_SCALING_STRETCH,
-                    SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
-                    AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-                    ..Default::default()
-                },
+                &descriptor,
+                None,
+            )?;
+            let hover_chain = compositor.dxgi_factory.CreateSwapChainForComposition(
+                &compositor.device,
+                &descriptor,
                 None,
             )?;
             let (drag_pixels, card) = match image {
@@ -507,18 +542,34 @@ impl Surface {
                     (pixels.to_vec(), cached_card(&compositor, layout, pixels)?)
                 }
             };
+            let dark = crate::theme::dark();
             compose(
                 &compositor,
                 &swap_chain,
                 layout,
                 &card,
-                (false, false, false, crate::theme::dark()),
+                (false, false, false, dark),
+                true,
+            )?;
+            compose(
+                &compositor,
+                &hover_chain,
+                layout,
+                &card,
+                (true, false, false, dark),
+                false,
             )?;
             let target = compositor.composition.CreateTargetForHwnd(hwnd, true)?;
             let visual = compositor.composition.CreateVisual()?;
+            let hover_visual = compositor.composition.CreateVisual()?;
             let opacity = compositor.composition.CreateEffectGroup()?;
+            let hover_opacity = compositor.composition.CreateEffectGroup()?;
             visual.SetContent(&swap_chain)?;
             visual.SetEffect(&opacity)?;
+            hover_visual.SetContent(&hover_chain)?;
+            hover_visual.SetEffect(&hover_opacity)?;
+            hover_opacity.SetOpacity2(0.0)?;
+            visual.AddVisual(&hover_visual, false, None)?;
             // Commit a transparent initial state before showing the popup.
             opacity.SetOpacity2(0.0)?;
             visual.SetOffsetX2(24.0 * layout.scale)?;
@@ -529,13 +580,17 @@ impl Surface {
                 target,
                 visual,
                 opacity,
+                hover_opacity,
                 _swap_chain: swap_chain,
+                _hover_chain: hover_chain,
                 layout,
                 timing,
                 started: None,
                 drag_pixels,
                 card,
-                controls: (false, false, false, crate::theme::dark()),
+                controls: (false, false, false, dark),
+                card_transition: None,
+                hover_transition: None,
             })
         }
     }
@@ -552,59 +607,116 @@ impl Surface {
         highlighted: bool,
         dark: bool,
     ) -> Result<()> {
-        if self.controls != (hovered, pinned, highlighted, dark) {
-            compose(
-                &self.compositor,
-                &self._swap_chain,
-                self.layout,
-                &self.card,
-                (hovered, pinned, highlighted, dark),
-            )?;
-            self.controls = (hovered, pinned, highlighted, dark);
+        if self.controls.1 != pinned || self.controls.2 != highlighted || self.controls.3 != dark {
+            // The two card states are cached. Hover changes only the compositor
+            // opacity, never a GPU readback or a redraw on every animation frame.
+            for (chain, show_controls) in [(&self._swap_chain, false), (&self._hover_chain, true)] {
+                compose(
+                    &self.compositor,
+                    chain,
+                    self.layout,
+                    &self.card,
+                    (show_controls, pinned, highlighted, dark),
+                    !show_controls,
+                )?;
+            }
         }
+        if self.controls.0 != hovered {
+            let from = self.hover_transition.map_or(
+                if self.controls.0 { 1.0 } else { 0.0 },
+                OpacityTransition::sample,
+            );
+            let to = if hovered { 1.0 } else { 0.0 };
+            let duration = self.motion_duration(120);
+            unsafe {
+                self.hover_opacity.SetOpacity(&cubic_out(
+                    &self.compositor.composition,
+                    from,
+                    to,
+                    duration,
+                )?)?;
+                self.compositor.composition.Commit()?;
+            }
+            self.hover_transition = Some(OpacityTransition {
+                started: Instant::now(),
+                from,
+                to,
+                duration,
+            });
+        }
+        self.controls = (hovered, pinned, highlighted, dark);
         Ok(())
     }
 
     pub fn set_dragging(&mut self, dragging: bool) -> Result<()> {
-        // Keep the source in place but subdued behind the pointer-following
-        // miniature, as in the supplied video.
+        // The source card eases behind the live drag image; cancel reverses
+        // from the current opacity without a bright flash.
+        let from = self.card_transition.map_or(1.0, OpacityTransition::sample);
+        let to = if dragging { 0.45 } else { 1.0 };
+        let duration = self.motion_duration(120);
         unsafe {
-            self.opacity
-                .SetOpacity2(if dragging { 0.45 } else { 1.0 })?;
+            self.opacity.SetOpacity(&cubic_out(
+                &self.compositor.composition,
+                from,
+                to,
+                duration,
+            )?)?;
             self.compositor.composition.Commit()?;
         }
+        self.card_transition = Some(OpacityTransition {
+            started: Instant::now(),
+            from,
+            to,
+            duration,
+        });
         Ok(())
+    }
+
+    fn motion_duration(&self, milliseconds: u64) -> Duration {
+        if self.timing.appear <= Duration::from_millis(1) {
+            Duration::from_millis(1)
+        } else {
+            Duration::from_millis(milliseconds)
+        }
     }
 
     pub fn appear(&mut self) -> Result<()> {
         self.started = Some(Instant::now());
-        self.animate(24.0 * self.layout.scale, 0.0, 0.0, 1.0, self.timing.appear)
+        self.animate(24.0 * self.layout.scale, 0.0, 0.0, 1.0, self.timing.appear)?;
+        self.card_transition = Some(OpacityTransition {
+            started: Instant::now(),
+            from: 0.0,
+            to: 1.0,
+            duration: self.timing.appear,
+        });
+        Ok(())
     }
 
-    pub fn dismiss_after_drag(&self) -> Result<()> {
-        // The original remains at 45% throughout OLE's modal loop, then
-        // exits toward the right without flashing back to full opacity.
+    pub fn dismiss_after_drag(&mut self) -> Result<()> {
+        // A quick accepted drop can interrupt the dimming animation. Leave
+        // from its current value, not a hard-coded 45%.
+        let from = self.card_transition.map_or(0.45, OpacityTransition::sample);
         self.animate(
             0.0,
             self.layout.width as f32,
-            0.45,
+            from,
             0.0,
             self.timing.dismiss,
         )
     }
 
-    pub fn dismiss(&self) -> Result<()> {
-        // A manual dismissal can interrupt entrance. Start from the current
-        // easing sample instead of flashing back to a fully opaque image.
-        let progress = self.started.map_or(0.0, |started| {
+    pub fn dismiss(&mut self) -> Result<()> {
+        // Manual dismissal can interrupt entrance or a canceled drag.
+        let progress = self.started.map_or(1.0, |started| {
             let t = (started.elapsed().as_secs_f32() / self.timing.appear.as_secs_f32())
                 .clamp(0.0, 1.0);
             1.0 - (1.0 - t).powi(3)
         });
+        let opacity = self.card_transition.map_or(1.0, OpacityTransition::sample);
         self.animate(
             24.0 * self.layout.scale * (1.0 - progress),
             self.layout.width as f32,
-            progress,
+            opacity,
             0.0,
             self.timing.dismiss,
         )

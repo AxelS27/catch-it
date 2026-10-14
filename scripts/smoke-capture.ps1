@@ -376,7 +376,7 @@ function Wait-Thumbnail([bool]$Visible, [int]$TimeoutMs = 6000) {
     throw "Thumbnail visibility did not become $Visible. Check $artifacts logs."
 }
 function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeight = 200,
-    $Samples = @(@(80,170,'Blue'), @(80,55,'Red'), @(200,55,'Lime')), [string]$Artifact = 'thumbnail.png', [int]$ExpectedCount = 1, [int]$ExpectedSlot = 0, [switch]$SkipAnchor) {
+    $Samples = @(@(80,170,'Blue'), @(80,55,'Red'), @(200,55,'Lime')), [string]$Artifact = 'thumbnail.png', [int]$ExpectedCount = 1, [int]$ExpectedSlot = 0, [switch]$SkipAnchor, [switch]$TopRight) {
     $rect = New-Object CaptureInput+Rect
     [void][CaptureInput]::GetWindowRect($Window, [ref]$rect)
     $scale = [CaptureInput]::GetDpiForWindow($Window) / 96.0
@@ -399,7 +399,9 @@ function Assert-Preview([IntPtr]$Window, [int]$ImageWidth = 350, [int]$ImageHeig
         }
     }
     $expectedBottom=$effectiveBottom-[int][Math]::Round(20*$scale)-$ExpectedSlot*[int][Math]::Round(196*$scale)
-    if (-not $SkipAnchor -and ($rect.Right-$padding -ne $work.Right-[int][Math]::Round(20*$scale) -or $rect.Bottom-$padding -ne $expectedBottom)) { throw "Quick Access inset differs: cardRight=$($rect.Right-$padding),cardBottom=$($rect.Bottom-$padding) expectedBottom=$expectedBottom dpi=$scale slot=$ExpectedSlot." }
+    $expectedTop=$work.Top+[int][Math]::Round(20*$scale)+$ExpectedSlot*[int][Math]::Round(196*$scale)
+    $vertical=if($TopRight){$rect.Top+$padding -eq $expectedTop}else{$rect.Bottom-$padding -eq $expectedBottom}
+    if (-not $SkipAnchor -and ($rect.Right-$padding -ne $work.Right-[int][Math]::Round(20*$scale) -or -not $vertical)) { throw "Quick Access inset differs: cardRight=$($rect.Right-$padding),cardTop=$($rect.Top+$padding),cardBottom=$($rect.Bottom-$padding) expectedTop=$expectedTop expectedBottom=$expectedBottom dpi=$scale slot=$ExpectedSlot." }
     $cover = [Math]::Max($cardWidth/$ImageWidth, $cardHeight/$ImageHeight)
     $cropLeft = ($ImageWidth-$cardWidth/$cover)/2
     $cropTop = ($ImageHeight-$cardHeight/$cover)/2
@@ -475,7 +477,7 @@ function Wait-NewPreview([IntPtr[]]$Before) {
     }
     throw 'New capture did not publish a new visible preview.'
 }
-function New-TestPreview([switch]$KeepPreviews, [switch]$SkipAnchor) {
+function New-TestPreview([switch]$KeepPreviews, [switch]$SkipAnchor, [switch]$TopRight) {
     $beforeWindows=[CaptureInput]::ThumbnailWindows($false)
     $before = @(Get-Shots)
     [void](Start-Selection -KeepPreviews:$KeepPreviews)
@@ -484,7 +486,7 @@ function New-TestPreview([switch]$KeepPreviews, [switch]$SkipAnchor) {
     $script:created += $shot
     Assert-Png $shot
     $preview = Wait-NewPreview $beforeWindows
-    [void](Assert-Preview $preview -ExpectedCount $(if($KeepPreviews){0}else{1}) -ExpectedSlot $(if($KeepPreviews){@($beforeWindows).Count}else{0}) -SkipAnchor:$SkipAnchor)
+    [void](Assert-Preview $preview -ExpectedCount $(if($KeepPreviews){0}else{1}) -ExpectedSlot $(if($KeepPreviews){@($beforeWindows).Count}else{0}) -SkipAnchor:$SkipAnchor -TopRight:$TopRight)
     return @{ Shot = $shot; Window = $preview; Foreground = [CaptureInput]::GetForegroundWindow() }
 }
 function Wait-DragLog([string]$Text) {
@@ -2584,9 +2586,17 @@ function Test-HoverCycle {
     Write-Host 'PASS: temporary hover raise is cleared after drag ends'
 }
 function Test-DragDrop([switch]$PreviewOnly) {
+    # Keep the isolated card away from third-party desktop notifications.
+    if($PreviewOnly){[void][CaptureInput]::PostMessage([CaptureInput]::ControllerWindow(),0x8012,[IntPtr]1,[IntPtr]::Zero);Start-Sleep -Milliseconds 100}
     $targetX = $sceneRect.Left + 400
     $targetY = $sceneRect.Top + 250
-    $record = New-TestPreview
+    $record = New-TestPreview -TopRight:$PreviewOnly
+    $card=Preview-Rect $record.Window
+    [CaptureInput]::MouseAt([int](($card.Left+$card.Right)/2),[int](($card.Top+$card.Bottom)/2),0)
+    Start-Sleep -Milliseconds 35
+    Save-GalleryScreenshot 'quickaccess-hover-mid.png'
+    Start-Sleep -Milliseconds 160
+    Save-GalleryScreenshot 'quickaccess-hover-settled.png'
     Begin-PreviewDrag $record.Window $targetX $targetY
     Wait-DragLog 'Drag started:'
     [CaptureInput]::MouseAt($targetX, $targetY, 0)
@@ -2606,6 +2616,9 @@ function Test-DragDrop([switch]$PreviewOnly) {
     Wait-DragLog 'Drag result: canceled'
     [void](Wait-Thumbnail $true)
     if (-not [CaptureInput]::IsWindowVisible($record.Window)) { throw 'Canceled drag did not restore its preview.' }
+    Save-GalleryScreenshot 'quickaccess-drag-cancel-mid.png'
+    Start-Sleep -Milliseconds 160
+    Save-GalleryScreenshot 'quickaccess-drag-cancel-settled.png'
     $gdiBaseline = [CaptureInput]::GetGuiResources($app.Handle, 0)
     Write-Host 'PASS: long native drag pauses lifetime beyond five seconds; Escape restores preview and source file'
 
@@ -2637,7 +2650,7 @@ function Test-DragDrop([switch]$PreviewOnly) {
     [void][CaptureInput]::GetWindowRect($explorerHandle, [ref]$bounds)
     $x = [int]($bounds.Left + ($bounds.Right-$bounds.Left)*0.75)
     $y = [int]($bounds.Top + ($bounds.Bottom-$bounds.Top)*0.60)
-    $record = New-TestPreview
+    $record = New-TestPreview -TopRight:$PreviewOnly
     $hash = (Get-FileHash -LiteralPath $record.Shot).Hash
     Begin-PreviewDrag $record.Window $x $y
     Wait-DragLog 'Drag started:'
@@ -2653,24 +2666,32 @@ function Test-DragDrop([switch]$PreviewOnly) {
     Write-Host 'PASS: real Explorer drop copies identical PNG bytes and keeps the source'
     Remove-Item -LiteralPath $copy
     if ($PreviewOnly) {
-        $source = New-TestPreview
+        $source = New-TestPreview -TopRight
         Click-PreviewAction $source.Window 'Annotate'
         $editor = Wait-Editor
-        $record = New-TestPreview
+        $record = New-TestPreview -TopRight
         # Capture fixtures raise the scene for DXGI; leave it below the active editor.
         [void][CaptureInput]::SetWindowPos($sceneWindow, [IntPtr](-2), 0, 0, 0, 0, 0x13)
         [void][CaptureInput]::SetForegroundWindow($editor)
         Start-Sleep -Milliseconds 120
         $hoverX = $sceneRect.Left + 35
-        $hoverY = $sceneRect.Top + 35
+        $hoverY = $sceneRect.Bottom - 50 # inside the exposed scene, below desktop menus
+        # Keep the scene exposed under the pointer while the active editor
+        # remains above it in the overlapping part of their windows.
+        [void][CaptureInput]::SetWindowPos($sceneWindow,[IntPtr](-1),0,0,0,0,0x13)
+        [CaptureInput]::ClickAt($hoverX,$hoverY) # dismiss any stray desktop menu
+        [void][CaptureInput]::SetWindowPos($editor,[IntPtr](-1),0,0,0,0,0x13)
+        [void][CaptureInput]::SetForegroundWindow($editor)
+        if([CaptureInput]::WindowAt($hoverX,$hoverY) -ne $sceneWindow){Save-GalleryScreenshot 'fixture-hover-occluded.png';throw "Hover fixture obscured: scene=$sceneWindow atPointer=$([CaptureInput]::WindowAt($hoverX,$hoverY))"}
         Begin-PreviewDrag $record.Window $hoverX $hoverY
         Wait-DragLog 'Drag started:'
         [CaptureInput]::MouseAt($hoverX, $hoverY, 0)
         Start-Sleep -Milliseconds 900
-        if ([CaptureInput]::GetForegroundWindow() -ne $sceneWindow) {
+        $overlapX=$sceneRect.Left+400;$overlapY=$sceneRect.Top+300
+        if ([CaptureInput]::WindowAt($overlapX,$overlapY) -ne $sceneWindow) {
             Save-GalleryScreenshot 'drag-hover-activation-failure.png'
             [CaptureInput]::DropAt($hoverX, $hoverY)
-            throw 'Hovering another application during thumbnail drag did not bring it to the foreground.'
+            throw 'Hovering another application during thumbnail drag did not bring it above the editor.'
         }
         Press-Key 0x1B
         [CaptureInput]::DropAt($hoverX, $hoverY)

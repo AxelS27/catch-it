@@ -981,6 +981,12 @@ impl Editor {
         // background composition can otherwise leave the editor covering the
         // target for hundreds of milliseconds after the pointer starts moving.
         // Keep normal/maximized placement for cancel.
+        // Remember the editor's place before hiding it. In particular, a
+        // window above the editor (such as Chrome) must stay above it when
+        // the drag ends, even if OLE changed the foreground window.
+        let above = unsafe { GetWindow(self.hwnd, GW_HWNDPREV).ok() };
+        let was_topmost =
+            unsafe { GetWindowLongW(self.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0 };
         self.state.drag_active.set(true);
         self.fade_for_drag(false);
         // Hiding sends WM_KILLFOCUS; it occurs before DoDragDrop, so re-arm
@@ -1024,6 +1030,24 @@ impl Editor {
         self.state.drag_active.set(false);
         if !crate::exit_requested() {
             self.fade_for_drag(true);
+            unsafe {
+                let insert_after = above
+                    .filter(|window| {
+                        IsWindow(Some(*window)).as_bool()
+                            && (GetWindowLongW(*window, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0 != 0)
+                                == was_topmost
+                    })
+                    .unwrap_or(if was_topmost { HWND_TOPMOST } else { HWND_TOP });
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(insert_after),
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
         }
         if let Ok(outcome) = &result {
             println!(
@@ -1050,8 +1074,7 @@ impl Editor {
             let alpha = if restore { 0 } else { 255 };
             if SetLayeredWindowAttributes(self.hwnd, COLORREF(0), alpha, LWA_ALPHA).is_ok() {
                 if restore {
-                    let _ = ShowWindow(self.hwnd, SW_SHOW);
-                    let _ = SetForegroundWindow(self.hwnd);
+                    let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
                 }
                 for step in 1..=6 {
                     let alpha = if restore {
@@ -1064,8 +1087,7 @@ impl Editor {
                     std::thread::sleep(Duration::from_millis(12));
                 }
             } else if restore {
-                let _ = ShowWindow(self.hwnd, SW_SHOW);
-                let _ = SetForegroundWindow(self.hwnd);
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
             }
             if !restore {
                 let _ = ShowWindow(self.hwnd, SW_HIDE);

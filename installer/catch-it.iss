@@ -39,8 +39,12 @@ Source: "{#Root}\installer\install-layout.txt"; DestDir: "{app}"; Flags: ignorev
 [Dirs]
 Name: "{app}\Temp"
 
+[Tasks]
+Name: "autostart"; Description: "Start Catch It when I sign in to Windows"; GroupDescription: "Startup:"
+
 [Icons]
 Name: "{group}\Catch It"; Filename: "{app}\catch-it.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\catch-it.ico"
+Name: "{userstartup}\Catch It"; Filename: "{app}\catch-it.exe"; WorkingDir: "{app}"; IconFilename: "{app}\assets\catch-it.ico"; Tasks: autostart
 
 [Run]
 Filename: "{app}\catch-it.exe"; Description: "Launch Catch It"; Flags: nowait postinstall skipifsilent

@@ -442,7 +442,7 @@ impl Thumbnail {
     fn apply(&mut self, action: Action) -> Result<bool> {
         match action {
             Action::BeginDismiss => {
-                if let Some(surface) = &self.surface {
+                if let Some(surface) = &mut self.surface {
                     surface.dismiss()?;
                 }
             }
@@ -526,7 +526,7 @@ impl Thumbnail {
         }
         if matches!(result, Ok(Outcome::Copied)) && !self.pinned() {
             let _ = self.lifecycle.dismiss(Instant::now());
-            if let Some(surface) = &self.surface {
+            if let Some(surface) = &mut self.surface {
                 surface.dismiss_after_drag()?;
             }
             return result;
