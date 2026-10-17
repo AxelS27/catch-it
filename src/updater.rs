@@ -14,9 +14,13 @@ use reqwest::blocking::Client;
 use semver::Version;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use windows::Win32::{
-    Foundation::{HWND, LPARAM, WPARAM},
-    UI::WindowsAndMessaging::PostMessageW,
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, HANDLE, HWND, LPARAM, WAIT_ABANDONED, WAIT_OBJECT_0, WPARAM},
+        System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
+        UI::WindowsAndMessaging::PostMessageW,
+    },
+    core::w,
 };
 
 pub const READY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 19;
@@ -24,6 +28,34 @@ const API: &str = "https://api.github.com/repos/AxelS27/catch-it/releases/latest
 const ASSET_ROOT: &str = "https://github.com/AxelS27/catch-it/releases/download/";
 const MAX_INSTALLER: u64 = 150 * 1024 * 1024;
 const INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+// Duplicate app processes share the same per-user cache. An OS mutex survives
+// crashes without leaving a stale lock file in the writable Updates directory.
+struct CacheLock(HANDLE);
+impl CacheLock {
+    fn acquire() -> Result<Self> {
+        unsafe {
+            let handle = CreateMutexW(None, false, w!("Local\\CatchIt.ReleaseCache"))?;
+            // The other instance may be downloading a 150 MiB installer with
+            // a ten-minute HTTP deadline. Waiting here does not block the UI.
+            match WaitForSingleObject(handle, 11 * 60 * 1000) {
+                WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(handle)),
+                status => {
+                    let _ = CloseHandle(handle);
+                    bail!("Updater cache lock unavailable ({})", status.0)
+                }
+            }
+        }
+    }
+}
+impl Drop for CacheLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct Release {
@@ -140,6 +172,8 @@ fn check_with(
     ensure!(release.tag_name.len() <= 64, "Release tag is too long");
     let version = Version::parse(release.tag_name.trim_start_matches('v'))?;
     if &version <= current {
+        let _lock = CacheLock::acquire()?;
+        prune_cache(dir, None);
         return Ok(None);
     }
     let name = format!("CatchIt-Setup-{version}.exe");
@@ -163,8 +197,10 @@ fn check_with(
     ensure!(hash.len() < 256, "Checksum file too large");
     let expected = parse_checksum(std::str::from_utf8(&hash)?, &name)?;
     fs::create_dir_all(dir)?;
+    let _lock = CacheLock::acquire()?;
     let path = dir.join(&name);
     if path.is_file() && verify(&path, &expected).is_ok() {
+        prune_cache(dir, Some(&path));
         return Ok(Some(Update {
             version,
             installer: path,
@@ -209,11 +245,54 @@ fn check_with(
         let _ = fs::remove_file(&partial);
     }
     result?;
+    prune_cache(dir, Some(&path));
     Ok(Some(Update {
         version,
         installer: path,
         checksum: expected,
     }))
+}
+
+// Only remove files with the exact generated installer naming scheme; unrelated
+// files or directories in the user-owned folder are never touched. Cache cleanup
+// is best-effort and must not turn a valid update into a capture-blocking error.
+fn prune_cache(dir: &Path, keep: Option<&Path>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!("Update cache cleanup: {error}");
+            return;
+        }
+    };
+    for entry in entries {
+        let result = (|| -> std::io::Result<()> {
+            let entry = entry?;
+            let path = entry.path();
+            if keep.is_some_and(|keep| keep == path) || !entry.file_type()?.is_file() {
+                return Ok(());
+            }
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                return Ok(());
+            };
+            let Some(stem) = name.strip_prefix("CatchIt-Setup-") else {
+                return Ok(());
+            };
+            let Some(stem) = stem
+                .strip_suffix(".exe")
+                .or_else(|| stem.strip_suffix(".exe.partial"))
+            else {
+                return Ok(());
+            };
+            if !Version::parse(stem).is_ok_and(|version| version.to_string() == stem) {
+                return Ok(());
+            }
+            fs::remove_file(path)
+        })();
+        if let Err(error) = result {
+            eprintln!("Update cache cleanup: {error}");
+        }
+    }
 }
 
 fn asset_url<'a>(asset: &'a Asset, tag: &str, root: &str) -> Result<&'a str> {
@@ -391,6 +470,14 @@ mod tests {
     #[test]
     fn downloads_verifies_caches_and_replaces_corrupt_cached_installer() {
         let folder = TestFolder::new();
+        let old = folder.0.join("CatchIt-Setup-0.1.0.exe");
+        let abandoned = folder.0.join("CatchIt-Setup-0.1.0.exe.partial");
+        let unrelated = folder.0.join("personal.png");
+        let directory = folder.0.join("CatchIt-Setup-0.0.1.exe");
+        fs::write(&old, b"old installer").unwrap();
+        fs::write(&abandoned, b"old partial").unwrap();
+        fs::write(&unrelated, b"untouched").unwrap();
+        fs::create_dir(&directory).unwrap();
         let bytes = b"fixture installer for updater";
         let hash = format!("{:x}", Sha256::digest(bytes));
         let (root, server) = release_server(bytes, hash, 8, None);
@@ -411,9 +498,68 @@ mod tests {
         let first = check();
         assert_eq!(first.version, Version::new(0, 1, 2));
         assert_eq!(fs::read(&first.installer).unwrap(), bytes);
+        assert!(!old.exists());
+        assert!(!abandoned.exists());
+        assert_eq!(fs::read(&unrelated).unwrap(), b"untouched");
+        assert!(directory.is_dir());
         assert_eq!(check().installer, first.installer); // No second binary transfer.
         fs::write(&first.installer, b"changed after verification").unwrap();
         assert_eq!(fs::read(check().installer).unwrap(), bytes);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn up_to_date_check_removes_obsolete_cache_without_downloading() {
+        let folder = TestFolder::new();
+        let old = folder.0.join("CatchIt-Setup-0.1.0.exe");
+        let unrelated = folder.0.join("personal.png");
+        fs::write(&old, b"old").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+        let (root, server) = release_server(b"not fetched", "00".repeat(32), 1, None);
+        let client = local_client();
+        assert!(
+            check_with(
+                &client,
+                &client,
+                &format!("{root}latest"),
+                &format!("{root}download/"),
+                &folder.0,
+                &Version::new(0, 1, 2)
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(!old.exists());
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn two_instances_download_to_shared_cache_only_once() {
+        let folder = TestFolder::new();
+        let bytes = b"shared installer";
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let (root, server) = release_server(bytes, hash, 5, None);
+        let client = local_client();
+        let run = || {
+            check_with(
+                &client,
+                &client,
+                &format!("{root}latest"),
+                &format!("{root}download/"),
+                &folder.0,
+                &Version::new(0, 1, 1),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let (first, second) = thread::scope(|scope| {
+            let first = scope.spawn(run);
+            let second = scope.spawn(run);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_eq!(first.installer, second.installer);
+        assert_eq!(fs::read(first.installer).unwrap(), bytes);
         server.join().unwrap();
     }
 
