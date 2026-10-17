@@ -4,7 +4,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError},
     thread,
     time::Duration,
 };
@@ -42,8 +42,28 @@ pub struct Update {
     checksum: [u8; 32],
 }
 
-pub fn start(hwnd: HWND) -> Receiver<Result<Option<Update>, String>> {
+pub struct Updater {
+    results: Receiver<Result<Option<Update>, String>>,
+    requests: SyncSender<()>,
+}
+
+impl Updater {
+    pub fn try_recv(
+        &self,
+    ) -> std::result::Result<Result<Option<Update>, String>, mpsc::TryRecvError> {
+        self.results.try_recv()
+    }
+    pub fn check_now(&self) -> Result<()> {
+        match self.requests.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => Ok(()),
+            Err(TrySendError::Disconnected(())) => anyhow::bail!("Updater has stopped"),
+        }
+    }
+}
+
+pub fn start(hwnd: HWND) -> Updater {
     let (sender, receiver) = mpsc::channel();
+    let (requests, commands) = mpsc::sync_channel(1);
     let hwnd = hwnd.0 as isize;
     thread::spawn(move || {
         // Network outages and missing release assets must never block capture.
@@ -60,10 +80,16 @@ pub fn start(hwnd: HWND) -> Receiver<Result<Option<Update>, String>> {
             {
                 break;
             }
-            thread::sleep(INTERVAL);
+            match commands.recv_timeout(INTERVAL) {
+                Ok(()) | Err(RecvTimeoutError::Timeout) => (),
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
         }
     });
-    receiver
+    Updater {
+        results: receiver,
+        requests,
+    }
 }
 
 fn installed() -> bool {
@@ -73,7 +99,7 @@ fn installed() -> bool {
         .is_some_and(|path| path.is_file())
 }
 
-pub fn start_if_installed(hwnd: HWND) -> Option<Receiver<Result<Option<Update>, String>>> {
+pub fn start_if_installed(hwnd: HWND) -> Option<Updater> {
     installed().then(|| start(hwnd))
 }
 
@@ -87,10 +113,33 @@ fn http_client(timeout: Duration) -> Result<Client> {
 
 fn check() -> Result<Option<Update>> {
     let client = http_client(Duration::from_secs(60))?;
-    let release: Release = client.get(API).send()?.error_for_status()?.json()?;
+    let download = http_client(Duration::from_secs(10 * 60))?;
+    let dir = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA unavailable")?;
+    let dir = PathBuf::from(dir).join("CatchIt").join("Updates");
+    check_with(
+        &client,
+        &download,
+        API,
+        ASSET_ROOT,
+        &dir,
+        &Version::parse(env!("CARGO_PKG_VERSION"))?,
+    )
+}
+
+// End-to-end testable with an isolated local release server; production cannot
+// override the pinned GitHub endpoint or installed version at runtime.
+fn check_with(
+    client: &Client,
+    download: &Client,
+    api: &str,
+    asset_root: &str,
+    dir: &Path,
+    current: &Version,
+) -> Result<Option<Update>> {
+    let release: Release = client.get(api).send()?.error_for_status()?.json()?;
     ensure!(release.tag_name.len() <= 64, "Release tag is too long");
     let version = Version::parse(release.tag_name.trim_start_matches('v'))?;
-    if version <= Version::parse(env!("CARGO_PKG_VERSION"))? {
+    if &version <= current {
         return Ok(None);
     }
     let name = format!("CatchIt-Setup-{version}.exe");
@@ -106,16 +155,14 @@ fn check() -> Result<Option<Update>> {
         .find(|a| a.name == checksum_name)
         .context("Release has no installer SHA-256 checksum")?;
     let response = client
-        .get(asset_url(checksum, &release.tag_name)?)
+        .get(asset_url(checksum, &release.tag_name, asset_root)?)
         .send()?
         .error_for_status()?;
     let mut hash = Vec::new();
     response.take(256).read_to_end(&mut hash)?;
     ensure!(hash.len() < 256, "Checksum file too large");
     let expected = parse_checksum(std::str::from_utf8(&hash)?, &name)?;
-    let dir = std::env::var_os("LOCALAPPDATA").context("LOCALAPPDATA unavailable")?;
-    let dir = PathBuf::from(dir).join("CatchIt").join("Updates");
-    fs::create_dir_all(&dir)?;
+    fs::create_dir_all(dir)?;
     let path = dir.join(&name);
     if path.is_file() && verify(&path, &expected).is_ok() {
         return Ok(Some(Update {
@@ -127,9 +174,8 @@ fn check() -> Result<Option<Update>> {
     let partial = dir.join(format!("{name}.partial"));
     let result = (|| {
         // A slow connection should not fail every large update at 60 seconds.
-        let download = http_client(Duration::from_secs(10 * 60))?;
         let mut response = download
-            .get(asset_url(asset, &release.tag_name)?)
+            .get(asset_url(asset, &release.tag_name, asset_root)?)
             .send()?
             .error_for_status()?;
         ensure!(
@@ -170,8 +216,8 @@ fn check() -> Result<Option<Update>> {
     }))
 }
 
-fn asset_url<'a>(asset: &'a Asset, tag: &str) -> Result<&'a str> {
-    let prefix = format!("{ASSET_ROOT}{tag}/");
+fn asset_url<'a>(asset: &'a Asset, tag: &str, root: &str) -> Result<&'a str> {
+    let prefix = format!("{root}{tag}/");
     ensure!(
         asset.browser_download_url == format!("{prefix}{}", asset.name),
         "Unexpected release asset URL"
@@ -236,6 +282,195 @@ pub fn install(update: &Update) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{BufRead, BufReader},
+        net::TcpListener,
+        time::{Instant, SystemTime, UNIX_EPOCH},
+    };
+
+    struct TestFolder(PathBuf);
+    impl TestFolder {
+        fn new() -> Self {
+            let stamp = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "catch-it-update-test-{}-{stamp}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for TestFolder {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn release_server(
+        installer: &'static [u8],
+        expected: String,
+        requests: usize,
+        reported_installer_size: Option<u64>,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let root = format!("http://{}/", listener.local_addr().unwrap());
+        let base = root.clone();
+        let worker = thread::spawn(move || {
+            let name = "CatchIt-Setup-0.1.2.exe";
+            let path = format!("/download/v0.1.2/{name}");
+            let manifest = format!(
+                "{{\"tag_name\":\"v0.1.2\",\"assets\":[{{\"name\":\"{name}\",\"browser_download_url\":\"{base}download/v0.1.2/{name}\"}},{{\"name\":\"{name}.sha256\",\"browser_download_url\":\"{base}download/v0.1.2/{name}.sha256\"}}]}}"
+            );
+            let hash = format!("{expected}  {name}\n");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut handled = 0;
+            while handled < requests && Instant::now() < deadline {
+                let (mut socket, _) = match listener.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("Test server failed: {error}"),
+                };
+                let mut first = String::new();
+                {
+                    let mut reader = BufReader::new(&mut socket);
+                    reader.read_line(&mut first).unwrap();
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                let request = first.split_whitespace().nth(1).unwrap_or("");
+                let body: &[u8] = if request == "/latest" {
+                    manifest.as_bytes()
+                } else if request == format!("{path}.sha256") {
+                    hash.as_bytes()
+                } else if request == path {
+                    installer
+                } else {
+                    panic!("Unexpected request: {request}");
+                };
+                let length = if request == path {
+                    reported_installer_size.unwrap_or(body.len() as u64)
+                } else {
+                    body.len() as u64
+                };
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                socket.write_all(body).unwrap();
+                handled += 1;
+            }
+            assert_eq!(
+                handled, requests,
+                "Updater requested the wrong number of assets"
+            );
+        });
+        (root, worker)
+    }
+
+    fn local_client() -> Client {
+        Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn downloads_verifies_caches_and_replaces_corrupt_cached_installer() {
+        let folder = TestFolder::new();
+        let bytes = b"fixture installer for updater";
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let (root, server) = release_server(bytes, hash, 8, None);
+        let client = local_client();
+        let current = Version::new(0, 1, 1);
+        let check = || {
+            check_with(
+                &client,
+                &client,
+                &format!("{root}latest"),
+                &format!("{root}download/"),
+                &folder.0,
+                &current,
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let first = check();
+        assert_eq!(first.version, Version::new(0, 1, 2));
+        assert_eq!(fs::read(&first.installer).unwrap(), bytes);
+        assert_eq!(check().installer, first.installer); // No second binary transfer.
+        fs::write(&first.installer, b"changed after verification").unwrap();
+        assert_eq!(fs::read(check().installer).unwrap(), bytes);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn rejects_corrupted_download_without_publishing_executable() {
+        let folder = TestFolder::new();
+        let hash = format!("{:x}", Sha256::digest(b"expected installer"));
+        let (root, server) = release_server(b"bad installer", hash, 3, None);
+        let client = local_client();
+        assert!(
+            check_with(
+                &client,
+                &client,
+                &format!("{root}latest"),
+                &format!("{root}download/"),
+                &folder.0,
+                &Version::new(0, 1, 1)
+            )
+            .is_err()
+        );
+        assert!(!folder.0.join("CatchIt-Setup-0.1.2.exe").exists());
+        assert!(!folder.0.join("CatchIt-Setup-0.1.2.exe.partial").exists());
+        server.join().unwrap();
+    }
+    #[test]
+    fn repeated_manual_checks_coalesce_without_blocking_ui() {
+        let (requests, queue) = mpsc::sync_channel(1);
+        let (_sender, results) = mpsc::channel();
+        let updater = Updater { results, requests };
+        updater.check_now().unwrap();
+        updater.check_now().unwrap();
+        assert!(queue.try_recv().is_ok());
+        assert!(queue.try_recv().is_err());
+    }
+
+    #[test]
+    fn refuses_oversized_installer_before_writing_any_file() {
+        let folder = TestFolder::new();
+        let hash = format!("{:x}", Sha256::digest(b"small installer"));
+        let (root, server) = release_server(b"small installer", hash, 3, Some(MAX_INSTALLER + 1));
+        let client = local_client();
+        assert!(
+            check_with(
+                &client,
+                &client,
+                &format!("{root}latest"),
+                &format!("{root}download/"),
+                &folder.0,
+                &Version::new(0, 1, 1)
+            )
+            .is_err()
+        );
+        assert!(!folder.0.join("CatchIt-Setup-0.1.2.exe").exists());
+        assert!(!folder.0.join("CatchIt-Setup-0.1.2.exe.partial").exists());
+        server.join().unwrap();
+    }
+
     #[test]
     fn checksum_requires_exact_name_and_valid_hash() {
         let name = "CatchIt-Setup-0.2.0.exe";
@@ -250,7 +485,7 @@ mod tests {
             name: "foo.exe".into(),
             browser_download_url: format!("{ASSET_ROOT}v0.2.0/foo.exe"),
         };
-        assert!(asset_url(&asset, "v0.2.0").is_ok());
-        assert!(asset_url(&asset, "v0.3.0").is_err());
+        assert!(asset_url(&asset, "v0.2.0", ASSET_ROOT).is_ok());
+        assert!(asset_url(&asset, "v0.3.0", ASSET_ROOT).is_err());
     }
 }

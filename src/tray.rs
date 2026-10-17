@@ -19,12 +19,14 @@ pub const SET_PLACEMENT_REQUEST: u32 = WM_APP + 18;
 pub const INSTALL_UPDATE_REQUEST: u32 = WM_APP + 20;
 pub const SET_APPEARANCE_REQUEST: u32 = WM_APP + 21;
 pub const SET_SHORTCUT_REQUEST: u32 = WM_APP + 22;
+pub const CHECK_UPDATE_REQUEST: u32 = WM_APP + 23;
 const ICON_ID: u32 = 1;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1; // NINF_KEY
 const CAPTURE_ITEM: usize = 1;
 const QUIT_ITEM: usize = 2;
 const CLOSE_ALL_ITEM: usize = 3;
 const UPDATE_ITEM: usize = 4;
+const CHECK_UPDATE_ITEM: usize = 5;
 const TIMER_BASE: usize = 100;
 const PLACEMENT_BASE: usize = 120;
 const APPEARANCE_BASE: usize = 130;
@@ -141,6 +143,7 @@ impl Tray {
             QUIT_ITEM => (QUIT_REQUEST, 0),
             CLOSE_ALL_ITEM => (CLOSE_ALL_REQUEST, 0),
             UPDATE_ITEM if self.update.borrow().is_some() => (INSTALL_UPDATE_REQUEST, 0),
+            CHECK_UPDATE_ITEM if self.updates_supported => (CHECK_UPDATE_REQUEST, 0),
             id if (TIMER_BASE..TIMER_BASE + AutoClose::ALL.len()).contains(&id) => {
                 (SET_TIMEOUT_REQUEST, id - TIMER_BASE)
             }
@@ -451,6 +454,14 @@ impl Menu {
                     w!("Checking for updates / up to date"),
                 )?;
             }
+            if updates_supported {
+                AppendMenuW(
+                    menu.0,
+                    MF_STRING,
+                    CHECK_UPDATE_ITEM,
+                    w!("Check for updates now"),
+                )?;
+            }
             AppendMenuW(menu.0, MF_STRING, QUIT_ITEM, w!("Quit"))?;
         }
         Ok(menu)
@@ -558,9 +569,10 @@ mod tests {
             true,
         )?;
         unsafe {
-            assert_eq!(GetMenuItemCount(Some(menu.0)), 8);
+            assert_eq!(GetMenuItemCount(Some(menu.0)), 9);
             assert_eq!(GetMenuItemID(menu.0, 6), UPDATE_ITEM as u32);
-            assert_eq!(GetMenuItemID(menu.0, 7), QUIT_ITEM as u32);
+            assert_eq!(GetMenuItemID(menu.0, 7), CHECK_UPDATE_ITEM as u32);
+            assert_eq!(GetMenuItemID(menu.0, 8), QUIT_ITEM as u32);
         }
         Ok(())
     }
@@ -582,10 +594,11 @@ mod tests {
         )
         .context("Cannot create tray menu")?;
         unsafe {
-            assert_eq!(GetMenuItemCount(Some(menu.0)), 8);
+            assert_eq!(GetMenuItemCount(Some(menu.0)), 9);
             assert_eq!(GetMenuItemID(menu.0, 0), CAPTURE_ITEM as u32);
             assert_eq!(GetMenuItemID(menu.0, 6), UPDATE_ITEM as u32);
-            assert_eq!(GetMenuItemID(menu.0, 7), QUIT_ITEM as u32);
+            assert_eq!(GetMenuItemID(menu.0, 7), CHECK_UPDATE_ITEM as u32);
+            assert_eq!(GetMenuItemID(menu.0, 8), QUIT_ITEM as u32);
             let timers = GetSubMenu(menu.0, 1);
             assert_eq!(GetMenuItemCount(Some(timers)), 6);
             assert!(GetMenuState(timers, TIMER_BASE as u32 + 5, MF_BYCOMMAND) & MF_CHECKED.0 != 0);

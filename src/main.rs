@@ -67,6 +67,23 @@ struct PendingClipboard {
     expires: Instant,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ClosePlan {
+    Save,
+    Close,
+    Cancel,
+    CompleteGesture,
+}
+
+fn plan_editor_close(answer: MESSAGEBOX_RESULT, has_uncommitted_selection: bool) -> ClosePlan {
+    match answer {
+        IDYES if has_uncommitted_selection => ClosePlan::CompleteGesture,
+        IDYES => ClosePlan::Save,
+        IDNO => ClosePlan::Close,
+        _ => ClosePlan::Cancel,
+    }
+}
+
 struct App {
     controller: HWND,
     tray: Option<Box<tray::Tray>>,
@@ -83,7 +100,7 @@ struct App {
     preferences: settings::Settings,
     hotkey_registered: bool,
     quit_hotkey_registered: bool,
-    update_receiver: Option<Receiver<Result<Option<updater::Update>, String>>>,
+    updater: Option<updater::Updater>,
     update: Option<updater::Update>,
 }
 
@@ -367,16 +384,16 @@ impl App {
                 MB_YESNOCANCEL | MB_ICONWARNING,
             )
         };
-        if answer == IDYES {
-            if self.editors[index].has_uncommitted_selection() {
+        match plan_editor_close(answer, self.editors[index].has_uncommitted_selection()) {
+            ClosePlan::Save => self.save_editor(index),
+            ClosePlan::Close => Ok(true),
+            ClosePlan::Cancel => Ok(false),
+            ClosePlan::CompleteGesture => {
                 self.report_error(&anyhow::anyhow!(
                     "Apply or cancel the current selection before saving"
                 ));
-                return Ok(false);
+                Ok(false)
             }
-            self.save_editor(index)
-        } else {
-            Ok(answer == IDNO)
         }
     }
 
@@ -732,6 +749,7 @@ unsafe extern "system" fn controller_proc(
             | WORK_READY
             | updater::READY
             | tray::INSTALL_UPDATE_REQUEST
+            | tray::CHECK_UPDATE_REQUEST
             | overlay::FINISH_SELECTION
             | thumbnail::HOVER_CHANGED
             | thumbnail::DISMISS
@@ -867,7 +885,7 @@ fn run() -> Result<()> {
         preferences,
         hotkey_registered: false,
         quit_hotkey_registered: false,
-        update_receiver: updater::start_if_installed(controller),
+        updater: updater::start_if_installed(controller),
         update: None,
     };
     if let Err(error) = register_capture_hotkey(controller, preferences.shortcut) {
@@ -893,7 +911,7 @@ fn run() -> Result<()> {
         preferences.shortcut,
         preferences.appearance,
         app.hotkey_registered,
-        app.update_receiver.is_some(),
+        app.updater.is_some(),
     )?);
     println!("Catch It - running in the notification area");
     println!(
@@ -950,8 +968,8 @@ fn run() -> Result<()> {
                 }
                 WORK_READY => app.receive_work(),
                 updater::READY => {
-                    if let Some(receiver) = &app.update_receiver {
-                        while let Ok(result) = receiver.try_recv() {
+                    if let Some(updater) = &app.updater {
+                        while let Ok(result) = updater.try_recv() {
                             match result {
                                 Ok(Some(update)) => {
                                     app.update = Some(update);
@@ -960,12 +978,16 @@ fn run() -> Result<()> {
                                     }
                                 }
                                 Ok(None) => {
+                                    app.update = None;
                                     if let Some(tray) = &app.tray {
+                                        tray.set_update(None);
                                         tray.set_update_failure(false);
                                     }
                                 }
                                 Err(error) => {
+                                    app.update = None;
                                     if let Some(tray) = &app.tray {
+                                        tray.set_update(None);
                                         tray.set_update_failure(true);
                                     }
                                     eprintln!("Update unavailable: {error}");
@@ -983,6 +1005,12 @@ fn run() -> Result<()> {
                                 eprintln!("Update notification: {error:#}");
                             }
                         }
+                    }
+                    Ok(())
+                }
+                tray::CHECK_UPDATE_REQUEST => {
+                    if let Some(updater) = &app.updater {
+                        updater.check_now()?;
                     }
                     Ok(())
                 }
@@ -1060,6 +1088,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn close_choice_never_loses_edits_on_cancel_or_pending_crop() {
+        assert_eq!(plan_editor_close(IDYES, false), ClosePlan::Save);
+        assert_eq!(plan_editor_close(IDYES, true), ClosePlan::CompleteGesture);
+        assert_eq!(plan_editor_close(IDNO, true), ClosePlan::Close);
+        assert_eq!(plan_editor_close(IDCANCEL, false), ClosePlan::Cancel);
+        assert_eq!(
+            plan_editor_close(MESSAGEBOX_RESULT(0), false),
+            ClosePlan::Cancel
+        );
+    }
 
     #[test]
     fn nested_loop_preserves_completions_and_coalesces_lifecycle_messages() {
