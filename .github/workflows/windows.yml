@@ -32,7 +32,10 @@ jobs:
           cargo test --locked 2>&1 | Tee-Object -FilePath $log
           $result = $LASTEXITCODE
           if ($result -ne 0) {
-            $detail = (Get-Content $log -Tail 70) -join "`n"
+            $lines = Get-Content $log
+            $failures = $lines | Where-Object { $_ -match 'FAILED|panicked at|^---- |^failures:|^error:|^test result:' }
+            $detail = (($failures | Select-Object -Last 12) + ($lines | Select-Object -Last 12)) -join "`n"
+            if ($detail.Length -gt 3000) { $detail = $detail.Substring($detail.Length - 3000) }
             $detail = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
             Write-Host "::error title=Windows unit tests failed::$detail"
             exit $result
