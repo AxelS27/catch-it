@@ -25,7 +25,18 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
       - name: Unit tests
-        run: cargo test --locked
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $log = Join-Path $env:RUNNER_TEMP 'catch-it-tests.log'
+          cargo test --locked 2>&1 | Tee-Object -FilePath $log
+          $result = $LASTEXITCODE
+          if ($result -ne 0) {
+            $detail = (Get-Content $log -Tail 70) -join "`n"
+            $detail = $detail.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Windows unit tests failed::$detail"
+            exit $result
+          }
       - name: Verify release tag matches package
         if: github.event_name == 'release'
         shell: pwsh
