@@ -719,10 +719,15 @@ mod tests {
             DragQueryFileW(drop, 0, Some(&mut filename));
             ReleaseStgMedium(&mut medium);
             assert_eq!(count, 1);
+            // Shell can expand an 8.3 parent directory (RUNNER~1) to its
+            // long name. Compare the actual file, not its path spelling.
+            let returned = std::path::PathBuf::from(String::from_utf16(&filename[..len as usize])?);
+            assert_eq!(returned.file_name(), path.file_name());
             assert_eq!(
-                String::from_utf16(&filename[..len as usize])?,
-                path.to_string_lossy()
+                std::fs::canonicalize(&returned)?,
+                std::fs::canonicalize(&path)?
             );
+            assert_eq!(std::fs::read(returned)?, b"native data-object test");
         }
         assert_eq!(std::fs::read(&path)?, b"native data-object test");
         Ok(())
