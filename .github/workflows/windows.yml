@@ -14,6 +14,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Upgrade regression builds the pinned v0.1.0 tag.
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -37,6 +39,9 @@ jobs:
       - name: Build installer and checksum
         shell: pwsh
         run: ./scripts/build-installer.ps1
+      - name: Isolated upgrade, rollback and uninstall regression
+        shell: pwsh
+        run: ./scripts/smoke-upgrade.ps1
       - name: Verify package checksum
         shell: pwsh
         run: |
