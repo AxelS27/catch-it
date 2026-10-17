@@ -2,13 +2,16 @@
 #ifndef AppVersion
   #error "Build through scripts/build-installer.ps1 to set AppVersion"
 #endif
+#ifndef PackageAppId
+  #define PackageAppId "{{63A637BC-4A49-445A-AADF-457225F73DAA}"
+#endif
 #define Root ".."
 #ifndef BinaryPath
   #define BinaryPath "..\\target\\release\\catch-it.exe"
 #endif
 
 [Setup]
-AppId={{63A637BC-4A49-445A-AADF-457225F73DAA}
+AppId={#PackageAppId}
 AppName=Catch It
 AppVersion={#AppVersion}
 AppPublisher=Catch It
@@ -47,6 +50,9 @@ Name: "{app}\Temp"
 Type: files; Name: "{app}\Temp\shot_*.png"
 Type: files; Name: "{app}\Temp\shot_*.png.part"
 
+; Integration-test builds use a different AppId and install directory. Do not
+; launch the app or touch the user's real Startup/Start Menu shortcuts.
+#ifndef UpgradeSmoke
 [Tasks]
 Name: "autostart"; Description: "Start Catch It when I sign in to Windows"; GroupDescription: "Startup:"
 
@@ -57,6 +63,7 @@ Name: "{userstartup}\Catch It"; Filename: "{app}\catch-it.exe"; WorkingDir: "{ap
 [Run]
 Filename: "{app}\catch-it.exe"; Description: "Launch Catch It"; Flags: nowait postinstall skipifsilent
 Filename: "{app}\catch-it.exe"; Flags: nowait skipifnotsilent
+#endif
 
 [Code]
 // Temporary captures live under {app}\Temp, so the install directory must
