@@ -5,7 +5,7 @@ use crate::{
     thumbnail::{self, Thumbnail},
 };
 use anyhow::Result;
-use std::{cell::Cell, collections::BTreeMap, time::Duration};
+use std::{cell::Cell, collections::BTreeMap, rc::Rc, time::Duration};
 use windows::{
     Win32::{Foundation::*, UI::WindowsAndMessaging::*},
     core::{PCWSTR, w},
@@ -69,6 +69,12 @@ impl Gallery {
         self.reflow()?;
         Ok(had_visible)
     }
+    pub fn recover_compositor(&mut self, compositor: Rc<thumbnail::Compositor>) -> Result<()> {
+        for item in &mut self.items {
+            item.recover_compositor(Rc::clone(&compositor))?;
+        }
+        Ok(())
+    }
     pub fn refresh_theme(&mut self, dark: bool) -> Result<()> {
         for item in &mut self.items {
             item.refresh_theme(dark)?;
@@ -120,6 +126,9 @@ impl Gallery {
                 }
                 Ok(false) => index += 1,
                 Err(error) => {
+                    if thumbnail::is_device_lost_error(&error) {
+                        return Err(error);
+                    }
                     self.items.remove(index);
                     self.reflow()?;
                     return Err(error);

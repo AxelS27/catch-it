@@ -15,6 +15,7 @@ mod storage;
 mod theme;
 mod thumbnail;
 mod tray;
+mod updater;
 mod worker;
 
 use std::{
@@ -80,6 +81,10 @@ struct App {
     editors: Vec<editor::Editor>,
     editor_capture_focus: Option<(HWND, HWND)>,
     preferences: settings::Settings,
+    hotkey_registered: bool,
+    quit_hotkey_registered: bool,
+    update_receiver: Option<Receiver<Result<Option<updater::Update>, String>>>,
+    update: Option<updater::Update>,
 }
 
 impl App {
@@ -331,6 +336,59 @@ impl App {
         self.schedule_thumbnail_timer()
     }
 
+    fn save_editor(&mut self, index: usize) -> Result<bool> {
+        self.gallery.pause_all()?;
+        unsafe {
+            let _ = KillTimer(Some(self.controller), THUMBNAIL_TIMER);
+        }
+        let mut editor = self.editors.remove(index);
+        let hwnd = editor.hwnd();
+        let result = editor
+            .output()
+            .and_then(|(path, _)| export::save_as(hwnd, path));
+        if matches!(result, Ok(Some(_))) {
+            editor.mark_saved();
+        }
+        self.editors.insert(index, editor);
+        self.gallery.reflow()?;
+        self.schedule_thumbnail_timer()?;
+        result.map(|path| path.is_some())
+    }
+
+    fn confirm_editor_close(&mut self, index: usize) -> Result<bool> {
+        if !self.editors[index].has_unsaved_changes() {
+            return Ok(true);
+        }
+        let answer = unsafe {
+            MessageBoxW(
+                Some(self.editors[index].hwnd()),
+                w!("Save changes to this screenshot before closing?"),
+                w!("Catch It"),
+                MB_YESNOCANCEL | MB_ICONWARNING,
+            )
+        };
+        if answer == IDYES {
+            if self.editors[index].has_uncommitted_selection() {
+                self.report_error(&anyhow::anyhow!(
+                    "Apply or cancel the current selection before saving"
+                ));
+                return Ok(false);
+            }
+            self.save_editor(index)
+        } else {
+            Ok(answer == IDNO)
+        }
+    }
+
+    fn confirm_exit(&mut self) -> Result<bool> {
+        for index in 0..self.editors.len() {
+            if !self.confirm_editor_close(index)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn editor_action(&mut self, source: WPARAM, action: isize) -> Result<()> {
         let Some(index) = self
             .editors
@@ -340,6 +398,9 @@ impl App {
             return Ok(());
         };
         if action == editor::CLOSE {
+            if !self.confirm_editor_close(index)? {
+                return Ok(());
+            }
             println!(
                 "Editor close requested: {}",
                 self.editors[index].path().display()
@@ -348,6 +409,10 @@ impl App {
             self.gallery.set_editing(editor.path(), false)?;
             drop(editor);
             return self.schedule_thumbnail_timer();
+        }
+        if action == editor::SAVE {
+            self.save_editor(index)?;
+            return Ok(());
         }
         if action == editor::BACKGROUND_TOGGLE {
             return self.editors[index].toggle_background();
@@ -370,10 +435,6 @@ impl App {
             let _ = KillTimer(Some(self.controller), THUMBNAIL_TIMER);
         }
         let result = match action {
-            editor::SAVE => {
-                let path = editor.output()?.0.to_path_buf();
-                export::save_as(editor.hwnd(), &path).map(|_| ())
-            }
             editor::DRAG => editor.run_drag().map(|_| ()),
             editor::ZOOM_MENU => editor.zoom_menu(),
             editor::ADD_IMAGE => editor.add_image(),
@@ -478,6 +539,26 @@ impl App {
     }
 
     fn report_error(&mut self, error: &anyhow::Error) {
+        let d2d_target_lost = error
+            .chain()
+            .filter_map(|cause| cause.downcast_ref::<windows::core::Error>())
+            .any(|cause| cause.code().0 == 0x8899000c_u32 as i32);
+        if thumbnail::is_device_lost_error(error)
+            && (d2d_target_lost || self.compositor.health().is_err())
+        {
+            let recovery = thumbnail::Compositor::new().and_then(|compositor| {
+                self.gallery.recover_compositor(Rc::clone(&compositor))?;
+                self.compositor = compositor;
+                self.gallery.refresh_theme(theme::dark())?;
+                self.gallery.reflow()?;
+                self.schedule_thumbnail_timer()
+            });
+            if recovery.is_ok() {
+                eprintln!("Thumbnail rendering device recovered: {error:#}");
+                return;
+            }
+            eprintln!("Thumbnail recovery failed: {recovery:?}");
+        }
         // Failed capture/PNG/render work must not strand older previews hidden
         // or leave their resumed clocks without a timer.
         if !self.pending
@@ -497,6 +578,64 @@ impl App {
         self.gallery.refresh_theme(dark)?;
         for editor in &mut self.editors {
             editor.refresh_theme(dark);
+        }
+        Ok(())
+    }
+
+    fn configure_appearance(&mut self, index: usize) -> Result<()> {
+        let Some(choice) = settings::Appearance::ALL.get(index).copied() else {
+            return Ok(());
+        };
+        let mut changed = self.preferences;
+        changed.appearance = choice;
+        changed.save()?;
+        self.preferences = changed;
+        theme::set_appearance(choice);
+        if let Some(tray) = &self.tray {
+            tray.set_appearance(choice);
+        }
+        self.refresh_theme()
+    }
+
+    fn configure_shortcut(&mut self, index: usize) -> Result<()> {
+        let Some(choice) = settings::CaptureShortcut::ALL.get(index).copied() else {
+            return Ok(());
+        };
+        if self.hotkey_registered && choice == self.preferences.shortcut {
+            return Ok(());
+        }
+        let previous = self.preferences.shortcut;
+        if self.hotkey_registered {
+            unsafe {
+                UnregisterHotKey(Some(self.controller), CAPTURE_HOTKEY)?;
+            }
+        }
+        if let Err(error) = register_capture_hotkey(self.controller, choice) {
+            self.hotkey_registered = false;
+            if previous != choice && register_capture_hotkey(self.controller, previous).is_ok() {
+                self.hotkey_registered = true;
+            }
+            if let Some(tray) = &self.tray {
+                tray.set_shortcut(previous, self.hotkey_registered)?;
+            }
+            return Err(error);
+        }
+        self.hotkey_registered = true;
+        let mut changed = self.preferences;
+        changed.shortcut = choice;
+        if let Err(error) = changed.save() {
+            unsafe {
+                let _ = UnregisterHotKey(Some(self.controller), CAPTURE_HOTKEY);
+            }
+            self.hotkey_registered = register_capture_hotkey(self.controller, previous).is_ok();
+            if let Some(tray) = &self.tray {
+                tray.set_shortcut(previous, self.hotkey_registered)?;
+            }
+            return Err(error);
+        }
+        self.preferences = changed;
+        if let Some(tray) = &self.tray {
+            tray.set_shortcut(choice, true)?;
         }
         Ok(())
     }
@@ -534,8 +673,12 @@ impl Drop for App {
         self.worker.shutdown();
         self.tray.take();
         unsafe {
-            let _ = UnregisterHotKey(Some(self.controller), CAPTURE_HOTKEY);
-            let _ = UnregisterHotKey(Some(self.controller), QUIT_HOTKEY);
+            if self.hotkey_registered {
+                let _ = UnregisterHotKey(Some(self.controller), CAPTURE_HOTKEY);
+            }
+            if self.quit_hotkey_registered {
+                let _ = UnregisterHotKey(Some(self.controller), QUIT_HOTKEY);
+            }
             let _ = DestroyWindow(self.controller);
         }
     }
@@ -584,8 +727,11 @@ unsafe extern "system" fn controller_proc(
     if matches!(
         message,
         WM_SETTINGCHANGE
+            | WM_DISPLAYCHANGE
             | WM_THEMECHANGED
             | WORK_READY
+            | updater::READY
+            | tray::INSTALL_UPDATE_REQUEST
             | overlay::FINISH_SELECTION
             | thumbnail::HOVER_CHANGED
             | thumbnail::DISMISS
@@ -597,6 +743,8 @@ unsafe extern "system" fn controller_proc(
             | thumbnail::ANNOTATE
             | editor::ACTION
             | tray::SET_TIMEOUT_REQUEST
+            | tray::SET_APPEARANCE_REQUEST
+            | tray::SET_SHORTCUT_REQUEST
             | tray::SET_PLACEMENT_REQUEST
             | tray::CLOSE_ALL_REQUEST
     ) || (message == WM_TIMER && matches!(wparam.0, THUMBNAIL_TIMER | CLIPBOARD_TIMER))
@@ -630,6 +778,28 @@ unsafe extern "system" fn controller_proc(
         return LRESULT(0);
     }
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+}
+
+fn register_capture_hotkey(controller: HWND, shortcut: settings::CaptureShortcut) -> Result<()> {
+    let modifiers = match shortcut {
+        settings::CaptureShortcut::AltShiftS => MOD_ALT | MOD_SHIFT,
+        settings::CaptureShortcut::CtrlShiftS => MOD_CONTROL | MOD_SHIFT,
+        settings::CaptureShortcut::CtrlAltS => MOD_CONTROL | MOD_ALT,
+    };
+    unsafe {
+        RegisterHotKey(
+            Some(controller),
+            CAPTURE_HOTKEY,
+            modifiers | MOD_NOREPEAT,
+            u32::from(b'S'),
+        )
+        .with_context(|| {
+            format!(
+                "{} is already registered by another application",
+                shortcut.label()
+            )
+        })
+    }
 }
 
 fn run() -> Result<()> {
@@ -695,38 +865,35 @@ fn run() -> Result<()> {
         editors: Vec::new(),
         editor_capture_focus: None,
         preferences,
+        hotkey_registered: false,
+        quit_hotkey_registered: false,
+        update_receiver: updater::start_if_installed(controller),
+        update: None,
     };
-    unsafe {
-        let modifiers = match preferences.shortcut {
-            settings::CaptureShortcut::AltShiftS => MOD_ALT | MOD_SHIFT,
-            settings::CaptureShortcut::CtrlShiftS => MOD_CONTROL | MOD_SHIFT,
-            settings::CaptureShortcut::CtrlAltS => MOD_CONTROL | MOD_ALT,
-        };
-        RegisterHotKey(
-            Some(controller),
-            CAPTURE_HOTKEY,
-            modifiers | MOD_NOREPEAT,
-            u32::from(b'S'),
-        )
-        .with_context(|| {
-            format!(
-                "{} is already registered by another application",
-                preferences.shortcut.label()
-            )
-        })?;
+    if let Err(error) = register_capture_hotkey(controller, preferences.shortcut) {
+        eprintln!("Capture hotkey unavailable: {error:#}");
+    } else {
+        app.hotkey_registered = true;
+    }
+    match unsafe {
         RegisterHotKey(
             Some(controller),
             QUIT_HOTKEY,
             MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
             u32::from(b'Q'),
         )
-        .context("Prototype exit shortcut Ctrl + Alt + Q is unavailable")?;
+    } {
+        Ok(()) => app.quit_hotkey_registered = true,
+        Err(error) => eprintln!("Quit hotkey unavailable; use tray Quit: {error}"),
     }
     app.tray = Some(tray::Tray::new(
         controller,
         app.gallery.timeout(),
         app.gallery.placement(),
         preferences.shortcut,
+        preferences.appearance,
+        app.hotkey_registered,
+        app.update_receiver.is_some(),
     )?);
     println!("Catch It - running in the notification area");
     println!(
@@ -743,7 +910,7 @@ fn run() -> Result<()> {
     let mut message = MSG::default();
     loop {
         // A quit hotkey may have been dispatched by a tray menu's modal loop.
-        if EXIT_REQUESTED.replace(false) {
+        if EXIT_REQUESTED.replace(false) && app.confirm_exit()? {
             break;
         }
         if CAPTURE_REQUESTED.replace(false)
@@ -768,10 +935,78 @@ fn run() -> Result<()> {
         if message.hwnd == controller {
             let result = match message.message {
                 tray::CAPTURE_REQUEST => app.start_capture(),
-                tray::QUIT_REQUEST => break,
+                tray::QUIT_REQUEST => {
+                    if app.confirm_exit()? {
+                        break;
+                    }
+                    Ok(())
+                }
                 WM_HOTKEY if message.wParam.0 == CAPTURE_HOTKEY as usize => app.start_capture(),
-                WM_HOTKEY if message.wParam.0 == QUIT_HOTKEY as usize => break,
+                WM_HOTKEY if message.wParam.0 == QUIT_HOTKEY as usize => {
+                    if app.confirm_exit()? {
+                        break;
+                    }
+                    Ok(())
+                }
                 WORK_READY => app.receive_work(),
+                updater::READY => {
+                    if let Some(receiver) = &app.update_receiver {
+                        while let Ok(result) = receiver.try_recv() {
+                            match result {
+                                Ok(Some(update)) => {
+                                    app.update = Some(update);
+                                    if let Some(tray) = &app.tray {
+                                        tray.set_update_failure(false);
+                                    }
+                                }
+                                Ok(None) => {
+                                    if let Some(tray) = &app.tray {
+                                        tray.set_update_failure(false);
+                                    }
+                                }
+                                Err(error) => {
+                                    if let Some(tray) = &app.tray {
+                                        tray.set_update_failure(true);
+                                    }
+                                    eprintln!("Update unavailable: {error}");
+                                }
+                            }
+                        }
+                    }
+                    if let Some(tray) = &app.tray {
+                        let version = app.update.as_ref().map(|u| u.version.to_string());
+                        if let Some(version) = version.as_deref()
+                            && !tray.is_update_announced(version)
+                        {
+                            tray.set_update(Some(version.to_string()));
+                            if let Err(error) = tray.notify_update(version) {
+                                eprintln!("Update notification: {error:#}");
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                tray::INSTALL_UPDATE_REQUEST => {
+                    if app.pending || app.overlay.is_some() {
+                        app.report_error(&anyhow::anyhow!("Finish the capture before updating"));
+                    } else if app.confirm_exit()?
+                        && let Some(update) = &app.update
+                    {
+                        if let Err(error) = updater::install(update) {
+                            app.report_error(&error);
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok(())
+                }
+                WM_DISPLAYCHANGE => match app.compositor.health() {
+                    Ok(()) => app.gallery.reflow(),
+                    Err(error) => {
+                        app.report_error(&error);
+                        Ok(())
+                    }
+                },
                 WM_SETTINGCHANGE | WM_THEMECHANGED => app.refresh_theme(),
                 overlay::FINISH_SELECTION => app.finish_selection(),
                 WM_TIMER if message.wParam.0 == THUMBNAIL_TIMER => {
@@ -788,6 +1023,8 @@ fn run() -> Result<()> {
                 editor::ACTION => app.editor_action(message.wParam, message.lParam.0),
                 WM_TIMER if message.wParam.0 == CLIPBOARD_TIMER => app.publish_clipboard(),
                 tray::SET_TIMEOUT_REQUEST => app.configure_timeout(message.wParam.0),
+                tray::SET_APPEARANCE_REQUEST => app.configure_appearance(message.wParam.0),
+                tray::SET_SHORTCUT_REQUEST => app.configure_shortcut(message.wParam.0),
                 tray::SET_PLACEMENT_REQUEST => app.configure_placement(message.wParam.0),
                 tray::CLOSE_ALL_REQUEST => {
                     app.clear_thumbnail();

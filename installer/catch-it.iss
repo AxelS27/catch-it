@@ -1,5 +1,7 @@
 ; Per-user Windows installer. Setup only chooses a writable app folder.
-#define AppVersion "0.1.0"
+#ifndef AppVersion
+  #error "Build through scripts/build-installer.ps1 to set AppVersion"
+#endif
 #define Root ".."
 #ifndef BinaryPath
   #define BinaryPath "..\\target\\release\\catch-it.exe"
@@ -39,6 +41,12 @@ Source: "{#Root}\installer\install-layout.txt"; DestDir: "{app}"; Flags: ignorev
 [Dirs]
 Name: "{app}\Temp"
 
+; Captures are explicitly temporary. Uninstall removes only the files created
+; inside the app's dedicated Temp directory, not arbitrary files elsewhere.
+[UninstallDelete]
+Type: files; Name: "{app}\Temp\shot_*.png"
+Type: files; Name: "{app}\Temp\shot_*.png.part"
+
 [Tasks]
 Name: "autostart"; Description: "Start Catch It when I sign in to Windows"; GroupDescription: "Startup:"
 
@@ -48,6 +56,7 @@ Name: "{userstartup}\Catch It"; Filename: "{app}\catch-it.exe"; WorkingDir: "{ap
 
 [Run]
 Filename: "{app}\catch-it.exe"; Description: "Launch Catch It"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\catch-it.exe"; Flags: nowait skipifnotsilent
 
 [Code]
 // Temporary captures live under {app}\Temp, so the install directory must

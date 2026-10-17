@@ -37,6 +37,10 @@ pub struct Compositor {
 }
 
 impl Compositor {
+    pub fn health(&self) -> Result<()> {
+        unsafe { self.device.GetDeviceRemovedReason().map_err(Into::into) }
+    }
+
     pub fn new() -> Result<Rc<Self>> {
         unsafe {
             let mut device = None;
@@ -593,6 +597,27 @@ impl Surface {
                 hover_transition: None,
             })
         }
+    }
+
+    /// Restore a card from CPU-cached pixels after device loss without restarting
+    /// its preview timeout or re-decoding the screenshot.
+    pub fn restore(
+        &mut self,
+        hovered: bool,
+        pinned: bool,
+        highlighted: bool,
+        dark: bool,
+        visible: bool,
+    ) -> Result<()> {
+        self.set_controls(hovered, pinned, highlighted, dark)?;
+        unsafe {
+            self.visual.SetOffsetX2(0.0)?;
+            self.opacity.SetOpacity2(if visible { 1.0 } else { 0.0 })?;
+            self.hover_opacity
+                .SetOpacity2(if hovered { 1.0 } else { 0.0 })?;
+            self.compositor.composition.Commit()?;
+        }
+        Ok(())
     }
 
     /// The exact rendered, premultiplied card, cached once per screenshot.

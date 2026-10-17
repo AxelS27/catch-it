@@ -1,7 +1,7 @@
 //! Native notification-area icon and menu. No polling or App borrows in modal loops.
-use crate::settings::{AutoClose, CaptureShortcut, Placement};
+use crate::settings::{Appearance, AutoClose, CaptureShortcut, Placement, Settings};
 use anyhow::Result;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use windows::{
     Win32::{
         Foundation::{HWND, LPARAM, POINT, WPARAM},
@@ -16,13 +16,19 @@ pub const QUIT_REQUEST: u32 = WM_APP + 8;
 pub const SET_TIMEOUT_REQUEST: u32 = WM_APP + 12;
 pub const CLOSE_ALL_REQUEST: u32 = WM_APP + 13;
 pub const SET_PLACEMENT_REQUEST: u32 = WM_APP + 18;
+pub const INSTALL_UPDATE_REQUEST: u32 = WM_APP + 20;
+pub const SET_APPEARANCE_REQUEST: u32 = WM_APP + 21;
+pub const SET_SHORTCUT_REQUEST: u32 = WM_APP + 22;
 const ICON_ID: u32 = 1;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1; // NINF_KEY
 const CAPTURE_ITEM: usize = 1;
 const QUIT_ITEM: usize = 2;
 const CLOSE_ALL_ITEM: usize = 3;
+const UPDATE_ITEM: usize = 4;
 const TIMER_BASE: usize = 100;
 const PLACEMENT_BASE: usize = 120;
+const APPEARANCE_BASE: usize = 130;
+const SHORTCUT_BASE: usize = 140;
 
 pub struct Tray {
     hwnd: HWND,
@@ -31,7 +37,12 @@ pub struct Tray {
     timeout: Cell<AutoClose>,
     placement: Cell<Placement>,
     count: Cell<usize>,
-    shortcut: CaptureShortcut,
+    update: RefCell<Option<String>>,
+    update_failed: Cell<bool>,
+    updates_supported: bool,
+    shortcut: Cell<CaptureShortcut>,
+    appearance: Cell<Appearance>,
+    shortcut_available: Cell<bool>,
 }
 
 impl Tray {
@@ -42,6 +53,9 @@ impl Tray {
         timeout: AutoClose,
         placement: Placement,
         shortcut: CaptureShortcut,
+        appearance: Appearance,
+        shortcut_available: bool,
+        updates_supported: bool,
     ) -> Result<Box<Self>> {
         let pixels = icon_pixels();
         let mask = [0u8; 128]; // 32 x 32 monochrome AND mask, alpha supplies transparency.
@@ -53,7 +67,12 @@ impl Tray {
             timeout: Cell::new(timeout),
             placement: Cell::new(placement),
             count: Cell::new(0),
-            shortcut,
+            update: RefCell::new(None),
+            update_failed: Cell::new(false),
+            updates_supported,
+            shortcut: Cell::new(shortcut),
+            appearance: Cell::new(appearance),
+            shortcut_available: Cell::new(shortcut_available),
         });
         anyhow::ensure!(
             tray.taskbar_created != 0,
@@ -73,16 +92,66 @@ impl Tray {
         self.count.set(count);
     }
 
+    pub fn set_update_failure(&self, failed: bool) {
+        self.update_failed.set(failed);
+    }
+
+    pub fn set_update(&self, version: Option<String>) {
+        *self.update.borrow_mut() = version;
+    }
+
+    pub fn is_update_announced(&self, version: &str) -> bool {
+        self.update.borrow().as_deref() == Some(version)
+    }
+
+    pub fn notify_update(&self, version: &str) -> Result<()> {
+        let mut data = self.data();
+        data.uFlags = NIF_INFO;
+        data.dwInfoFlags = NIIF_INFO;
+        let title: Vec<u16> = "Catch It update ready".encode_utf16().collect();
+        data.szInfoTitle[..title.len()].copy_from_slice(&title);
+        let message: Vec<u16> =
+            format!("Version {version} is ready. Open the tray menu to install.")
+                .encode_utf16()
+                .collect();
+        data.szInfo[..message.len()].copy_from_slice(&message);
+        anyhow::ensure!(
+            unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool(),
+            "Cannot show update notification"
+        );
+        Ok(())
+    }
+
+    pub fn set_appearance(&self, appearance: Appearance) {
+        self.appearance.set(appearance);
+    }
+    pub fn set_shortcut(&self, shortcut: CaptureShortcut, available: bool) -> Result<()> {
+        self.shortcut.set(shortcut);
+        self.shortcut_available.set(available);
+        anyhow::ensure!(
+            unsafe { Shell_NotifyIconW(NIM_MODIFY, &self.data()) }.as_bool(),
+            "Cannot update tray shortcut hint"
+        );
+        Ok(())
+    }
+
     fn post_choice(&self, chosen: usize) -> Result<bool> {
         let (message, parameter) = match chosen {
             CAPTURE_ITEM => (CAPTURE_REQUEST, 0),
             QUIT_ITEM => (QUIT_REQUEST, 0),
             CLOSE_ALL_ITEM => (CLOSE_ALL_REQUEST, 0),
+            UPDATE_ITEM if self.update.borrow().is_some() => (INSTALL_UPDATE_REQUEST, 0),
             id if (TIMER_BASE..TIMER_BASE + AutoClose::ALL.len()).contains(&id) => {
                 (SET_TIMEOUT_REQUEST, id - TIMER_BASE)
             }
             id if (PLACEMENT_BASE..PLACEMENT_BASE + Placement::ALL.len()).contains(&id) => {
                 (SET_PLACEMENT_REQUEST, id - PLACEMENT_BASE)
+            }
+            id if (APPEARANCE_BASE..APPEARANCE_BASE + Appearance::ALL.len()).contains(&id) => {
+                (SET_APPEARANCE_REQUEST, id - APPEARANCE_BASE)
+            }
+            id if (SHORTCUT_BASE..SHORTCUT_BASE + CaptureShortcut::ALL.len()).contains(&id) => {
+                (SET_SHORTCUT_REQUEST, id - SHORTCUT_BASE)
             }
             _ => return Ok(false),
         };
@@ -102,9 +171,13 @@ impl Tray {
             hIcon: self.icon,
             ..Default::default()
         };
-        let tip: Vec<_> = format!("Catch It - {}", self.shortcut.label())
-            .encode_utf16()
-            .collect();
+        let tip: Vec<_> = if self.shortcut_available.get() {
+            format!("Catch It - {}", self.shortcut.get().label())
+        } else {
+            "Catch It - shortcut unavailable; change in Settings".to_string()
+        }
+        .encode_utf16()
+        .collect();
         data.szTip[..tip.len()].copy_from_slice(&tip);
         data
     }
@@ -171,10 +244,17 @@ impl Tray {
             }
         }
         let menu = Menu::new(
-            self.timeout.get(),
-            self.placement.get(),
+            Settings {
+                auto_close: self.timeout.get(),
+                placement: self.placement.get(),
+                shortcut: self.shortcut.get(),
+                appearance: self.appearance.get(),
+            },
             self.count.get(),
-            self.shortcut,
+            self.shortcut_available.get(),
+            self.update.borrow().as_deref(),
+            self.update_failed.get(),
+            self.updates_supported,
         )?;
         let previous = unsafe { GetForegroundWindow() };
         // Required by the shell for outside-click/Escape dismissal of tray menus.
@@ -221,11 +301,19 @@ impl Drop for Tray {
 struct Menu(HMENU);
 impl Menu {
     fn new(
-        timeout: AutoClose,
-        placement: Placement,
+        settings: Settings,
         count: usize,
-        shortcut: CaptureShortcut,
+        shortcut_available: bool,
+        update: Option<&str>,
+        update_failed: bool,
+        updates_supported: bool,
     ) -> Result<Self> {
+        let Settings {
+            auto_close: timeout,
+            placement,
+            shortcut,
+            appearance,
+        } = settings;
         let menu = Self(unsafe { CreatePopupMenu() }?);
         unsafe {
             let capture_label: Vec<u16> = format!("Take screenshot\t{}", shortcut.label())
@@ -287,7 +375,82 @@ impl Menu {
                 CLOSE_ALL_ITEM,
                 PCWSTR(label.as_ptr()),
             )?;
+            let settings = Self(CreatePopupMenu()?);
+            let appearances = Self(CreatePopupMenu()?);
+            for (index, choice) in Appearance::ALL.into_iter().enumerate() {
+                let label: Vec<u16> = choice.label().encode_utf16().chain(Some(0)).collect();
+                AppendMenuW(
+                    appearances.0,
+                    MF_STRING
+                        | if appearance == choice {
+                            MF_CHECKED
+                        } else {
+                            MF_UNCHECKED
+                        },
+                    APPEARANCE_BASE + index,
+                    PCWSTR(label.as_ptr()),
+                )?;
+            }
+            AppendMenuW(
+                settings.0,
+                MF_POPUP,
+                appearances.0.0 as usize,
+                w!("Appearance"),
+            )?;
+            std::mem::forget(appearances);
+            let shortcuts = Self(CreatePopupMenu()?);
+            for (index, choice) in CaptureShortcut::ALL.into_iter().enumerate() {
+                let label: Vec<u16> = choice.label().encode_utf16().chain(Some(0)).collect();
+                AppendMenuW(
+                    shortcuts.0,
+                    MF_STRING
+                        | if shortcut == choice && shortcut_available {
+                            MF_CHECKED
+                        } else {
+                            MF_UNCHECKED
+                        },
+                    SHORTCUT_BASE + index,
+                    PCWSTR(label.as_ptr()),
+                )?;
+            }
+            AppendMenuW(
+                settings.0,
+                MF_POPUP,
+                shortcuts.0.0 as usize,
+                w!("Capture shortcut"),
+            )?;
+            std::mem::forget(shortcuts);
+            AppendMenuW(menu.0, MF_POPUP, settings.0.0 as usize, w!("Settings"))?;
+            std::mem::forget(settings);
             AppendMenuW(menu.0, MF_SEPARATOR, 0, None)?;
+            if let Some(version) = update {
+                let label: Vec<u16> = format!("Install update v{version}")
+                    .encode_utf16()
+                    .chain(Some(0))
+                    .collect();
+                AppendMenuW(menu.0, MF_STRING, UPDATE_ITEM, PCWSTR(label.as_ptr()))?;
+            } else if !updates_supported {
+                AppendMenuW(
+                    menu.0,
+                    MF_STRING | MF_GRAYED,
+                    UPDATE_ITEM,
+                    w!("Updates require installed copy"),
+                )?;
+            } else if update_failed {
+                AppendMenuW(
+                    menu.0,
+                    MF_STRING | MF_GRAYED,
+                    UPDATE_ITEM,
+                    w!("Update check unavailable (retrying)"),
+                )?;
+            } else {
+                AppendMenuW(
+                    menu.0,
+                    MF_STRING | MF_GRAYED,
+                    UPDATE_ITEM,
+                    w!("Checking for updates / up to date"),
+                )?;
+            }
             AppendMenuW(menu.0, MF_STRING, QUIT_ITEM, w!("Quit"))?;
         }
         Ok(menu)
@@ -380,18 +543,49 @@ mod tests {
     }
 
     #[test]
+    fn update_menu_item_only_appears_when_ready() -> Result<()> {
+        let menu = Menu::new(
+            Settings {
+                auto_close: AutoClose::Never,
+                placement: Placement::TopLeft,
+                shortcut: CaptureShortcut::AltShiftS,
+                appearance: Appearance::System,
+            },
+            0,
+            true,
+            Some("0.2.0"),
+            false,
+            true,
+        )?;
+        unsafe {
+            assert_eq!(GetMenuItemCount(Some(menu.0)), 8);
+            assert_eq!(GetMenuItemID(menu.0, 6), UPDATE_ITEM as u32);
+            assert_eq!(GetMenuItemID(menu.0, 7), QUIT_ITEM as u32);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn native_menu_has_checked_timer_and_placement_submenus() -> Result<()> {
         let menu = Menu::new(
-            AutoClose::Never,
-            Placement::TopLeft,
+            Settings {
+                auto_close: AutoClose::Never,
+                placement: Placement::TopLeft,
+                shortcut: CaptureShortcut::AltShiftS,
+                appearance: Appearance::System,
+            },
             5,
-            CaptureShortcut::AltShiftS,
+            true,
+            None,
+            false,
+            true,
         )
         .context("Cannot create tray menu")?;
         unsafe {
-            assert_eq!(GetMenuItemCount(Some(menu.0)), 6);
+            assert_eq!(GetMenuItemCount(Some(menu.0)), 8);
             assert_eq!(GetMenuItemID(menu.0, 0), CAPTURE_ITEM as u32);
-            assert_eq!(GetMenuItemID(menu.0, 5), QUIT_ITEM as u32);
+            assert_eq!(GetMenuItemID(menu.0, 6), UPDATE_ITEM as u32);
+            assert_eq!(GetMenuItemID(menu.0, 7), QUIT_ITEM as u32);
             let timers = GetSubMenu(menu.0, 1);
             assert_eq!(GetMenuItemCount(Some(timers)), 6);
             assert!(GetMenuState(timers, TIMER_BASE as u32 + 5, MF_BYCOMMAND) & MF_CHECKED.0 != 0);
@@ -399,6 +593,18 @@ mod tests {
             assert_eq!(GetMenuItemCount(Some(positions)), 4);
             assert!(
                 GetMenuState(positions, PLACEMENT_BASE as u32, MF_BYCOMMAND) & MF_CHECKED.0 != 0
+            );
+            let settings = GetSubMenu(menu.0, 4);
+            assert_eq!(GetMenuItemCount(Some(settings)), 2);
+            let appearances = GetSubMenu(settings, 0);
+            let shortcuts = GetSubMenu(settings, 1);
+            assert_eq!(GetMenuItemCount(Some(appearances)), 3);
+            assert_eq!(GetMenuItemCount(Some(shortcuts)), 3);
+            assert!(
+                GetMenuState(appearances, APPEARANCE_BASE as u32, MF_BYCOMMAND) & MF_CHECKED.0 != 0
+            );
+            assert!(
+                GetMenuState(shortcuts, SHORTCUT_BASE as u32, MF_BYCOMMAND) & MF_CHECKED.0 != 0
             );
         }
         Ok(())

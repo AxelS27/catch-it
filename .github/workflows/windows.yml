@@ -1,0 +1,54 @@
+name: Windows quality and package
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --locked
+      - name: Verify release tag matches package
+        if: github.event_name == 'release'
+        shell: pwsh
+        run: |
+          $manifest = Get-Content Cargo.toml -Raw
+          $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"').Groups[1].Value
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Release tag must be v$version" }
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+      - name: Build installer and checksum
+        shell: pwsh
+        run: ./scripts/build-installer.ps1
+      - name: Verify package checksum
+        shell: pwsh
+        run: |
+          $manifest = Get-Content Cargo.toml -Raw
+          $version = [regex]::Match($manifest, '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"').Groups[1].Value
+          $name = "CatchIt-Setup-$version.exe"
+          $expected = "{0}  {1}" -f (Get-FileHash "dist/$name" -Algorithm SHA256).Hash.ToLowerInvariant(), $name
+          if ((Get-Content "dist/$name.sha256" -Raw).Trim() -ne $expected) { throw 'Checksum mismatch' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: catch-it-installer
+          path: |
+            dist/CatchIt-Setup-*.exe
+            dist/CatchIt-Setup-*.exe.sha256
+          if-no-files-found: error

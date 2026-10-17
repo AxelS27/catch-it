@@ -34,6 +34,25 @@ use crate::{
 use layout::{Control, Layout, WorkArea};
 use lifecycle::{Action, Lifecycle, Timing};
 pub use render::Compositor;
+
+pub fn is_device_lost_error(error: &anyhow::Error) -> bool {
+    use windows::Win32::Graphics::Dxgi::{
+        DXGI_ERROR_DEVICE_HUNG, DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET,
+        DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+    };
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<windows::core::Error>())
+        .any(|cause| {
+            matches!(
+                cause.code(),
+                DXGI_ERROR_DEVICE_REMOVED
+                    | DXGI_ERROR_DEVICE_RESET
+                    | DXGI_ERROR_DEVICE_HUNG
+                    | DXGI_ERROR_DRIVER_INTERNAL_ERROR
+            ) || cause.code().0 == 0x8899000c_u32 as i32
+        }) // D2DERR_RECREATE_TARGET
+}
 use render::Surface;
 
 pub const HOVER_CHANGED: u32 = WM_APP + 3;
@@ -198,6 +217,28 @@ impl Thumbnail {
             thumbnail.lifecycle.set_paused(Instant::now(), true);
             Ok(thumbnail)
         }
+    }
+
+    pub fn recover_compositor(&mut self, compositor: Rc<Compositor>) -> Result<()> {
+        // Detach the old composition target before binding a new device to HWND.
+        self.surface = None;
+        self.compositor = Rc::clone(&compositor);
+        let mut surface = Surface::from_cached(
+            compositor,
+            self.hwnd,
+            self.state.layout,
+            &self.cached_pixels,
+            self.timing,
+        )?;
+        surface.restore(
+            self.state.hovered,
+            self.state.pinned,
+            self.highlighted,
+            self.dark,
+            self.visible,
+        )?;
+        self.surface = Some(surface);
+        Ok(())
     }
 
     pub fn path(&self) -> &std::path::Path {
@@ -814,6 +855,17 @@ unsafe extern "system" fn window_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gpu_errors_are_classified_without_masking_other_errors() {
+        use windows::Win32::Graphics::Dxgi::{DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_WAIT_TIMEOUT};
+        let removed = anyhow::Error::new(windows::core::Error::from(DXGI_ERROR_DEVICE_REMOVED))
+            .context("Present failed");
+        assert!(is_device_lost_error(&removed));
+        assert!(!is_device_lost_error(&anyhow::Error::new(
+            windows::core::Error::from(DXGI_ERROR_WAIT_TIMEOUT)
+        )));
+    }
+
     #[test]
     fn drag_uses_the_system_sized_centered_rectangle() {
         let start = Point { x: 100, y: 100 };

@@ -1,5 +1,23 @@
 //! Follow the Windows *app* appearance, not wallpaper or system taskbar color.
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU8, Ordering},
+};
+
+static APPEARANCE: OnceLock<AtomicU8> = OnceLock::new();
+fn appearance() -> &'static AtomicU8 {
+    APPEARANCE.get_or_init(|| AtomicU8::new(code(crate::settings::Settings::load().appearance)))
+}
+fn code(value: crate::settings::Appearance) -> u8 {
+    match value {
+        crate::settings::Appearance::System => 0,
+        crate::settings::Appearance::Dark => 1,
+        crate::settings::Appearance::Light => 2,
+    }
+}
+pub fn set_appearance(value: crate::settings::Appearance) {
+    appearance().store(code(value), Ordering::Relaxed);
+}
 
 use windows::{
     Win32::{Foundation::ERROR_SUCCESS, System::Registry::*},
@@ -7,11 +25,10 @@ use windows::{
 };
 
 pub fn dark() -> bool {
-    static APPEARANCE: OnceLock<crate::settings::Appearance> = OnceLock::new();
-    match *APPEARANCE.get_or_init(|| crate::settings::Settings::load().appearance) {
-        crate::settings::Appearance::Dark => return true,
-        crate::settings::Appearance::Light => return false,
-        crate::settings::Appearance::System => {}
+    match appearance().load(Ordering::Relaxed) {
+        1 => return true,
+        2 => return false,
+        _ => {}
     }
     let mut value = 1u32; // Windows defaults to light apps if this key is absent.
     let mut size = std::mem::size_of::<u32>() as u32;

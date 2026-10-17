@@ -447,6 +447,10 @@ impl WindowState {
     }
 }
 
+fn unsaved(current: (u64, u64), saved: (u64, u64), gesture: bool) -> bool {
+    current != saved || gesture
+}
+
 pub struct Editor {
     hwnd: HWND,
     state: Box<WindowState>,
@@ -454,7 +458,9 @@ pub struct Editor {
     _protection: std::fs::File,
     drag_image: Option<(u32, u32, Vec<u8>)>,
     output_path: Option<PathBuf>,
+    output_protection: Option<std::fs::File>,
     output_revision: (u64, u64),
+    saved_revision: (u64, u64),
 }
 impl Editor {
     pub fn create(controller: HWND, source: HWND, path: &Path) -> Result<Self> {
@@ -561,7 +567,9 @@ impl Editor {
                 _protection: protection,
                 drag_image: None,
                 output_path: None,
+                output_protection: None,
                 output_revision: (0, 0),
+                saved_revision: (0, 0),
             };
             editor.state.dpi = GetDpiForWindow(hwnd);
             editor.theme();
@@ -601,10 +609,26 @@ impl Editor {
             .or(self.state.composed.as_ref())
             .or(self.state.image.as_ref())
     }
+    pub fn has_unsaved_changes(&self) -> bool {
+        unsaved(
+            (self.state.background_revision, self.state.document.revision),
+            self.saved_revision,
+            self.state.pending_mark.is_some()
+                || self.state.text_editing.is_some()
+                || self.state.crop_mode,
+        )
+    }
+    pub fn has_uncommitted_selection(&self) -> bool {
+        self.state.crop_mode || self.state.pending_mark.is_some()
+    }
+    pub fn mark_saved(&mut self) {
+        self.saved_revision = (self.state.background_revision, self.state.document.revision);
+    }
     pub fn output(&mut self) -> Result<(&Path, &Raster)> {
         self.state.finish_text(true);
         let revision = (self.state.background_revision, self.state.document.revision);
         if self.output_revision != revision {
+            self.output_protection = None;
             self.output_path = None;
             self.state.exported = None;
             self.output_revision = revision;
@@ -644,11 +668,9 @@ impl Editor {
                 .as_ref()
                 .or(self.state.composed.as_ref())
         {
-            self.output_path = Some(storage::save_png(
-                &composed.pixels,
-                composed.width,
-                composed.height,
-            )?);
+            let path = storage::save_png(&composed.pixels, composed.width, composed.height)?;
+            self.output_protection = Some(storage::protect_png(&path)?);
+            self.output_path = Some(path);
         }
         Ok((
             self.output_path.as_deref().unwrap_or(&self.path),
@@ -1426,6 +1448,14 @@ pub fn register_class() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn closing_requires_save_after_edit_or_uncommitted_gesture() {
+        assert!(!unsaved((0, 0), (0, 0), false));
+        assert!(unsaved((0, 1), (0, 0), false));
+        assert!(unsaved((1, 0), (0, 0), false));
+        assert!(unsaved((0, 0), (0, 0), true));
+        assert!(!unsaved((1, 2), (1, 2), false));
+    }
     #[test]
     fn rotation_and_resize_are_editable_gestures() {
         let mut original = Mark::from_tool(

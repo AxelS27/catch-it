@@ -114,6 +114,14 @@ pub enum Appearance {
     Light,
 }
 impl Appearance {
+    pub const ALL: [Self; 3] = [Self::System, Self::Dark, Self::Light];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::System => "Follow Windows",
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+        }
+    }
     fn value(self) -> &'static str {
         match self {
             Self::System => "system",
@@ -139,6 +147,7 @@ pub enum CaptureShortcut {
     CtrlAltS,
 }
 impl CaptureShortcut {
+    pub const ALL: [Self; 3] = [Self::AltShiftS, Self::CtrlShiftS, Self::CtrlAltS];
     fn value(self) -> &'static str {
         match self {
             Self::AltShiftS => "alt_shift_s",

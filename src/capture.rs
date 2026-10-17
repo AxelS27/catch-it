@@ -143,7 +143,18 @@ impl CaptureSession {
             let texture: ID3D11Texture2D = resource.context("DXGI returned no frame")?.cast()?;
             let mut texture_desc = D3D11_TEXTURE2D_DESC::default();
             texture.GetDesc(&mut texture_desc);
-            if self.staging.is_none() {
+            // Mode changes can resize the duplication surface without changing
+            // the session. Never CopyResource into an old-sized staging texture.
+            let mut old_desc = D3D11_TEXTURE2D_DESC::default();
+            if let Some(staging) = &self.staging {
+                staging.GetDesc(&mut old_desc);
+            }
+            if self.staging.is_none()
+                || old_desc.Width != texture_desc.Width
+                || old_desc.Height != texture_desc.Height
+                || old_desc.Format != texture_desc.Format
+            {
+                self.staging = None;
                 let staging_desc = D3D11_TEXTURE2D_DESC {
                     Usage: D3D11_USAGE_STAGING,
                     BindFlags: 0,
@@ -165,8 +176,16 @@ impl CaptureSession {
                 .Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
             let width = texture_desc.Width;
             let height = texture_desc.Height;
+            let length = u64::from(width)
+                .checked_mul(u64::from(height))
+                .and_then(|area| area.checked_mul(4))
+                .context("Display dimensions overflow")?;
+            anyhow::ensure!(
+                length <= 256 * 1024 * 1024,
+                "Display exceeds the 256 MiB capture limit"
+            );
             let stride = width as usize * 4;
-            let mut pixels = vec![0; stride * height as usize];
+            let mut pixels = vec![0; length as usize];
             for y in 0..height as usize {
                 let src = std::slice::from_raw_parts(
                     mapped.pData.cast::<u8>().add(y * mapped.RowPitch as usize),
@@ -200,7 +219,7 @@ impl CaptureSession {
 
 /// Duplication surfaces are unrotated, even for portrait monitors.
 fn orient_pixels(
-    pixels: Vec<u8>,
+    mut pixels: Vec<u8>,
     width: u32,
     height: u32,
     rotation: DXGI_MODE_ROTATION,
@@ -213,6 +232,17 @@ fn orient_pixels(
         DXGI_MODE_ROTATION_ROTATE180 => (width, height),
         _ => bail!("Unsupported display rotation"),
     };
+    if rotation == DXGI_MODE_ROTATION_ROTATE180 {
+        // Reverse pixels in place; 8K frames need not allocate a second frame.
+        for i in 0..pixels.len() / 8 {
+            let a = i * 4;
+            let b = pixels.len() - (i + 1) * 4;
+            for channel in 0..4 {
+                pixels.swap(a + channel, b + channel);
+            }
+        }
+        return Ok((pixels, out_width, out_height));
+    }
     let mut output = vec![0; pixels.len()];
     for y in 0..height {
         for x in 0..width {
@@ -289,6 +319,14 @@ mod tests {
         ] {
             assert!(snapshot.crop(region).is_err());
         }
+    }
+
+    #[test]
+    fn half_turn_reuses_original_pixel_allocation() {
+        let pixels = vec![1u8; 8 * 8 * 4];
+        let address = pixels.as_ptr();
+        let (rotated, _, _) = orient_pixels(pixels, 8, 8, DXGI_MODE_ROTATION_ROTATE180).unwrap();
+        assert_eq!(rotated.as_ptr(), address);
     }
 
     #[test]
