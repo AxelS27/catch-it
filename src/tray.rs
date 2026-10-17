@@ -545,10 +545,18 @@ mod tests {
             &pixels[(16 * 32 + 16) * 4..(16 * 32 + 16) * 4 + 4],
             &[235, 125, 35, 255]
         );
-        assert!(pixels.chunks_exact(4).any(|p| p[3] > 0 && p[3] < 255));
         assert!(
             pixels
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|p| p[3] > 0 && p[3] < 255)
+        );
+        assert!(
+            pixels
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .all(|p| p[..3].iter().all(|c| *c <= p[3]))
         );
     }

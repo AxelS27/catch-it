@@ -81,7 +81,9 @@ fn color(rgb: u32) -> D2D1_COLOR_F {
 
 pub fn premultiply(pixels: &[u8]) -> Vec<u8> {
     pixels
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|p| {
             let a = u32::from(p[3]);
             [

@@ -96,6 +96,6 @@ pub fn glyph_mask(
         target.EndDraw(None, None)?;
         let mut pixels = vec![0; width as usize * height as usize * 4];
         bitmap.CopyPixels(std::ptr::null(), width * 4, &mut pixels)?;
-        Ok(pixels.chunks_exact(4).map(|p| p[3]).collect())
+        Ok(pixels.as_chunks::<4>().0.iter().map(|p| p[3]).collect())
     }
 }

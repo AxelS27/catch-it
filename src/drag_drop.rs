@@ -649,15 +649,17 @@ mod tests {
     fn quick_access_preview_preserves_premultiplied_edges_and_aspect() -> Result<()> {
         assert!(preview_pixels(&[], 260, 184).is_err());
         let mut pixels = vec![0; 260 * 184 * 4];
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&[40, 80, 120, 160]);
         }
         let (small, width, height) = preview_pixels(&pixels, 260, 184)?;
         assert_eq!((width, height), (160, 113));
         assert!(
             small
-                .chunks_exact(4)
-                .all(|pixel| pixel == [40, 80, 120, 160])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel == &[40, 80, 120, 160])
         );
         Ok(())
     }

@@ -314,7 +314,7 @@ fn parse_checksum(text: &str, name: &str) -> Result<[u8; 32]> {
     let bytes = hex.as_bytes();
     ensure!(bytes.len() == 64, "Invalid SHA-256 length");
     let mut hash = [0; 32];
-    for (i, pair) in bytes.chunks_exact(2).enumerate() {
+    for (i, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         hash[i] = (pair[0] as char).to_digit(16).context("Invalid SHA-256")? as u8 * 16
             + (pair[1] as char).to_digit(16).context("Invalid SHA-256")? as u8;
     }
@@ -416,6 +416,12 @@ mod tests {
                     }
                     Err(error) => panic!("Test server failed: {error}"),
                 };
+                // Winsock can inherit the listener's nonblocking mode on an
+                // accepted socket. Read complete requests in blocking mode.
+                socket.set_nonblocking(false).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
                 let mut first = String::new();
                 {
                     let mut reader = BufReader::new(&mut socket);

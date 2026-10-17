@@ -194,7 +194,7 @@ impl CaptureSession {
                 pixels[y * stride..(y + 1) * stride].copy_from_slice(src);
             }
             self.context.Unmap(staging, 0);
-            for pixel in pixels.chunks_exact_mut(4) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
                 pixel[3] = 255;
             }
             let desktop_width =
@@ -343,7 +343,12 @@ mod tests {
             let (result, w, h) = orient_pixels(pixels.clone(), 2, 3, rotation).unwrap();
             assert_eq!((w, h), size);
             assert_eq!(
-                result.chunks_exact(4).map(|p| p[0]).collect::<Vec<_>>(),
+                result
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|p| p[0])
+                    .collect::<Vec<_>>(),
                 expected
             );
         }
